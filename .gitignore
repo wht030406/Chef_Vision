@@ -1,0 +1,27 @@
+# 大文件（视频、温度矩阵）
+*.mp4
+*.npy
+*.avi
+
+# 输出目录（视频和数据文件）
+output/*.mp4
+output/*.csv
+output/*.xlsx
+output/*.png
+output/*/
+
+# 临时帧目录
+core/tmp_sam2_frames/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 日志
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
