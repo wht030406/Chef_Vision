@@ -99,12 +99,18 @@ latest_ir    = None    # 最新一帧温度矩阵（float32，℃）
 lock_rgb     = threading.Lock()
 lock_ir      = threading.Lock()
 
-is_recording = False
-video_writer = None
-temp_list    = []
-frame_count  = 0
-temp_count   = 0
-rec_ts       = None    # 录制开始时间戳（按 S 时记录，视频和 npy 共用）
+is_recording    = False
+video_writer    = None
+ir_video_writer = None   # IR 伪彩色视频写入器
+temp_list       = []
+frame_count     = 0
+temp_count      = 0
+ir_frame_count  = 0
+rec_ts          = None   # 录制开始时间戳（按 S 时记录，视频和 npy 共用）
+
+# IR 视频输出分辨率（原始 192×256 放大 2 倍，方便查看）
+IR_VIDEO_W = 512
+IR_VIDEO_H = 384
 
 # ============================================================
 # DLL 加载与 SDK 初始化
@@ -206,6 +212,7 @@ def on_video_frame(handle, video_info_ptr, ivs_ptr, user_data):
 
 def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
     global latest_ir, is_recording, temp_list, temp_count
+    global ir_video_writer, ir_frame_count, rec_ts
     try:
         ti = temp_info_ptr.contents
         if ti.width <= 0 or ti.height <= 0:
@@ -222,8 +229,42 @@ def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
             latest_ir = celsius.copy()
 
         if is_recording:
+            # 保存温度矩阵（精度数据）
             temp_list.append(celsius)
             temp_count += 1
+
+            # 同步录制 IR 伪彩色视频
+            if ir_video_writer is None:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                ts = rec_ts if rec_ts else datetime.now().strftime("%Y%m%d_%H%M%S")
+                ir_fname = os.path.join(_DATA_DIR, f"ir_{ts}.mp4")
+                # IR 帧率由实际回调频率决定，这里用 25fps 作为标称值
+                ir_video_writer = cv2.VideoWriter(
+                    ir_fname, fourcc, 25.0, (IR_VIDEO_W, IR_VIDEO_H)
+                )
+                print(f"[IR视频] 开始写入: {ir_fname}")
+
+            # 温度矩阵 → 伪彩色图（不加文字，保持干净）
+            t_min = float(celsius.min())
+            t_max = float(celsius.max())
+            if t_max - t_min < 0.1:
+                norm = np.zeros_like(celsius, dtype=np.uint8)
+            else:
+                norm = ((celsius - t_min) / (t_max - t_min) * 255).astype(np.uint8)
+            colored = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+            colored = cv2.resize(colored, (IR_VIDEO_W, IR_VIDEO_H),
+                                 interpolation=cv2.INTER_NEAREST)
+
+            # 叠加温度信息文字
+            cv2.putText(colored, f"MAX:{t_max:.1f}C", (4, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(colored, f"MIN:{t_min:.1f}C", (4, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(colored, f"AVG:{float(celsius.mean()):.1f}C", (4, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            ir_video_writer.write(colored)
+            ir_frame_count += 1
 
     except Exception as e:
         pass
@@ -257,7 +298,8 @@ def temp_to_colormap(temp_matrix, width=640, height=480):
 # ============================================================
 
 def main():
-    global is_recording, video_writer, temp_list, frame_count, temp_count, rec_ts
+    global is_recording, video_writer, ir_video_writer, ir_frame_count
+    global temp_list, frame_count, temp_count, rec_ts
 
     print("=" * 55)
     print("  Chef Vision — 厨房数据采集（现场版）")
@@ -346,11 +388,13 @@ def main():
 
         if key == ord('s') or key == ord('S'):
             if not is_recording:
-                rec_ts       = datetime.now().strftime("%Y%m%d_%H%M%S")  # 统一时间戳
-                is_recording = True
-                temp_list    = []
-                frame_count  = 0
-                temp_count   = 0
+                rec_ts          = datetime.now().strftime("%Y%m%d_%H%M%S")  # 统一时间戳
+                is_recording    = True
+                temp_list       = []
+                frame_count     = 0
+                temp_count      = 0
+                ir_frame_count  = 0
+                ir_video_writer = None   # 确保下次录制创建新文件
                 print(f"\n[录制] 已开始录制！时间戳: {rec_ts}  按 Q 停止")
             else:
                 print("[提示] 已在录制中")
@@ -369,6 +413,11 @@ def main():
     if video_writer is not None:
         video_writer.release()
         print(f"[OK] RGB 视频已保存，共 {frame_count} 帧")
+
+    # 7b. 保存 IR 视频
+    if ir_video_writer is not None:
+        ir_video_writer.release()
+        print(f"[OK] IR 视频已保存，共 {ir_frame_count} 帧  ({IR_VIDEO_W}×{IR_VIDEO_H})")
 
     # 8. 保存温度矩阵（使用 rec_ts，与视频保持同一时间戳）
     ts = rec_ts if rec_ts else datetime.now().strftime("%Y%m%d_%H%M%S")
