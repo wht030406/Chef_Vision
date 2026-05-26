@@ -20,6 +20,7 @@ import json
 import shutil
 import glob
 import re
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -51,8 +52,13 @@ MODEL_CFG       = "configs/sam2.1/sam2.1_hiera_l.yaml"
 CHECKPOINT_PATH = "D:/sam2_checkpoints/sam2.1_hiera_large.pt"
 
 # 分批处理参数
-# 12 帧 = 0.5 秒批次（@25fps），模拟实时处理节奏，显存占用低
-CHUNK_SIZE      = 12
+# SAM2 每隔多少帧做一次精确追踪（"锚点帧"），其余帧用光流传播
+# 25 帧 = 1 秒间隔（@25fps）；设为 0 或 1 则退化为纯 SAM2 模式
+OPTICAL_FLOW_INTERVAL = 25   # 0 = 禁用光流，纯 SAM2 模式
+
+# SAM2 批次大小（每次 SAM2 推理处理的帧数）
+# 建议与 OPTICAL_FLOW_INTERVAL 相同，或设为 1（单帧模式）
+CHUNK_SIZE      = 25
 
 # 提示点数量上限（None = 不限制，使用全部标注点）
 MAX_FG_POINTS   = None
@@ -318,6 +324,59 @@ def map_mask_to_ir(rgb_mask, homography, ir_shape):
     return ir_mask
 
 
+def flow_propagate_mask(prev_gray, cur_gray, prev_mask):
+    """
+    用 Farneback 稠密光流将上一帧 mask 传播到当前帧。
+
+    原理：
+      1. 计算 prev→cur 的稠密光流场 (dx, dy)
+      2. 对 prev_mask 中每个前景像素，按光流偏移映射到 cur 坐标
+      3. 对结果做形态学闭运算填补空洞
+
+    参数：
+      prev_gray : (H,W) uint8 灰度图（上一帧）
+      cur_gray  : (H,W) uint8 灰度图（当前帧）
+      prev_mask : (H,W) bool  上一帧 mask
+
+    返回：
+      cur_mask  : (H,W) bool  传播后的 mask
+    """
+    if not prev_mask.any():
+        return prev_mask.copy()
+
+    # Farneback 光流（CPU，速度快）
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray, cur_gray,
+        None,
+        pyr_scale=0.5, levels=3, winsize=15,
+        iterations=3, poly_n=5, poly_sigma=1.2,
+        flags=0
+    )  # shape: (H, W, 2)
+
+    H, W = prev_mask.shape
+    ys, xs = np.where(prev_mask)
+
+    # 按光流偏移计算新坐标
+    dx = flow[ys, xs, 0]
+    dy = flow[ys, xs, 1]
+    new_xs = np.round(xs + dx).astype(int)
+    new_ys = np.round(ys + dy).astype(int)
+
+    # 过滤越界坐标
+    valid = (new_xs >= 0) & (new_xs < W) & (new_ys >= 0) & (new_ys < H)
+    new_xs = new_xs[valid]
+    new_ys = new_ys[valid]
+
+    cur_mask = np.zeros((H, W), dtype=np.uint8)
+    cur_mask[new_ys, new_xs] = 255
+
+    # 形态学闭运算：填补光流稀疏导致的空洞
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    cur_mask = cv2.morphologyEx(cur_mask, cv2.MORPH_CLOSE, kernel)
+
+    return cur_mask.astype(bool)
+
+
 def render_overlay(frame_bgr, mask, color_bgr, alpha):
     """在帧上叠加半透明 mask + 轮廓"""
     vis = frame_bgr.copy()
@@ -413,6 +472,16 @@ def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60):
 # ── 主程序 ───────────────────────────────────────────────────────────────────
 
 def main():
+    # ── 创建时间戳输出子目录 ──────────────────────────────────────────────────
+    run_ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir  = os.path.join(_HERE, "..", "output", run_ts)
+    os.makedirs(out_dir, exist_ok=True)
+    out_video_viz = os.path.join(out_dir, "track_result_viz.mp4")
+    out_csv       = os.path.join(out_dir, "food_temp_log.csv")
+    out_xlsx      = os.path.join(out_dir, "food_temp_log.xlsx")
+    out_curve     = os.path.join(out_dir, "food_temp_curve.png")
+    print(f"[输出] 本次结果目录: {out_dir}")
+
     # ── 检查依赖文件 ──────────────────────────────────────────────────────────
     if not os.path.exists(LABELS_JSON):
         print(f"[错误] 找不到标注文件: {LABELS_JSON}")
@@ -490,13 +559,23 @@ def main():
     # ── 输出视频准备 ──────────────────────────────────────────────────────────
     fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
     OUT_H    = VH + INFO_H + CHART_H          # 原始帧高 + 文字条 + 曲线图
-    writer   = cv2.VideoWriter(OUTPUT_VIDEO_VIZ, fourcc, fps, (VW, OUT_H))
+    writer   = cv2.VideoWriter(out_video_viz, fourcc, fps, (VW, OUT_H))
     csv_lines = ["frame_abs,frame_rel,time_s,mask_pixels,mask_ratio,temp_mean,temp_min,temp_max"]
     temp_history = []   # list of (time_s, temp_mean)，用于实时曲线绘制
 
-    # ── 分批追踪主循环 ────────────────────────────────────────────────────────
-    carry_mask = None   # 上批末帧 mask，用于跨批传递目标信息
-    global_local = 0    # 全局相对帧计数
+    # ── 分批追踪主循环（SAM2 + 光流混合）────────────────────────────────────
+    carry_mask   = None   # 上批末帧 SAM2 mask，用于跨批传递
+    global_local = 0      # 全局相对帧计数
+    flow_prev_gray = None # 光流：上一帧灰度图
+    flow_prev_mask = None # 光流：上一帧 mask
+
+    # 是否启用光流（OPTICAL_FLOW_INTERVAL > 1 时启用）
+    use_flow = (OPTICAL_FLOW_INTERVAL > 1)
+    if use_flow:
+        print(f"[模式] SAM2+光流混合  SAM2间隔={OPTICAL_FLOW_INTERVAL}帧  "
+              f"CHUNK_SIZE={CHUNK_SIZE}")
+    else:
+        print(f"[模式] 纯SAM2  CHUNK_SIZE={CHUNK_SIZE}")
 
     n_chunks = (track_frames + CHUNK_SIZE - 1) // CHUNK_SIZE
     for chunk_i in range(n_chunks):
@@ -531,7 +610,7 @@ def main():
                         "label":       kf.get("label", ""),
                     })
 
-            # SAM2 追踪本批
+            # SAM2 追踪本批（得到锚点帧 mask）
             chunk_masks, carry_mask = track_chunk(
                 predictor, tmp_dir, frame_names,
                 fg_points, bg_points,
@@ -540,11 +619,10 @@ def main():
             )
             print(f"[SAM2] 批次 {chunk_i+1} 追踪完成，{len(chunk_masks)} 帧")
         finally:
-            # 每批完成后立即清理临时目录（不等全部批次）
             shutil.rmtree(tmp_dir, ignore_errors=True)
             print(f"[清理] 临时帧已删除")
 
-        # ── 写入本批输出 ──────────────────────────────────────────────────────
+        # ── 写入本批输出（光流填充中间帧）────────────────────────────────────
         cap = cv2.VideoCapture(video_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
 
@@ -555,18 +633,43 @@ def main():
 
             abs_idx   = chunk_start_abs + local_in_chunk
             local_idx = global_local + local_in_chunk
-            mask      = chunk_masks.get(local_in_chunk,
-                                        np.zeros((VH, VW), dtype=bool))
 
-            # 叠加可视化
-            vis = render_overlay(frame, mask, MASK_COLOR, MASK_ALPHA)
+            # ── 决定本帧 mask 来源 ────────────────────────────────────────────
+            # 全局相对帧号（从追踪起始帧算起）
+            rel_idx = abs_idx - start_frame
 
-            # 温度统计（时间对齐：用 abs_idx * ir_fps_ratio 换算 IR 帧号）
+            if not use_flow:
+                # 纯 SAM2 模式
+                mask = chunk_masks.get(local_in_chunk, np.zeros((VH, VW), dtype=bool))
+                mask_src = "SAM2"
+            else:
+                # 混合模式：rel_idx % OPTICAL_FLOW_INTERVAL == 0 的帧用 SAM2
+                is_anchor = (rel_idx % OPTICAL_FLOW_INTERVAL == 0)
+                if is_anchor or flow_prev_mask is None:
+                    # 锚点帧：用 SAM2 结果
+                    mask = chunk_masks.get(local_in_chunk, np.zeros((VH, VW), dtype=bool))
+                    mask_src = "SAM2"
+                else:
+                    # 中间帧：用光流传播
+                    cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    mask = flow_propagate_mask(flow_prev_gray, cur_gray, flow_prev_mask)
+                    mask_src = "Flow"
+
+            # 更新光流状态（供下一帧使用）
+            if use_flow:
+                flow_prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                flow_prev_mask = mask
+
+            # 叠加可视化（光流帧用稍浅的颜色区分）
+            color = MASK_COLOR if mask_src == "SAM2" else (0, 200, 80)
+            vis = render_overlay(frame, mask, color, MASK_ALPHA)
+
+            # 温度统计
             temp_mean = temp_min = temp_max = float("nan")
             if temp_data is not None and homography is not None:
                 ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
                 ir_mask    = map_mask_to_ir(mask, homography, (ir_h, ir_w))
-                ir_idx     = int(abs_idx * ir_fps_ratio)   # 时间对齐
+                ir_idx     = int(abs_idx * ir_fps_ratio)
                 if ir_idx < temp_data.shape[0]:
                     t_frame    = temp_data[ir_idx]
                     food_temps = t_frame[ir_mask]
@@ -575,28 +678,26 @@ def main():
                         temp_min  = float(np.min(food_temps))
                         temp_max  = float(np.max(food_temps))
 
-            # 视频帧 HUD
+            # HUD
             time_s     = abs_idx / fps
             mask_ratio = mask.sum() / mask.size * 100
-            info1 = f"Frame {abs_idx}  t={time_s:.1f}s  Mask={mask_ratio:.1f}%"
+            info1 = (f"Frame {abs_idx}  t={time_s:.1f}s  "
+                     f"Mask={mask_ratio:.1f}%  [{mask_src}]")
             info2 = (f"Temp: mean={temp_mean:.1f}C  min={temp_min:.1f}C  max={temp_max:.1f}C"
                      if not np.isnan(temp_mean) else "Temp: N/A")
 
-            # 更新温度历史（仅记录有效值）
             if not np.isnan(temp_mean):
                 temp_history.append((time_s, temp_mean))
 
-            # 文字信息条（INFO_H px 黑底）
             info_bar = np.zeros((INFO_H, VW, 3), dtype=np.uint8)
+            # SAM2 帧白色，光流帧黄色
+            hud_color = (255, 255, 255) if mask_src == "SAM2" else (80, 220, 255)
             cv2.putText(info_bar, info1, (10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, hud_color, 1)
             cv2.putText(info_bar, info2, (10, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 1)
 
-            # 温度曲线图（CHART_H px）
             chart_bar = draw_temp_chart(temp_history, time_s, VW, CHART_H, CURVE_WIN_S)
-
-            # 拼接：原始帧 + 文字条 + 曲线图，写入扩展高度视频
             out_frame = np.vstack([vis, info_bar, chart_bar])
             writer.write(out_frame)
             csv_lines.append(
@@ -607,7 +708,8 @@ def main():
 
             if local_in_chunk % 50 == 0:
                 print(f"  写帧: {local_in_chunk+1}/{actual}  "
-                      f"mask={mask_ratio:.1f}%  temp={temp_mean:.1f}°C", end="\r")
+                      f"mask={mask_ratio:.1f}%  temp={temp_mean:.1f}°C  [{mask_src}]",
+                      end="\r")
 
         cap.release()
         print()
@@ -616,20 +718,21 @@ def main():
     writer.release()
 
     # ── 保存 CSV ──────────────────────────────────────────────────────────────
-    with open(OUTPUT_CSV, "w", encoding="utf-8") as f:
+    with open(out_csv, "w", encoding="utf-8") as f:
         f.write("\n".join(csv_lines))
 
     print(f"\n\n✅ 追踪完成！")
-    print(f"   可视化视频: {OUTPUT_VIDEO_VIZ}")
-    print(f"   温度日志:   {OUTPUT_CSV}")
+    print(f"   结果目录:   {out_dir}")
+    print(f"   可视化视频: {out_video_viz}")
+    print(f"   温度日志:   {out_csv}")
     print(f"   共处理 {global_local} 帧")
 
     # ── 保存 Excel ────────────────────────────────────────────────────────────
-    _save_excel(OUTPUT_CSV, OUTPUT_EXCEL)
+    _save_excel(out_csv, out_xlsx)
 
     # ── 绘制温度曲线 ──────────────────────────────────────────────────────────
     if temp_data is not None:
-        _plot_temp_curve(OUTPUT_CSV)
+        _plot_temp_curve(out_csv, out_curve)
 
     # 清理空的 tmp 根目录（如果为空）
     try:
@@ -721,7 +824,7 @@ def _save_excel(csv_path, xlsx_path):
     print(f"[Excel] 已保存: {xlsx_path}  ({len(rows_data)} 行数据)")
 
 
-def _plot_temp_curve(csv_path):
+def _plot_temp_curve(csv_path, out_path=None):
     """从 CSV 绘制菜温随时间变化曲线"""
     import csv
     times, means, mins, maxs = [], [], [], []
@@ -751,7 +854,7 @@ def _plot_temp_curve(csv_path):
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    out = os.path.join(_HERE, "..", "output", "food_temp_curve.png")
+    out = out_path or os.path.join(_HERE, "..", "output", "food_temp_curve.png")
     plt.savefig(out, dpi=120)
     plt.close()
     print(f"[温度曲线] 已保存: {out}")
