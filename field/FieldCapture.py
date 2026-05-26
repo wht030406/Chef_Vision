@@ -39,13 +39,13 @@ DEVICE_PORT = 80
 USERNAME    = "admin"
 PASSWORD    = "ZGTC2026"
 
-# DLL 路径（sdk/ 目录）
+# DLL 路径（与本脚本同目录，适配下位机所有文件放在同一文件夹的情况）
 _HERE    = os.path.dirname(os.path.abspath(__file__))
-DLL_DIR  = os.path.join(_HERE, "..", "sdk")
+DLL_DIR  = _HERE
 DLL_PATH = os.path.join(DLL_DIR, "IRCNetSDK.dll")
 
-# 数据输出目录
-_DATA_DIR = os.path.join(_HERE, "..", "data")
+# 数据输出目录（与本脚本同目录）
+_DATA_DIR = _HERE
 os.makedirs(_DATA_DIR, exist_ok=True)
 
 # ============================================================
