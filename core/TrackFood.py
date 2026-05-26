@@ -564,105 +564,190 @@ def main():
     temp_history = []   # list of (time_s, temp_mean)，用于实时曲线绘制
 
     # ── 分批追踪主循环（SAM2 + 光流混合）────────────────────────────────────
-    carry_mask   = None   # 上批末帧 SAM2 mask，用于跨批传递
-    global_local = 0      # 全局相对帧计数
-    flow_prev_gray = None # 光流：上一帧灰度图
-    flow_prev_mask = None # 光流：上一帧 mask
+    # 真正的混合模式：
+    #   - 纯SAM2模式（OPTICAL_FLOW_INTERVAL<=1）：每批处理 CHUNK_SIZE 帧
+    #   - 混合模式（OPTICAL_FLOW_INTERVAL>1）：SAM2 只处理锚点帧（单帧批次），
+    #     其余帧完全用光流传播，不再调用 SAM2
+    carry_mask     = None   # 上批末帧 SAM2 mask，用于跨批传递
+    global_local   = 0      # 全局相对帧计数
+    flow_prev_gray = None   # 光流：上一帧灰度图
+    flow_prev_mask = None   # 光流：上一帧 mask
 
-    # 是否启用光流（OPTICAL_FLOW_INTERVAL > 1 时启用）
     use_flow = (OPTICAL_FLOW_INTERVAL > 1)
     if use_flow:
-        print(f"[模式] SAM2+光流混合  SAM2间隔={OPTICAL_FLOW_INTERVAL}帧  "
-              f"CHUNK_SIZE={CHUNK_SIZE}")
+        print(f"[模式] SAM2+光流混合  SAM2锚点间隔={OPTICAL_FLOW_INTERVAL}帧")
+        # 混合模式下：SAM2 每隔 N 帧处理 1 帧，其余帧光流传播
+        # 将追踪范围按锚点帧切分
+        anchor_frames = list(range(start_frame,
+                                   total_frames,
+                                   OPTICAL_FLOW_INTERVAL))
+        print(f"[混合] 共 {len(anchor_frames)} 个SAM2锚点帧，"
+              f"其余 {track_frames - len(anchor_frames)} 帧用光流")
     else:
         print(f"[模式] 纯SAM2  CHUNK_SIZE={CHUNK_SIZE}")
 
-    n_chunks = (track_frames + CHUNK_SIZE - 1) // CHUNK_SIZE
-    for chunk_i in range(n_chunks):
-        chunk_start_abs = start_frame + chunk_i * CHUNK_SIZE
-        chunk_end_abs   = min(chunk_start_abs + CHUNK_SIZE, total_frames)
-        chunk_len       = chunk_end_abs - chunk_start_abs
+    if not use_flow:
+        # ── 纯 SAM2 模式（原有逻辑）──────────────────────────────────────────
+        n_chunks = (track_frames + CHUNK_SIZE - 1) // CHUNK_SIZE
+        for chunk_i in range(n_chunks):
+            chunk_start_abs = start_frame + chunk_i * CHUNK_SIZE
+            chunk_end_abs   = min(chunk_start_abs + CHUNK_SIZE, total_frames)
+            chunk_len       = chunk_end_abs - chunk_start_abs
 
-        print(f"\n{'='*55}")
-        print(f"[批次 {chunk_i+1}/{n_chunks}] 帧 {chunk_start_abs} ~ {chunk_end_abs-1}"
-              f"  ({chunk_len} 帧)")
+            print(f"\n{'='*55}")
+            print(f"[批次 {chunk_i+1}/{n_chunks}] 帧 {chunk_start_abs} ~ {chunk_end_abs-1}"
+                  f"  ({chunk_len} 帧)")
 
-        # 抽帧到临时目录
-        tmp_dir, frame_names, actual = extract_chunk_to_dir(
-            video_path, chunk_start_abs, chunk_end_abs
-        )
-        print(f"[抽帧] 临时目录: {tmp_dir}  实际帧数: {actual}")
-
-        if actual == 0:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            break
-
-        try:
-            # ── 计算本批内哪些帧需要注入额外关键帧 ──────────────────────────
-            inject_this_chunk = []
-            for abs_f, kf in inject_map.items():
-                if chunk_start_abs <= abs_f < chunk_end_abs:
-                    local_f = abs_f - chunk_start_abs
-                    inject_this_chunk.append({
-                        "local_frame": local_f,
-                        "fg_points":   kf["fg_points"],
-                        "bg_points":   kf.get("bg_points", []),
-                        "label":       kf.get("label", ""),
-                    })
-
-            # SAM2 追踪本批（得到锚点帧 mask）
-            chunk_masks, carry_mask = track_chunk(
-                predictor, tmp_dir, frame_names,
-                fg_points, bg_points,
-                carry_mask=carry_mask,
-                inject_keyframes=inject_this_chunk,
+            tmp_dir, frame_names, actual = extract_chunk_to_dir(
+                video_path, chunk_start_abs, chunk_end_abs
             )
-            print(f"[SAM2] 批次 {chunk_i+1} 追踪完成，{len(chunk_masks)} 帧")
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            print(f"[清理] 临时帧已删除")
+            print(f"[抽帧] 临时目录: {tmp_dir}  实际帧数: {actual}")
 
-        # ── 写入本批输出（光流填充中间帧）────────────────────────────────────
+            if actual == 0:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                break
+
+            try:
+                inject_this_chunk = []
+                for abs_f, kf in inject_map.items():
+                    if chunk_start_abs <= abs_f < chunk_end_abs:
+                        local_f = abs_f - chunk_start_abs
+                        inject_this_chunk.append({
+                            "local_frame": local_f,
+                            "fg_points":   kf["fg_points"],
+                            "bg_points":   kf.get("bg_points", []),
+                            "label":       kf.get("label", ""),
+                        })
+
+                chunk_masks, carry_mask = track_chunk(
+                    predictor, tmp_dir, frame_names,
+                    fg_points, bg_points,
+                    carry_mask=carry_mask,
+                    inject_keyframes=inject_this_chunk,
+                )
+                print(f"[SAM2] 批次 {chunk_i+1} 追踪完成，{len(chunk_masks)} 帧")
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                print(f"[清理] 临时帧已删除")
+
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
+
+            for local_in_chunk in range(actual):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                abs_idx   = chunk_start_abs + local_in_chunk
+                local_idx = global_local + local_in_chunk
+                mask      = chunk_masks.get(local_in_chunk,
+                                            np.zeros((VH, VW), dtype=bool))
+                mask_src  = "SAM2"
+
+                vis       = render_overlay(frame, mask, MASK_COLOR, MASK_ALPHA)
+                temp_mean = temp_min = temp_max = float("nan")
+                if temp_data is not None and homography is not None:
+                    ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
+                    ir_mask    = map_mask_to_ir(mask, homography, (ir_h, ir_w))
+                    ir_idx     = int(abs_idx * ir_fps_ratio)
+                    if ir_idx < temp_data.shape[0]:
+                        t_frame    = temp_data[ir_idx]
+                        food_temps = t_frame[ir_mask]
+                        if len(food_temps) > 0:
+                            temp_mean = float(np.mean(food_temps))
+                            temp_min  = float(np.min(food_temps))
+                            temp_max  = float(np.max(food_temps))
+
+                time_s     = abs_idx / fps
+                mask_ratio = mask.sum() / mask.size * 100
+                if not np.isnan(temp_mean):
+                    temp_history.append((time_s, temp_mean))
+
+                info_bar = np.zeros((INFO_H, VW, 3), dtype=np.uint8)
+                cv2.putText(info_bar,
+                            f"Frame {abs_idx}  t={time_s:.1f}s  Mask={mask_ratio:.1f}%  [SAM2]",
+                            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                cv2.putText(info_bar,
+                            (f"Temp: mean={temp_mean:.1f}C  min={temp_min:.1f}C  max={temp_max:.1f}C"
+                             if not np.isnan(temp_mean) else "Temp: N/A"),
+                            (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 1)
+
+                chart_bar = draw_temp_chart(temp_history, time_s, VW, CHART_H, CURVE_WIN_S)
+                writer.write(np.vstack([vis, info_bar, chart_bar]))
+                csv_lines.append(
+                    f"{abs_idx},{local_idx},{time_s:.3f},"
+                    f"{mask.sum()},{mask_ratio:.2f},"
+                    f"{temp_mean:.2f},{temp_min:.2f},{temp_max:.2f}"
+                )
+                if local_in_chunk % 50 == 0:
+                    print(f"  写帧: {local_in_chunk+1}/{actual}  "
+                          f"mask={mask_ratio:.1f}%  temp={temp_mean:.1f}°C", end="\r")
+
+            cap.release()
+            print()
+            global_local += actual
+
+    else:
+        # ── 混合模式：逐帧处理，锚点帧用 SAM2，中间帧用光流 ──────────────────
         cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-        for local_in_chunk in range(actual):
+        anchor_set = set(anchor_frames)   # 快速查找
+        n_total    = len(anchor_frames)
+        anchor_cnt = 0
+
+        for abs_idx in range(start_frame, total_frames):
             ret, frame = cap.read()
             if not ret:
                 break
 
-            abs_idx   = chunk_start_abs + local_in_chunk
-            local_idx = global_local + local_in_chunk
+            local_idx  = abs_idx - start_frame
+            is_anchor  = (abs_idx in anchor_set)
 
-            # ── 决定本帧 mask 来源 ────────────────────────────────────────────
-            # 全局相对帧号（从追踪起始帧算起）
-            rel_idx = abs_idx - start_frame
+            if is_anchor:
+                # SAM2 单帧推理：抽单帧到临时目录
+                tmp_dir, frame_names, actual = extract_chunk_to_dir(
+                    video_path, abs_idx, abs_idx + 1
+                )
+                try:
+                    # 检查此帧是否有注入关键帧（对于第一帧之外的额外标注）
+                    inject_this = []
+                    if abs_idx in inject_map and abs_idx != start_frame:
+                        kf = inject_map[abs_idx]
+                        inject_this = [{
+                            "local_frame": 0,
+                            "fg_points":   kf["fg_points"],
+                            "bg_points":   kf.get("bg_points", []),
+                            "label":       kf.get("label", ""),
+                        }]
 
-            if not use_flow:
-                # 纯 SAM2 模式
-                mask = chunk_masks.get(local_in_chunk, np.zeros((VH, VW), dtype=bool))
-                mask_src = "SAM2"
-            else:
-                # 混合模式：rel_idx % OPTICAL_FLOW_INTERVAL == 0 的帧用 SAM2
-                is_anchor = (rel_idx % OPTICAL_FLOW_INTERVAL == 0)
-                if is_anchor or flow_prev_mask is None:
-                    # 锚点帧：用 SAM2 结果
-                    mask = chunk_masks.get(local_in_chunk, np.zeros((VH, VW), dtype=bool))
+                    chunk_masks, carry_mask = track_chunk(
+                        predictor, tmp_dir, frame_names,
+                        fg_points, bg_points,
+                        carry_mask=carry_mask,
+                        inject_keyframes=inject_this,
+                    )
+                    mask     = chunk_masks.get(0, np.zeros((VH, VW), dtype=bool))
                     mask_src = "SAM2"
+                    anchor_cnt += 1
+                    if anchor_cnt % 25 == 1 or anchor_cnt == n_total:
+                        print(f"  [SAM2锚点 {anchor_cnt}/{n_total}] 帧 {abs_idx}"
+                              f"  t={abs_idx/fps:.1f}s", end="\r")
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+            else:
+                # 光流传播
+                if flow_prev_gray is None or flow_prev_mask is None:
+                    # 兜底：没有前帧信息时用空 mask
+                    mask = np.zeros((VH, VW), dtype=bool)
                 else:
-                    # 中间帧：用光流传播
                     cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    mask = flow_propagate_mask(flow_prev_gray, cur_gray, flow_prev_mask)
-                    mask_src = "Flow"
+                    mask     = flow_propagate_mask(flow_prev_gray, cur_gray, flow_prev_mask)
+                mask_src = "Flow"
 
-            # 更新光流状态（供下一帧使用）
-            if use_flow:
-                flow_prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                flow_prev_mask = mask
-
-            # 叠加可视化（光流帧用稍浅的颜色区分）
-            color = MASK_COLOR if mask_src == "SAM2" else (0, 200, 80)
-            vis = render_overlay(frame, mask, color, MASK_ALPHA)
+            # 更新光流状态
+            flow_prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            flow_prev_mask = mask
 
             # 温度统计
             temp_mean = temp_min = temp_max = float("nan")
@@ -678,42 +763,36 @@ def main():
                         temp_min  = float(np.min(food_temps))
                         temp_max  = float(np.max(food_temps))
 
-            # HUD
             time_s     = abs_idx / fps
             mask_ratio = mask.sum() / mask.size * 100
-            info1 = (f"Frame {abs_idx}  t={time_s:.1f}s  "
-                     f"Mask={mask_ratio:.1f}%  [{mask_src}]")
-            info2 = (f"Temp: mean={temp_mean:.1f}C  min={temp_min:.1f}C  max={temp_max:.1f}C"
-                     if not np.isnan(temp_mean) else "Temp: N/A")
-
             if not np.isnan(temp_mean):
                 temp_history.append((time_s, temp_mean))
 
-            info_bar = np.zeros((INFO_H, VW, 3), dtype=np.uint8)
-            # SAM2 帧白色，光流帧黄色
+            info_bar  = np.zeros((INFO_H, VW, 3), dtype=np.uint8)
             hud_color = (255, 255, 255) if mask_src == "SAM2" else (80, 220, 255)
-            cv2.putText(info_bar, info1, (10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, hud_color, 1)
-            cv2.putText(info_bar, info2, (10, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 1)
+            color     = MASK_COLOR if mask_src == "SAM2" else (0, 200, 80)
+            vis       = render_overlay(frame, mask, color, MASK_ALPHA)
+
+            cv2.putText(info_bar,
+                        f"Frame {abs_idx}  t={time_s:.1f}s  "
+                        f"Mask={mask_ratio:.1f}%  [{mask_src}]",
+                        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, hud_color, 1)
+            cv2.putText(info_bar,
+                        (f"Temp: mean={temp_mean:.1f}C  min={temp_min:.1f}C  max={temp_max:.1f}C"
+                         if not np.isnan(temp_mean) else "Temp: N/A"),
+                        (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 1)
 
             chart_bar = draw_temp_chart(temp_history, time_s, VW, CHART_H, CURVE_WIN_S)
-            out_frame = np.vstack([vis, info_bar, chart_bar])
-            writer.write(out_frame)
+            writer.write(np.vstack([vis, info_bar, chart_bar]))
             csv_lines.append(
                 f"{abs_idx},{local_idx},{time_s:.3f},"
                 f"{mask.sum()},{mask_ratio:.2f},"
                 f"{temp_mean:.2f},{temp_min:.2f},{temp_max:.2f}"
             )
 
-            if local_in_chunk % 50 == 0:
-                print(f"  写帧: {local_in_chunk+1}/{actual}  "
-                      f"mask={mask_ratio:.1f}%  temp={temp_mean:.1f}°C  [{mask_src}]",
-                      end="\r")
-
         cap.release()
         print()
-        global_local += actual
+        global_local = total_frames - start_frame
 
     writer.release()
 
