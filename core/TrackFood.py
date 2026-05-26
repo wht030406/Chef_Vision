@@ -48,17 +48,24 @@ OUTPUT_CSV      = os.path.join(_HERE, "..", "output", "food_temp_log.csv")
 OUTPUT_EXCEL    = os.path.join(_HERE, "..", "output", "food_temp_log.xlsx")
 
 # SAM2 配置
-MODEL_CFG       = "configs/sam2.1/sam2.1_hiera_l.yaml"
-CHECKPOINT_PATH = "D:/sam2_checkpoints/sam2.1_hiera_large.pt"
+# 模型选择：tiny（快，适合实时）/ large（慢，精度高，适合离线）
+MODEL_CFG       = "configs/sam2.1/sam2.1_hiera_t.yaml"
+CHECKPOINT_PATH = os.path.join(_HERE, "..", "models", "sam2.1_hiera_tiny.pt")
+# 如需切换回 large：
+# MODEL_CFG       = "configs/sam2.1/sam2.1_hiera_l.yaml"
+# CHECKPOINT_PATH = os.path.join(_HERE, "..", "models", "sam2.1_hiera_large.pt")
 
 # 分批处理参数
-# SAM2 每隔多少帧做一次精确追踪（"锚点帧"），其余帧用光流传播
-# 25 帧 = 1 秒间隔（@25fps）；设为 0 或 1 则退化为纯 SAM2 模式
-OPTICAL_FLOW_INTERVAL = 25   # 0 = 禁用光流，纯 SAM2 模式
+OPTICAL_FLOW_INTERVAL = 0    # 0 = 纯 SAM2 模式（推荐）；>1 = SAM2+光流混合
 
-# SAM2 批次大小（每次 SAM2 推理处理的帧数）
-# 建议与 OPTICAL_FLOW_INTERVAL 相同，或设为 1（单帧模式）
-CHUNK_SIZE      = 25
+# SAM2 批次大小（帧数）
+# 100 帧 = 4 秒批次（@25fps），流水线模式下处理时间(~3.5s) < 录制时间(4s)
+CHUNK_SIZE      = 100
+
+# SAM2 推理分辨率缩放
+# 缩小分辨率可大幅提升 SAM2 速度，mask 会放大回原始分辨率用于温度计算
+# None = 不缩放（使用原始分辨率）；(640, 480) = 缩放到 640×480
+SAM2_INFER_SIZE = None   # SAM2 内部会 resize 到 1024p，外部缩放无效
 
 # 提示点数量上限（None = 不限制，使用全部标注点）
 MAX_FG_POINTS   = None
@@ -196,9 +203,10 @@ def build_sam2_predictor(device):
     return predictor
 
 
-def extract_chunk_to_dir(video_path, start_abs, end_abs):
+def extract_chunk_to_dir(video_path, start_abs, end_abs, infer_size=None):
     """
     将视频 [start_abs, end_abs) 帧抽到临时目录。
+    infer_size: (W, H) 缩放尺寸，None 则不缩放。
     返回 (tmp_dir, frame_names, actual_count)
     """
     os.makedirs(TMP_BASE, exist_ok=True)
@@ -214,6 +222,8 @@ def extract_chunk_to_dir(video_path, start_abs, end_abs):
         ret, frame = cap.read()
         if not ret:
             break
+        if infer_size is not None:
+            frame = cv2.resize(frame, infer_size, interpolation=cv2.INTER_AREA)
         fname = f"{local_idx:06d}.jpg"
         cv2.imwrite(os.path.join(tmp_dir, fname),
                     frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -222,6 +232,25 @@ def extract_chunk_to_dir(video_path, start_abs, end_abs):
 
     cap.release()
     return tmp_dir, frame_names, local_idx
+
+
+def scale_points(points, src_wh, dst_wh):
+    """将标注点从 src_wh 坐标系缩放到 dst_wh 坐标系"""
+    if not points or src_wh == dst_wh:
+        return points
+    sx = dst_wh[0] / src_wh[0]
+    sy = dst_wh[1] / src_wh[1]
+    return [[p[0] * sx, p[1] * sy] for p in points]
+
+
+def upscale_mask(mask, dst_wh):
+    """将 mask 放大到 dst_wh (W, H) 大小"""
+    mh, mw = mask.shape
+    if (mw, mh) == dst_wh:
+        return mask
+    m_u8 = mask.astype(np.uint8) * 255
+    m_up = cv2.resize(m_u8, dst_wh, interpolation=cv2.INTER_NEAREST)
+    return m_up > 127
 
 
 def track_chunk(predictor, tmp_dir, frame_names,
@@ -586,8 +615,23 @@ def main():
     else:
         print(f"[模式] 纯SAM2  CHUNK_SIZE={CHUNK_SIZE}")
 
+    # ── 推理分辨率：计算缩放比例 ─────────────────────────────────────────────
+    orig_wh   = (VW, VH)   # 原始分辨率
+    infer_wh  = SAM2_INFER_SIZE if SAM2_INFER_SIZE is not None else orig_wh
+    do_resize = (infer_wh != orig_wh)
+
+    if do_resize:
+        print(f"[缩放] SAM2推理: {infer_wh[0]}×{infer_wh[1]}  "
+              f"输出/温度: {orig_wh[0]}×{orig_wh[1]}")
+        # 将标注点坐标缩放到推理分辨率
+        fg_infer = scale_points(fg_points, orig_wh, infer_wh)
+        bg_infer = scale_points(bg_points, orig_wh, infer_wh)
+    else:
+        fg_infer = fg_points
+        bg_infer = bg_points
+
     if not use_flow:
-        # ── 纯 SAM2 模式（原有逻辑）──────────────────────────────────────────
+        # ── 纯 SAM2 模式 ──────────────────────────────────────────────────────
         n_chunks = (track_frames + CHUNK_SIZE - 1) // CHUNK_SIZE
         for chunk_i in range(n_chunks):
             chunk_start_abs = start_frame + chunk_i * CHUNK_SIZE
@@ -599,7 +643,8 @@ def main():
                   f"  ({chunk_len} 帧)")
 
             tmp_dir, frame_names, actual = extract_chunk_to_dir(
-                video_path, chunk_start_abs, chunk_end_abs
+                video_path, chunk_start_abs, chunk_end_abs,
+                infer_size=SAM2_INFER_SIZE
             )
             print(f"[抽帧] 临时目录: {tmp_dir}  实际帧数: {actual}")
 
@@ -619,12 +664,25 @@ def main():
                             "label":       kf.get("label", ""),
                         })
 
-                chunk_masks, carry_mask = track_chunk(
+                # carry_mask 需要缩放到推理分辨率传给下一批
+                carry_mask_infer = None
+                if carry_mask is not None and do_resize:
+                    carry_mask_infer = upscale_mask(carry_mask, infer_wh) \
+                        if carry_mask.shape != (infer_wh[1], infer_wh[0]) else carry_mask
+                else:
+                    carry_mask_infer = carry_mask
+
+                chunk_masks, carry_mask_raw = track_chunk(
                     predictor, tmp_dir, frame_names,
-                    fg_points, bg_points,
-                    carry_mask=carry_mask,
+                    fg_infer, bg_infer,
+                    carry_mask=carry_mask_infer,
                     inject_keyframes=inject_this_chunk,
                 )
+                # carry_mask 放大回原始分辨率，供下批 add_new_mask 使用
+                if do_resize and carry_mask_raw is not None:
+                    carry_mask = upscale_mask(carry_mask_raw, orig_wh)
+                else:
+                    carry_mask = carry_mask_raw
                 print(f"[SAM2] 批次 {chunk_i+1} 追踪完成，{len(chunk_masks)} 帧")
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -640,8 +698,10 @@ def main():
 
                 abs_idx   = chunk_start_abs + local_in_chunk
                 local_idx = global_local + local_in_chunk
-                mask      = chunk_masks.get(local_in_chunk,
-                                            np.zeros((VH, VW), dtype=bool))
+                # SAM2 返回的是推理分辨率的 mask，放大回原始分辨率
+                raw_mask  = chunk_masks.get(local_in_chunk,
+                                            np.zeros((infer_wh[1], infer_wh[0]), dtype=bool))
+                mask      = upscale_mask(raw_mask, orig_wh) if do_resize else raw_mask
                 mask_src  = "SAM2"
 
                 vis       = render_overlay(frame, mask, MASK_COLOR, MASK_ALPHA)
