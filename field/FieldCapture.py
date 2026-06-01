@@ -113,6 +113,19 @@ IR_VIDEO_W = 512
 IR_VIDEO_H = 384
 
 # ============================================================
+# ROI 配置（圆形监测区域，在 RGB 预览坐标系下定义）
+# 默认位置：预览画面中心偏下，半径 60px（预览尺寸 640×480）
+# ============================================================
+ROI_CONFIG_PATH = os.path.join(_DATA_DIR, "roi_config.json")
+
+# ROI 状态（预览坐标系，640×480）
+roi_cx      = 320    # 圆心 X
+roi_cy      = 320    # 圆心 Y（偏下）
+roi_radius  = 60     # 半径（像素，预览坐标系）
+roi_editing = False  # 是否处于 ROI 编辑模式
+roi_dragging = False # 是否正在拖拽圆心
+
+# ============================================================
 # DLL 加载与 SDK 初始化
 # ============================================================
 
@@ -270,6 +283,87 @@ def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
         pass
 
 # ============================================================
+# ROI 工具函数
+# ============================================================
+
+def load_roi_config():
+    """从文件加载 ROI 配置，不存在则用默认值"""
+    global roi_cx, roi_cy, roi_radius
+    if os.path.exists(ROI_CONFIG_PATH):
+        try:
+            import json
+            with open(ROI_CONFIG_PATH, "r") as f:
+                cfg = json.load(f)
+            roi_cx     = cfg.get("preview_cx", roi_cx)
+            roi_cy     = cfg.get("preview_cy", roi_cy)
+            roi_radius = cfg.get("preview_radius", roi_radius)
+            print(f"[ROI] 已加载配置: 圆心=({roi_cx},{roi_cy}) 半径={roi_radius}px")
+        except Exception:
+            pass
+
+
+def save_roi_config(preview_w, preview_h, rgb_w, rgb_h):
+    """保存 ROI 配置到 JSON，同时记录原始 RGB 坐标系下的值"""
+    import json
+    # 将预览坐标系换算回原始 RGB 坐标系
+    sx = rgb_w / preview_w
+    sy = rgb_h / preview_h
+    cfg = {
+        "preview_cx":     roi_cx,
+        "preview_cy":     roi_cy,
+        "preview_radius": roi_radius,
+        "preview_w":      preview_w,
+        "preview_h":      preview_h,
+        "rgb_cx":         int(roi_cx * sx),
+        "rgb_cy":         int(roi_cy * sy),
+        "rgb_radius":     int(roi_radius * max(sx, sy)),
+        "rgb_w":          rgb_w,
+        "rgb_h":          rgb_h,
+    }
+    with open(ROI_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"[ROI] 已保存: {ROI_CONFIG_PATH}")
+    print(f"  预览坐标: 圆心=({roi_cx},{roi_cy}) 半径={roi_radius}px")
+    print(f"  原始RGB坐标: 圆心=({cfg['rgb_cx']},{cfg['rgb_cy']}) 半径={cfg['rgb_radius']}px")
+
+
+def draw_roi_on_frame(img, editing=False):
+    """在图像上绘制 ROI 圆形，编辑模式下用黄色，正常模式用青色"""
+    color  = (0, 255, 255) if editing else (255, 200, 0)
+    thick  = 2 if not editing else 3
+    cv2.circle(img, (roi_cx, roi_cy), roi_radius, color, thick)
+    cv2.circle(img, (roi_cx, roi_cy), 4, color, -1)
+    if editing:
+        cv2.putText(img, "[R]=退出编辑  拖拽=移动  滚轮=调半径",
+                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+    else:
+        cv2.putText(img, f"ROI r={roi_radius}px  [R]=编辑",
+                    (roi_cx - 40, roi_cy + roi_radius + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0), 1)
+
+
+def roi_mouse_callback(event, x, y, flags, param):
+    """ROI 编辑模式下的鼠标回调"""
+    global roi_cx, roi_cy, roi_radius, roi_dragging
+    if not roi_editing:
+        return
+    if event == cv2.EVENT_LBUTTONDOWN:
+        # 点击圆心附近开始拖拽
+        if abs(x - roi_cx) < roi_radius and abs(y - roi_cy) < roi_radius:
+            roi_dragging = True
+    elif event == cv2.EVENT_MOUSEMOVE and roi_dragging:
+        roi_cx = max(roi_radius, min(param["w"] - roi_radius, x))
+        roi_cy = max(roi_radius, min(param["h"] - roi_radius, y))
+    elif event == cv2.EVENT_LBUTTONUP:
+        roi_dragging = False
+    elif event == cv2.EVENT_MOUSEWHEEL:
+        if flags > 0:
+            roi_radius = min(200, roi_radius + 5)
+        else:
+            roi_radius = max(10, roi_radius - 5)
+
+
+# ============================================================
 # 温度矩阵 → 伪彩色图（用于预览）
 # ============================================================
 
@@ -300,6 +394,7 @@ def temp_to_colormap(temp_matrix, width=640, height=480):
 def main():
     global is_recording, video_writer, ir_video_writer, ir_frame_count
     global temp_list, frame_count, temp_count, rec_ts
+    global roi_editing, roi_cx, roi_cy, roi_radius, roi_dragging
 
     print("=" * 55)
     print("  Chef Vision — 厨房数据采集（现场版）")
@@ -345,9 +440,21 @@ def main():
         print(f"[错误] 启动视频预览失败: {ret}")
 
     print("\n[等待数据流...] 画面出现后按 S 开始录制，按 Q 退出")
+    print("  [R] 进入/退出 ROI 编辑模式（拖拽移动，滚轮调半径）")
 
     # 5. 主循环：显示双画面预览
     PREVIEW_W, PREVIEW_H = 640, 480
+    WIN_NAME = "Chef Vision — [S] 录制  [Q] 退出  [R] 编辑ROI"
+
+    # 加载已有 ROI 配置
+    load_roi_config()
+
+    cv2.namedWindow(WIN_NAME)
+    cv2.setMouseCallback(WIN_NAME, roi_mouse_callback,
+                         {"w": PREVIEW_W, "h": PREVIEW_H})
+
+    # 获取原始 RGB 分辨率（等第一帧到来后才知道）
+    rgb_orig_w, rgb_orig_h = 1600, 1200  # 默认值，回调到来后更新
 
     while True:
         # 读取最新帧
@@ -372,21 +479,70 @@ def main():
             cv2.putText(right, "等待 IR 信号...", (150, 240),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
 
+        # 更新原始 RGB 分辨率
+        if rgb_frame is not None:
+            rgb_orig_h, rgb_orig_w = rgb_frame.shape[:2]
+
+        # 在 RGB 预览上绘制 ROI 圆形
+        draw_roi_on_frame(left, editing=roi_editing)
+
+        # 在 IR 预览上绘制对应映射区域（通过单应矩阵，若无则按比例估算）
+        hom_path = os.path.join(_HERE, "..", "data", "homography.npy")
+        if ir_matrix is not None:
+            try:
+                H = np.load(hom_path)
+                # ROI 圆心（预览坐标 → 原始 RGB 坐标 → IR 坐标）
+                sx = rgb_orig_w / PREVIEW_W
+                sy = rgb_orig_h / PREVIEW_H
+                rgb_pt = np.array([[[roi_cx * sx, roi_cy * sy]]], dtype=np.float32)
+                ir_pt  = cv2.perspectiveTransform(rgb_pt, H)[0][0]
+                # IR 坐标 → 预览坐标（IR 原始 192×256 → 640×480）
+                ir_h, ir_w = ir_matrix.shape[:2]
+                ir_px = int(ir_pt[0] / ir_w * PREVIEW_W)
+                ir_py = int(ir_pt[1] / ir_h * PREVIEW_H)
+                ir_pr = int(roi_radius * (PREVIEW_W / ir_w) * (ir_w / rgb_orig_w) * sx)
+                ir_pr = max(5, min(100, ir_pr))
+                cv2.circle(right, (ir_px, ir_py), ir_pr, (255, 200, 0), 2)
+                cv2.circle(right, (ir_px, ir_py), 4, (255, 200, 0), -1)
+                # 显示 ROI 区域温度
+                mask = np.zeros(ir_matrix.shape[:2], dtype=np.uint8)
+                cv2.circle(mask,
+                           (int(ir_pt[0]), int(ir_pt[1])),
+                           max(2, int(roi_radius * ir_w / rgb_orig_w * sx)),
+                           255, -1)
+                roi_temps = ir_matrix[mask > 0]
+                if len(roi_temps) > 0:
+                    roi_t = float(np.mean(roi_temps))
+                    cv2.putText(right, f"ROI: {roi_t:.1f}C",
+                                (ir_px - 40, ir_py - ir_pr - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            except Exception:
+                pass  # 单应矩阵不存在时跳过
+
         # 录制状态指示
         status_color = (0, 0, 255) if is_recording else (0, 200, 0)
-        status_text  = f"● REC  帧:{frame_count}" if is_recording else "● 预览中  [S]=开始录制  [Q]=退出"
+        status_text  = f"● REC  帧:{frame_count}" if is_recording else "● 预览中  [S]=录制  [Q]=退出  [R]=ROI"
         cv2.putText(left,  status_text, (10, PREVIEW_H - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 2)
         cv2.putText(right, "IR 热力图", (10, PREVIEW_H - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
         # 左右拼接
         combined = np.hstack([left, right])
-        cv2.imshow("Chef Vision — [S] 录制  [Q] 退出", combined)
+        cv2.imshow(WIN_NAME, combined)
 
         key = cv2.waitKey(30) & 0xFF
 
-        if key == ord('s') or key == ord('S'):
+        if key == ord('r') or key == ord('R'):
+            roi_editing = not roi_editing
+            if not roi_editing:
+                # 退出编辑时保存配置
+                save_roi_config(PREVIEW_W, PREVIEW_H, rgb_orig_w, rgb_orig_h)
+                print(f"[ROI] 编辑完成，已保存")
+            else:
+                print("[ROI] 进入编辑模式：拖拽圆心移动，滚轮调节半径，再按 R 保存退出")
+
+        elif key == ord('s') or key == ord('S'):
             if not is_recording:
                 rec_ts          = datetime.now().strftime("%Y%m%d_%H%M%S")  # 统一时间戳
                 is_recording    = True

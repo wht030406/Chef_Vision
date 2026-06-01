@@ -4,11 +4,7 @@
 *.avi
 
 # 输出目录（视频和数据文件）
-output/*.mp4
-output/*.csv
-output/*.xlsx
-output/*.png
-output/*/
+output/
 
 # 临时帧目录
 core/tmp_sam2_frames/
@@ -16,6 +12,14 @@ core/tmp_sam2_frames/
 # SAM2 模型权重（文件较大，不提交到 git）
 models/*.pt
 models/*.pth
+
+# SDK 二进制文件（DLL、头文件不需要版本控制）
+sdk/*.dll
+sdk/*.h
+sdk/*.lib
+
+# 测试数据（视频/温度矩阵太大）
+test_data/
 
 # Python 缓存
 __pycache__/
@@ -25,7 +29,15 @@ __pycache__/
 
 # 日志
 *.log
+IRCNETSDK.log
 
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 标定图片（中间产物）
+*.png
+calibration_verify.png
+filter_result.png
+segment_result.png
+temp_verify.png

@@ -327,6 +327,8 @@ def track_chunk(predictor, tmp_dir, frame_names,
             masks[out_frame_idx] = mask
 
         predictor.reset_state(inference_state)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     last_mask = masks.get(len(frame_names) - 1, None)
     return masks, last_mask
@@ -417,15 +419,19 @@ def render_overlay(frame_bgr, mask, color_bgr, alpha):
     return vis
 
 
-def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60):
+def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
+                    roi_history=None, ir_mask_history=None):
     """
-    用纯 numpy/cv2 绘制 Mask 均值温度折线图，返回 BGR 图像 (h, w, 3)。
+    用纯 numpy/cv2 绘制温度折线图，支持三条曲线：
+      SAM2 mask（橙色）、ROI 固定圆圈（蓝色）、IR mask 自动分割（绿色）
 
     参数：
-      temp_history : list of (time_s, temp_mean)，已记录的历史温度
-      cur_time_s   : 当前帧时间（秒）
-      w, h         : 图像宽高（像素）
-      curve_win_s  : 滑动窗口长度（秒），只显示最近 N 秒
+      temp_history    : list of (time_s, temp_mean)，SAM2 mask 温度历史
+      cur_time_s      : 当前帧时间（秒）
+      w, h            : 图像宽高（像素）
+      curve_win_s     : 滑动窗口长度（秒），只显示最近 N 秒
+      roi_history     : list of (time_s, temp_mean)，ROI 区域温度历史（可选）
+      ir_mask_history : list of (time_s, temp_mean)，IR mask 温度历史（可选）
     """
     bar = np.zeros((h, w, 3), dtype=np.uint8)
     if len(temp_history) < 2:
@@ -437,16 +443,22 @@ def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60):
     t0  = max(0.0, cur_time_s - curve_win_s)
     pts = [(t, v) for t, v in temp_history if t >= t0 and not np.isnan(v)]
     if len(pts) < 2:
-        pts = temp_history[-2:]   # 至少保留最后两个点
+        pts = temp_history[-2:]
 
     times = [p[0] for p in pts]
     vals  = [p[1] for p in pts]
 
-    # 坐标范围（Y 轴留 5°C 余量）
+    # ROI 数据（同窗口）
+    roi_pts = []
+    if roi_history:
+        roi_pts = [(t, v) for t, v in roi_history if t >= t0 and not np.isnan(v)]
+
+    # 坐标范围（Y 轴留 5°C 余量，兼顾两条曲线）
+    all_vals = vals + [v for _, v in roi_pts]
     t_min = t0
     t_max = max(cur_time_s, t0 + 1.0)
-    v_min = max(0.0, min(vals) - 5.0)
-    v_max = max(vals) + 5.0
+    v_min = max(0.0, min(all_vals) - 5.0)
+    v_max = max(all_vals) + 5.0
     if v_max <= v_min:
         v_max = v_min + 10.0
 
@@ -476,24 +488,59 @@ def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60):
     cv2.putText(bar, f"{cur_time_s:.1f}s", (w - pad_r - 30, h - 5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.32, (140, 140, 140), 1)
 
-    # 折线（橙色）
+    # SAM2 mask 折线（橙色）
     screen_pts = [(tx(t), ty(v)) for t, v in zip(times, vals)]
     for i in range(1, len(screen_pts)):
         p1, p2 = screen_pts[i - 1], screen_pts[i]
-        # 防止坐标越界
         if all(0 <= c < dim for c, dim in [(p1[0], w), (p1[1], h), (p2[0], w), (p2[1], h)]):
             cv2.line(bar, p1, p2, (50, 165, 255), 2)
 
-    # 当前帧红点
+    # ROI 折线（蓝色）
+    if len(roi_pts) >= 2:
+        roi_screen = [(tx(t), ty(v)) for t, v in roi_pts]
+        for i in range(1, len(roi_screen)):
+            p1, p2 = roi_screen[i - 1], roi_screen[i]
+            if all(0 <= c < dim for c, dim in [(p1[0], w), (p1[1], h), (p2[0], w), (p2[1], h)]):
+                cv2.line(bar, p1, p2, (255, 160, 30), 2)
+        # ROI 当前值
+        rx, ry = roi_screen[-1]
+        if 0 <= rx < w and 0 <= ry < h:
+            cv2.circle(bar, (rx, ry), 4, (255, 100, 0), -1)
+            cv2.putText(bar, f"ROI:{roi_pts[-1][1]:.1f}C", (rx + 6, ry + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 180, 60), 1)
+
+    # IR mask 折线（绿色）
+    ir_pts = []
+    if ir_mask_history:
+        ir_pts = [(t, v) for t, v in ir_mask_history if t >= t0 and not np.isnan(v)]
+    if len(ir_pts) >= 2:
+        ir_screen = [(tx(t), ty(v)) for t, v in ir_pts]
+        for i in range(1, len(ir_screen)):
+            p1, p2 = ir_screen[i - 1], ir_screen[i]
+            if all(0 <= c < dim for c, dim in [(p1[0], w), (p1[1], h), (p2[0], w), (p2[1], h)]):
+                cv2.line(bar, p1, p2, (0, 220, 80), 2)
+        irx, iry = ir_screen[-1]
+        if 0 <= irx < w and 0 <= iry < h:
+            cv2.circle(bar, (irx, iry), 4, (0, 255, 60), -1)
+            cv2.putText(bar, f"IR:{ir_pts[-1][1]:.1f}C", (irx + 6, iry + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 100), 1)
+
+    # SAM2 当前帧红点
     cx, cy = tx(cur_time_s), ty(vals[-1])
     if 0 <= cx < w and 0 <= cy < h:
         cv2.circle(bar, (cx, cy), 4, (0, 60, 255), -1)
-        cv2.putText(bar, f"{vals[-1]:.1f}C", (cx + 6, cy + 4),
+        cv2.putText(bar, f"Mask:{vals[-1]:.1f}C", (cx + 6, cy + 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 255), 1)
 
-    # 标题
-    cv2.putText(bar, "Mask Avg Temp (C)", (pad_l + 4, pad_t + 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+    # 图例（全英文，cv2 不支持中文/特殊符号）
+    cv2.putText(bar, "[SAM2]", (pad_l + 4, pad_t + 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (50, 165, 255), 1)
+    if roi_pts:
+        cv2.putText(bar, "[ROI]", (pad_l + 70, pad_t + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 160, 30), 1)
+    if ir_pts:
+        cv2.putText(bar, "[IR-Auto]", (pad_l + 120, pad_t + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 220, 80), 1)
 
     return bar
 
@@ -589,8 +636,48 @@ def main():
     fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
     OUT_H    = VH + INFO_H + CHART_H          # 原始帧高 + 文字条 + 曲线图
     writer   = cv2.VideoWriter(out_video_viz, fourcc, fps, (VW, OUT_H))
-    csv_lines = ["frame_abs,frame_rel,time_s,mask_pixels,mask_ratio,temp_mean,temp_min,temp_max"]
-    temp_history = []   # list of (time_s, temp_mean)，用于实时曲线绘制
+    csv_lines = ["frame_abs,frame_rel,time_s,mask_pixels,mask_ratio,temp_mean,temp_min,temp_max,roi_temp_mean,ir_mask_temp"]
+    temp_history     = []   # list of (time_s, temp_mean)，SAM2 mask 温度历史
+    roi_history      = []   # list of (time_s, roi_temp)，ROI 区域温度历史
+    ir_mask_history  = []   # list of (time_s, ir_mask_temp)，IR 自动分割温度历史
+
+    # ── 加载 ROI 配置 ─────────────────────────────────────────────────────────
+    roi_cfg = None
+    roi_cfg_path = os.path.join(_HERE, "..", "field", "roi_config.json")
+    # 也兼容放在 data/ 目录下的情况
+    if not os.path.exists(roi_cfg_path):
+        roi_cfg_path = os.path.join(_HERE, "..", "data", "roi_config.json")
+    if os.path.exists(roi_cfg_path):
+        with open(roi_cfg_path, "r") as f:
+            roi_cfg = json.load(f)
+        print(f"[ROI] 已加载配置: {roi_cfg_path}")
+        print(f"  RGB坐标: 圆心=({roi_cfg['rgb_cx']},{roi_cfg['rgb_cy']}) 半径={roi_cfg['rgb_radius']}px")
+    else:
+        print(f"[ROI] 未找到 roi_config.json，跳过 ROI 温度统计")
+        print(f"  提示：在 FieldCapture.py 中按 R 键设置 ROI 后会自动生成")
+
+    # ── 加载 IR 锅区域配置（用于 IR 自动分割温度曲线）────────────────────────
+    wok_cfg     = None
+    wok_mask_ir = None
+    IR_FOOD_PCT = 40   # 锅内低于此百分位的像素 = 菜
+    wok_cfg_path = os.path.join(_HERE, "..", "data", "wok_region.json")
+    if os.path.exists(wok_cfg_path) and temp_data is not None:
+        with open(wok_cfg_path) as f:
+            wok_cfg = json.load(f)
+        ir_h_wok = temp_data.shape[1]
+        ir_w_wok = temp_data.shape[2]
+        wok_mask_ir = np.zeros((ir_h_wok, ir_w_wok), dtype=np.uint8)
+        cv2.ellipse(wok_mask_ir,
+                    (wok_cfg["cx"], wok_cfg["cy"]),
+                    (wok_cfg["rx"], wok_cfg["ry"]),
+                    0, 0, 360, 255, -1)
+        wok_mask_ir = wok_mask_ir > 0
+        print(f"[IR Mask] 已加载锅区域: {wok_cfg_path}")
+        print(f"  cx={wok_cfg['cx']} cy={wok_cfg['cy']} "
+              f"rx={wok_cfg['rx']} ry={wok_cfg['ry']}  "
+              f"覆盖 {wok_mask_ir.sum()} 像素")
+    else:
+        print(f"[IR Mask] 未找到 wok_region.json 或无温度数据，跳过 IR 自动分割温度")
 
     # ── 分批追踪主循环（SAM2 + 光流混合）────────────────────────────────────
     # 真正的混合模式：
@@ -723,21 +810,84 @@ def main():
                 if not np.isnan(temp_mean):
                     temp_history.append((time_s, temp_mean))
 
+                # ── ROI 温度统计 ──────────────────────────────────────────────
+                roi_temp_mean = float("nan")
+                if roi_cfg is not None and temp_data is not None and homography is not None:
+                    try:
+                        ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
+                        ir_idx_roi = int(abs_idx * ir_fps_ratio)
+                        if ir_idx_roi < temp_data.shape[0]:
+                            # RGB 圆心 → IR 坐标
+                            rgb_pt = np.array([[[float(roi_cfg["rgb_cx"]),
+                                                 float(roi_cfg["rgb_cy"])]]], dtype=np.float32)
+                            ir_pt  = cv2.perspectiveTransform(rgb_pt, homography)[0][0]
+                            ir_cx_roi = int(round(ir_pt[0]))
+                            ir_cy_roi = int(round(ir_pt[1]))
+                            # RGB 半径 → IR 半径（按 IR/RGB 宽度比缩放）
+                            ir_r = max(1, int(roi_cfg["rgb_radius"] * ir_w / roi_cfg["rgb_w"]))
+                            # 生成圆形 mask
+                            roi_mask_ir = np.zeros((ir_h, ir_w), dtype=np.uint8)
+                            cv2.circle(roi_mask_ir, (ir_cx_roi, ir_cy_roi), ir_r, 255, -1)
+                            roi_temps = temp_data[ir_idx_roi][roi_mask_ir > 0]
+                            if len(roi_temps) > 0:
+                                roi_temp_mean = float(np.mean(roi_temps))
+                    except Exception:
+                        pass
+                if not np.isnan(roi_temp_mean):
+                    roi_history.append((time_s, roi_temp_mean))
+
+                # 在 RGB 帧上叠加 ROI 圆形
+                if roi_cfg is not None:
+                    cv2.circle(vis, (roi_cfg["rgb_cx"], roi_cfg["rgb_cy"]),
+                               roi_cfg["rgb_radius"], (255, 200, 0), 2)
+                    if not np.isnan(roi_temp_mean):
+                        cv2.putText(vis, f"ROI:{roi_temp_mean:.1f}C",
+                                    (roi_cfg["rgb_cx"] - 40,
+                                     roi_cfg["rgb_cy"] - roi_cfg["rgb_radius"] - 8),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
+
                 info_bar = np.zeros((INFO_H, VW, 3), dtype=np.uint8)
                 cv2.putText(info_bar,
                             f"Frame {abs_idx}  t={time_s:.1f}s  Mask={mask_ratio:.1f}%  [SAM2]",
                             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-                cv2.putText(info_bar,
-                            (f"Temp: mean={temp_mean:.1f}C  min={temp_min:.1f}C  max={temp_max:.1f}C"
-                             if not np.isnan(temp_mean) else "Temp: N/A"),
-                            (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 1)
 
-                chart_bar = draw_temp_chart(temp_history, time_s, VW, CHART_H, CURVE_WIN_S)
+                # ── IR mask 自动分割温度 ──────────────────────────────────────
+                ir_mask_temp = float("nan")
+                if wok_mask_ir is not None and temp_data is not None:
+                    ir_idx_wok = int(abs_idx * ir_fps_ratio)
+                    if ir_idx_wok < temp_data.shape[0]:
+                        t_frame_wok = temp_data[ir_idx_wok]
+                        wok_temps   = t_frame_wok[wok_mask_ir]
+                        if len(wok_temps) > 0:
+                            t_thresh = np.percentile(wok_temps, IR_FOOD_PCT)
+                            food_ir  = wok_mask_ir & (t_frame_wok <= t_thresh)
+                            if food_ir.sum() > 0:
+                                ir_mask_temp = float(np.mean(t_frame_wok[food_ir]))
+                if not np.isnan(ir_mask_temp):
+                    ir_mask_history.append((time_s, ir_mask_temp))
+
+                # ── info_bar 第二行：三个温度值 ───────────────────────────────
+                parts = []
+                if not np.isnan(temp_mean):
+                    parts.append(f"SAM2:{temp_mean:.1f}C(min{temp_min:.0f}/max{temp_max:.0f})")
+                else:
+                    parts.append("SAM2:N/A")
+                if not np.isnan(roi_temp_mean):
+                    parts.append(f"ROI:{roi_temp_mean:.1f}C")
+                if not np.isnan(ir_mask_temp):
+                    parts.append(f"IR:{ir_mask_temp:.1f}C")
+                cv2.putText(info_bar, "  ".join(parts),
+                            (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (100, 255, 200), 1)
+
+                chart_bar = draw_temp_chart(temp_history, time_s, VW, CHART_H, CURVE_WIN_S,
+                                            roi_history=roi_history,
+                                            ir_mask_history=ir_mask_history)
                 writer.write(np.vstack([vis, info_bar, chart_bar]))
                 csv_lines.append(
                     f"{abs_idx},{local_idx},{time_s:.3f},"
                     f"{mask.sum()},{mask_ratio:.2f},"
-                    f"{temp_mean:.2f},{temp_min:.2f},{temp_max:.2f}"
+                    f"{temp_mean:.2f},{temp_min:.2f},{temp_max:.2f},"
+                    f"{roi_temp_mean:.2f},{ir_mask_temp:.2f}"
                 )
                 if local_in_chunk % 50 == 0:
                     print(f"  写帧: {local_in_chunk+1}/{actual}  "
