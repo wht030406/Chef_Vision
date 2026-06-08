@@ -897,15 +897,16 @@ def main():
                             print(f"[补强] t={chunk_start_s:.1f}s  "
                                   f"mask偏离锅内(overlap={_overlap_pct:.0f}%<60%)，"
                                   f"重置SAM2→初始标注点")
-                    # 也保留面积检查：mask 超过 wok 区域 70% 同样重置（整锅漂移）
+                    # 也保留面积检查：mask 超过 wok 区域 35% 同样重置（整锅漂移/锅底漂移）
+                    # 食材正常情况下占锅内面积 < 35%，超过说明 SAM2 追踪到了锅底/空白区域
                     _wok_px_chk = int(_wok_rgb_constraint.sum()) if _wok_rgb_constraint is not None else (VW * VH)
                     _mask_vs_wok = _mask_px / max(_wok_px_chk, 1) * 100
                     if not _need_reset:
-                        if _mask_vs_wok > 70.0:
+                        if _mask_vs_wok > 35.0:
                             _need_reset = True
                             print(f"[补强] t={chunk_start_s:.1f}s  "
-                                  f"mask过大({_mask_vs_wok:.0f}%>wok70%)，"
-                                  f"重置SAM2→初始标注点")
+                                  f"mask过大({_mask_vs_wok:.0f}%>wok35%)，"
+                                  f"重置SAM2→IR定位新前景点")
                     # ── 第三级：面积骤降检测（漂移到旋转轴/小碎片）────────────
                     # last_reinforce_wok_pct = 上次补强时 mask 占 wok% （不是批次均值）
                     # 骤降 > 70% 或绝对值 < 2% → 重置
@@ -924,6 +925,54 @@ def main():
                     if _need_reset:
                         carry_mask = None
                         last_relabel_s = chunk_start_s
+                        # ── 尝试用 IR 当前帧低温区定位食材，生成新前景点 ────────
+                        # 原理：食材温度 < 锅壁温度，取锅内低温像素 → 反投影到 RGB
+                        _ir_fg_pts = []
+                        if (temp_data is not None and homography is not None
+                                and _wok_mask_al is not None and _H_inv_al is not None
+                                and _rng_al is not None):
+                            try:
+                                _ir_idx_rst = min(int(chunk_start_abs * ir_fps_ratio),
+                                                  temp_data.shape[0] - 1)
+                                _ir_frm_rst = temp_data[_ir_idx_rst]
+                                _wok_t_rst  = _ir_frm_rst[_wok_mask_al]
+                                if len(_wok_t_rst) >= 10:
+                                    # 取锅内温度低于 35 百分位的像素作为"食材候选"
+                                    _t_thresh = float(np.percentile(_wok_t_rst, 35))
+                                    _food_ir  = (_ir_frm_rst < _t_thresh) & _wok_mask_al
+                                    _ys_ir, _xs_ir = np.where(_food_ir)
+                                    if len(_xs_ir) >= 6:
+                                        # 随机采 8 个 IR 像素
+                                        _sel_ir = _rng_al.choice(len(_xs_ir),
+                                                                  size=min(8, len(_xs_ir)),
+                                                                  replace=False)
+                                        # IR 坐标 → 齐次坐标 → 反投影到 RGB
+                                        _pts_ir_h = np.stack([
+                                            _xs_ir[_sel_ir].astype(float),
+                                            _ys_ir[_sel_ir].astype(float),
+                                            np.ones(len(_sel_ir))
+                                        ])  # (3, N)
+                                        _pts_rgb_h = _H_inv_al @ _pts_ir_h
+                                        _pts_rgb_h = _pts_rgb_h[:2] / _pts_rgb_h[2]
+                                        for _xi, _yi in _pts_rgb_h.T:
+                                            _xi, _yi = float(_xi), float(_yi)
+                                            if 0 <= _xi < VW and 0 <= _yi < VH:
+                                                _ir_fg_pts.append([_xi, _yi])
+                                        if _ir_fg_pts:
+                                            print(f"[补强] t={chunk_start_s:.1f}s  "
+                                                  f"重置+IR定位新前景点({len(_ir_fg_pts)}个)"
+                                                  f"  阈值={_t_thresh:.1f}°C")
+                            except Exception as _re:
+                                print(f"[补强] IR定位失败({_re})，重置后用初始标注点")
+                        if _ir_fg_pts:
+                            # 把 IR 定位点作为下一批的补强注入（carry_mask=None 时走初始点路径，
+                            # 但可以通过 inject_keyframes 在第 0 帧追加点）
+                            _reinforce_inject = {
+                                "local_frame": 0,
+                                "fg_points":   _ir_fg_pts,
+                                "bg_points":   [],
+                                "label":       "IR-reset",
+                            }
                     else:
                         # ── mask 正常，从内部腐蚀区域采点补强 ────────────────────
                         try:
