@@ -923,6 +923,43 @@ def main():
                                   f"mask面积骤降({last_reinforce_wok_pct:.0f}%→{_mask_vs_wok:.0f}%，"
                                   f"跌幅{_drop_pct:.0f}%>70%)，重置SAM2→初始标注点")
                     if _need_reset:
+                        # ── 先保存重置预览图（用跑偏的 carry_mask 可视化，方便排查）──
+                        try:
+                            _cap_rst = cv2.VideoCapture(video_path)
+                            _cap_rst.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
+                            _ret_rst, _rgb_rst = _cap_rst.read()
+                            _cap_rst.release()
+                            if _ret_rst:
+                                _vis_rst = _rgb_rst.copy()
+                                # 用红色半透明显示跑偏的 carry_mask
+                                if carry_mask is not None and carry_mask.any():
+                                    _vis_rst[carry_mask] = (
+                                        _vis_rst[carry_mask].astype(float) * 0.5
+                                        + np.array([0, 0, 220]) * 0.5
+                                    ).astype(np.uint8)
+                                # 标注重置原因（取最后触发的那条）
+                                _rst_reason = "RESET"
+                                if _mask_vs_wok < 2.0:
+                                    _rst_reason = f"RESET: mask过小({_mask_vs_wok:.1f}%<2%)"
+                                elif last_reinforce_wok_pct > 5.0 and _drop_pct > 70.0:
+                                    _rst_reason = f"RESET: 骤降({last_reinforce_wok_pct:.0f}%→{_mask_vs_wok:.0f}%)"
+                                elif _mask_vs_wok > 35.0:
+                                    _rst_reason = f"RESET: mask过大({_mask_vs_wok:.0f}%>wok35%)"
+                                elif _overlap_pct < 60.0:
+                                    _rst_reason = f"RESET: 偏离锅内(overlap={_overlap_pct:.0f}%)"
+                                cv2.putText(_vis_rst, _rst_reason,
+                                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                                            1.0, (0, 0, 255), 2)
+                                cv2.putText(_vis_rst,
+                                            f"t={chunk_start_s:.0f}s  f={chunk_start_abs}  [blue=bad_mask]",
+                                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.75, (80, 80, 255), 2)
+                                _rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
+                                cv2.imwrite(os.path.join(out_dir, _rst_name), _vis_rst)
+                                print(f"[重置] 预览图已保存: {_rst_name}  原因: {_rst_reason}")
+                        except Exception as _rpe:
+                            print(f"[重置] 预览图保存失败: {_rpe}")
+
                         carry_mask = None
                         last_relabel_s = chunk_start_s
                         # ── 尝试用 IR 当前帧低温区定位食材，生成新前景点 ────────
@@ -1078,6 +1115,9 @@ def main():
                     carry_mask = upscale_mask(carry_mask_raw, orig_wh)
                 else:
                     carry_mask = carry_mask_raw
+                # ── 对 carry_mask 也做 wok 约束，防止面积检查出现 >100% ──────
+                if carry_mask is not None and _wok_rgb_constraint is not None:
+                    carry_mask = carry_mask & _wok_rgb_constraint
                 print(f"[SAM2] 批次 {chunk_i+1} 追踪完成，{len(chunk_masks)} 帧")
 
                 # ── mask 面积异常检测：若本批平均占比 > 60% 且比上批大 3 倍 → 强制下批重标点 ──
