@@ -49,11 +49,11 @@ OUTPUT_EXCEL    = os.path.join(_HERE, "..", "output", "food_temp_log.xlsx")
 
 # SAM2 配置
 # 模型选择：tiny（快，适合实时）/ large（慢，精度高，适合离线）
-MODEL_CFG       = "configs/sam2.1/sam2.1_hiera_t.yaml"
-CHECKPOINT_PATH = os.path.join(_HERE, "..", "models", "sam2.1_hiera_tiny.pt")
-# 如需切换回 large：
-# MODEL_CFG       = "configs/sam2.1/sam2.1_hiera_l.yaml"
-# CHECKPOINT_PATH = os.path.join(_HERE, "..", "models", "sam2.1_hiera_large.pt")
+# MODEL_CFG       = "configs/sam2.1/sam2.1_hiera_t.yaml"
+# CHECKPOINT_PATH = os.path.join(_HERE, "..", "models", "sam2.1_hiera_tiny.pt")
+# 切换到 large：
+MODEL_CFG       = "configs/sam2.1/sam2.1_hiera_l.yaml"
+CHECKPOINT_PATH = os.path.join(_HERE, "..", "models", "sam2.1_hiera_large.pt")
 
 # 分批处理参数
 OPTICAL_FLOW_INTERVAL = 0    # 0 = 纯 SAM2 模式（推荐）；>1 = SAM2+光流混合
@@ -83,6 +83,11 @@ SHOW_PREVIEW    = False           # 关闭实时预览，减少资源占用
 INFO_H          = 50              # 文字信息条高度（像素）
 CHART_H         = 120             # 温度曲线图高度（像素）
 CURVE_WIN_S     = 60              # 曲线滑动窗口（秒），只显示最近 N 秒
+
+# 分段自动重标点（模拟实时流水线）
+# 每隔 N 秒自动重新生成前景点并重置 SAM2，解决长时间追踪漂移问题
+# 0 = 关闭（使用 food_labels.json 中的关键帧）
+RELABEL_INTERVAL_S = 8
 
 # 临时帧目录（放在 core/ 下）
 TMP_BASE        = os.path.join(_HERE, "tmp_sam2_frames")
@@ -299,14 +304,16 @@ def track_chunk(predictor, tmp_dir, frame_names,
                 labels=labels,
             )
 
-        # ── 注入额外关键帧的前景点（例如青椒入锅帧）────────────────────────
+        # ── 注入额外关键帧的前景点 ───────────────────────────────────────────
+        # local_frame=0：补强点追加到第0帧（与 carry_mask 同帧，SAM2 会合并两者）
+        # local_frame>0：食材入锅等关键帧，在对应帧注入
         for kf_inject in inject_keyframes:
             local_f  = kf_inject["local_frame"]
             kf_fg    = kf_inject["fg_points"]
             kf_bg    = kf_inject.get("bg_points", [])
             if not kf_fg:
                 continue
-            if 0 < local_f < len(frame_names):
+            if 0 <= local_f < len(frame_names):
                 pts    = np.array(kf_fg + kf_bg, dtype=np.float32)
                 lbls   = np.array([1]*len(kf_fg) + [0]*len(kf_bg), dtype=np.int32)
                 predictor.add_new_points_or_box(
@@ -417,6 +424,53 @@ def render_overlay(frame_bgr, mask, color_bgr, alpha):
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(vis, contours, -1, (255, 255, 255), 1)
     return vis
+
+
+def _kmeans_food_temp(wok_temps, min_cluster_gap=30.0):
+    """
+    用 K-means 把锅内温度分成两类（高温=锅壁/锅底，低温=食物），
+    返回低温类的均值作为食物温度。
+
+    参数：
+      wok_temps       : 1D float array，锅内所有像素温度
+      min_cluster_gap : 两个聚类中心差距的最小值（°C）。
+                        若两类中心差距 < 此值，说明锅内温度分布均匀
+                        （锅倾斜/空锅/翻炒过渡期），返回 nan 表示帧不可靠。
+
+    返回：
+      float，食物温度均值；或 nan（帧不可靠）
+    """
+    vals = wok_temps.astype(np.float32).flatten()
+    if len(vals) < 10:
+        return float("nan")
+
+    # 初始化：用最小值和最大值作为两个初始中心
+    c_low  = float(np.percentile(vals, 10))
+    c_high = float(np.percentile(vals, 90))
+
+    # 迭代 K-means（最多 20 次，收敛即停）
+    for _ in range(20):
+        # 分配：每个像素归入更近的中心
+        dist_low  = np.abs(vals - c_low)
+        dist_high = np.abs(vals - c_high)
+        label_low = dist_low <= dist_high   # True = 低温类（食物）
+
+        new_low  = float(np.mean(vals[label_low]))  if label_low.any()  else c_low
+        new_high = float(np.mean(vals[~label_low])) if (~label_low).any() else c_high
+
+        if abs(new_low - c_low) < 0.1 and abs(new_high - c_high) < 0.1:
+            break
+        c_low, c_high = new_low, new_high
+
+    # 可靠性检查：两类中心差距太小 → 帧不可靠（翻炒/倾斜/空锅）
+    if (c_high - c_low) < min_cluster_gap:
+        return float("nan")
+
+    # 返回低温类（食物）的均值
+    dist_low  = np.abs(vals - c_low)
+    dist_high = np.abs(vals - c_high)
+    food_mask = dist_low <= dist_high
+    return float(np.mean(vals[food_mask])) if food_mask.any() else float("nan")
 
 
 def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
@@ -636,7 +690,10 @@ def main():
     fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
     OUT_H    = VH + INFO_H + CHART_H          # 原始帧高 + 文字条 + 曲线图
     writer   = cv2.VideoWriter(out_video_viz, fourcc, fps, (VW, OUT_H))
-    csv_lines = ["frame_abs,frame_rel,time_s,mask_pixels,mask_ratio,temp_mean,temp_min,temp_max,roi_temp_mean,ir_mask_temp"]
+    # 三策略逐帧数据（各自独立存储，输出为单独表格）
+    sam2_rows   = []   # [frame_abs, frame_rel, time_s, mask_pixels, mask_ratio, mean, min, max]
+    roi_rows    = []   # [frame_abs, frame_rel, time_s, roi_temp_mean]
+    ir_rows     = []   # [frame_abs, frame_rel, time_s, ir_mask_temp]
     temp_history     = []   # list of (time_s, temp_mean)，SAM2 mask 温度历史
     roi_history      = []   # list of (time_s, roi_temp)，ROI 区域温度历史
     ir_mask_history  = []   # list of (time_s, ir_mask_temp)，IR 自动分割温度历史
@@ -717,6 +774,78 @@ def main():
         fg_infer = fg_points
         bg_infer = bg_points
 
+    # ── 自动重标点：加载 auto_label 的标点函数 ────────────────────────────────
+    _auto_label_func = None
+    _wok_cfg_al      = None
+    _wok_mask_al     = None
+    _H_inv_al        = None
+    _rng_al          = None
+    if RELABEL_INTERVAL_S > 0:
+        try:
+            import sys as _sys
+            if _HERE not in _sys.path:
+                _sys.path.insert(0, _HERE)
+            from auto_label import (
+                load_wok_cfg as _al_load_wok,
+                build_wok_mask as _al_build_mask,
+                generate_ir_mask_and_points as _al_ir_mask,
+            )
+            _wok_cfg_al = _al_load_wok()
+            if temp_data is not None and homography is not None:
+                _ir_h_al = temp_data.shape[1]
+                _ir_w_al = temp_data.shape[2]
+                _wok_mask_al = _al_build_mask(_wok_cfg_al, _ir_h_al, _ir_w_al)
+                _H_inv_al    = np.linalg.inv(homography)
+                _rng_al      = np.random.default_rng(42)
+                _auto_label_func = _al_ir_mask
+                print(f"[自动重标点] 已加载，每 {RELABEL_INTERVAL_S}s 重新标点并重置SAM2")
+            else:
+                print(f"[自动重标点] 无温度数据或单应矩阵，禁用")
+        except ImportError as e:
+            print(f"[自动重标点] 导入失败({e})，禁用")
+
+    last_relabel_s = start_frame / fps   # 上次重标点的时间（秒）
+    prev_mask_ratio = 0.0                # 上批末帧 mask 面积占比（%），用于异常检测
+    last_reinforce_wok_pct = 0.0         # 上次补强时 mask 占 wok 区域的%（骤降检测用）
+
+    # ── 预计算 wok RGB mask（用于每帧后处理约束，避免循环内重复计算）────────
+    _wok_rgb_constraint = None   # (VH, VW) bool
+    if wok_mask_ir is not None and homography is not None:
+        try:
+            _H_inv_wok = np.linalg.inv(homography)
+            _wok_u8_pre = wok_mask_ir.astype(np.uint8) * 255
+            _wok_proj   = cv2.warpPerspective(_wok_u8_pre, _H_inv_wok, (VW, VH))
+            _wok_rgb_constraint = _wok_proj > 64
+            print(f"[wok约束] 预计算 RGB锅区域 mask  覆盖像素: {_wok_rgb_constraint.sum()}")
+        except Exception as _we:
+            print(f"[wok约束] 预计算失败({_we})，跳过约束")
+
+    # ── 保存初始关键帧预览图 ──────────────────────────────────────────────────
+    if _auto_label_func is not None:
+        try:
+            _cap_init = cv2.VideoCapture(video_path)
+            _cap_init.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            _ret_init, _rgb_init = _cap_init.read()
+            _cap_init.release()
+            if _ret_init:
+                _vis_init = _rgb_init.copy()
+                for _p in fg_points:
+                    cv2.circle(_vis_init, (int(_p[0]), int(_p[1])), 8, (0, 255, 80), -1)
+                    cv2.circle(_vis_init, (int(_p[0]), int(_p[1])), 9, (255, 255, 255), 1)
+                for _p in bg_points:
+                    cv2.circle(_vis_init, (int(_p[0]), int(_p[1])), 8, (0, 0, 255), -1)
+                    cv2.circle(_vis_init, (int(_p[0]), int(_p[1])), 9, (255, 255, 255), 1)
+                cv2.putText(_vis_init,
+                            f"Initial-Label t={start_frame/fps:.0f}s  FG(green):{len(fg_points)} BG(red):{len(bg_points)}",
+                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
+                cv2.putText(_vis_init, f"[from food_labels.json]  frame={start_frame}",
+                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 160, 200), 2)
+                _init_name = f"relabel_t{start_frame/fps:.0f}s_f{start_frame}_initial.jpg"
+                cv2.imwrite(os.path.join(out_dir, _init_name), _vis_init)
+                print(f"[初始标注] 预览图已保存: {_init_name}")
+        except Exception as _ei:
+            print(f"[初始标注] 预览图保存失败: {_ei}")
+
     if not use_flow:
         # ── 纯 SAM2 模式 ──────────────────────────────────────────────────────
         n_chunks = (track_frames + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -724,10 +853,136 @@ def main():
             chunk_start_abs = start_frame + chunk_i * CHUNK_SIZE
             chunk_end_abs   = min(chunk_start_abs + CHUNK_SIZE, total_frames)
             chunk_len       = chunk_end_abs - chunk_start_abs
+            chunk_start_s   = chunk_start_abs / fps
 
             print(f"\n{'='*55}")
             print(f"[批次 {chunk_i+1}/{n_chunks}] 帧 {chunk_start_abs} ~ {chunk_end_abs-1}"
                   f"  ({chunk_len} 帧)")
+
+            # ── 检查是否需要自动补强（每 N 秒从 carry_mask 内部采点注入第一帧）────
+            # 新策略：carry_mask 始终保留（不置 None），只用 SAM2 自己的末帧 mask 定位，
+            # IR 只做稳定性检查（决定要不要补强），不再参与任何标注点生成。
+            _reinforce_inject = None   # 本批第一帧要注入的补强点
+            if (carry_mask is not None
+                    and chunk_i > 0
+                    and (chunk_start_s - last_relabel_s) >= RELABEL_INTERVAL_S):
+                # ── IR 稳定性检查（只判断要不要补强，不采点）─────────────────
+                _do_reinforce = True
+                if _auto_label_func is not None and temp_data is not None:
+                    try:
+                        _ir_idx_al = int(chunk_start_abs * ir_fps_ratio)
+                        _ir_idx_al = min(_ir_idx_al, temp_data.shape[0] - 1)
+                        _ir_frame_al = temp_data[_ir_idx_al]
+                        from auto_label import load_wok_cfg as _lwc, build_wok_mask as _bwm
+                        _wok_temps_chk = _ir_frame_al[_wok_mask_al]
+                        _var_chk = float(np.var(_wok_temps_chk)) if len(_wok_temps_chk) > 0 else 0
+                        if _var_chk < 200.0:
+                            _do_reinforce = False
+                            print(f"[补强] t={chunk_start_s:.1f}s  锅倾斜/翻炒(var={_var_chk:.1f})，跳过")
+                    except Exception:
+                        pass   # 检查失败则默认补强
+
+                if _do_reinforce:
+                    # ── 检查 carry_mask 是否还在锅内（位置检查，比面积检查更可靠）────
+                    # 指标：mask 与锅内区域(wok_rgb_constraint)的交集 / mask 自身面积
+                    # < 60% 说明 mask 大部分跑到锅外/搅拌爪/金属部件上 → 强制重置
+                    _mask_px = int(carry_mask.sum())
+                    _need_reset = False
+                    _overlap_pct = 100.0   # 默认100%（无wok约束时不重置）
+                    if _wok_rgb_constraint is not None and _mask_px > 0:
+                        _overlap_px = int((carry_mask & _wok_rgb_constraint).sum())
+                        _overlap_pct = _overlap_px / _mask_px * 100
+                        if _overlap_pct < 60.0:
+                            _need_reset = True
+                            print(f"[补强] t={chunk_start_s:.1f}s  "
+                                  f"mask偏离锅内(overlap={_overlap_pct:.0f}%<60%)，"
+                                  f"重置SAM2→初始标注点")
+                    # 也保留面积检查：mask 超过 wok 区域 70% 同样重置（整锅漂移）
+                    _wok_px_chk = int(_wok_rgb_constraint.sum()) if _wok_rgb_constraint is not None else (VW * VH)
+                    _mask_vs_wok = _mask_px / max(_wok_px_chk, 1) * 100
+                    if not _need_reset:
+                        if _mask_vs_wok > 70.0:
+                            _need_reset = True
+                            print(f"[补强] t={chunk_start_s:.1f}s  "
+                                  f"mask过大({_mask_vs_wok:.0f}%>wok70%)，"
+                                  f"重置SAM2→初始标注点")
+                    # ── 第三级：面积骤降检测（漂移到旋转轴/小碎片）────────────
+                    # last_reinforce_wok_pct = 上次补强时 mask 占 wok% （不是批次均值）
+                    # 骤降 > 70% 或绝对值 < 2% → 重置
+                    if not _need_reset and _wok_px_chk > 0:
+                        _drop_pct = (last_reinforce_wok_pct - _mask_vs_wok) / max(last_reinforce_wok_pct, 0.1) * 100
+                        if _mask_vs_wok < 2.0:
+                            _need_reset = True
+                            print(f"[补强] t={chunk_start_s:.1f}s  "
+                                  f"mask过小({_mask_vs_wok:.1f}%<2%，可能是旋转轴碎片)，"
+                                  f"重置SAM2→初始标注点")
+                        elif last_reinforce_wok_pct > 5.0 and _drop_pct > 70.0:
+                            _need_reset = True
+                            print(f"[补强] t={chunk_start_s:.1f}s  "
+                                  f"mask面积骤降({last_reinforce_wok_pct:.0f}%→{_mask_vs_wok:.0f}%，"
+                                  f"跌幅{_drop_pct:.0f}%>70%)，重置SAM2→初始标注点")
+                    if _need_reset:
+                        carry_mask = None
+                        last_relabel_s = chunk_start_s
+                    else:
+                        # ── mask 正常，从内部腐蚀区域采点补强 ────────────────────
+                        try:
+                            _cm_u8 = carry_mask.astype(np.uint8) * 255
+                            _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
+                            _inner = cv2.erode(_cm_u8, _ek)
+                            _ys_r, _xs_r = np.where(_inner > 0)
+                            _n_reinforce = 6
+                            if len(_xs_r) >= _n_reinforce:
+                                _idx_r = _rng_al.choice(len(_xs_r), size=_n_reinforce, replace=False)
+                                _fg_reinforce = [[float(_xs_r[i]), float(_ys_r[i])] for i in _idx_r]
+                            elif len(_xs_r) > 0:
+                                _cx_r = float(np.mean(_xs_r)); _cy_r = float(np.mean(_ys_r))
+                                _ys2, _xs2 = np.where(_cm_u8 > 0)
+                                _dists = np.sqrt((_xs2-_cx_r)**2 + (_ys2-_cy_r)**2)
+                                _sel = np.argsort(_dists)[:_n_reinforce]
+                                _fg_reinforce = [[float(_xs2[i]), float(_ys2[i])] for i in _sel]
+                            else:
+                                _fg_reinforce = []
+
+                            if _fg_reinforce:
+                                _reinforce_inject = {
+                                    "local_frame": 0,
+                                    "fg_points":   _fg_reinforce,
+                                    "bg_points":   [],
+                                }
+                                last_relabel_s = chunk_start_s
+                                last_reinforce_wok_pct = _mask_vs_wok   # 记录本次补强时面积（骤降检测用）
+                                print(f"[补强] t={chunk_start_s:.1f}s  mask正常({_mask_vs_wok:.0f}%)"
+                                      f"  从SAM2末帧内部采点FG={len(_fg_reinforce)}")
+                        except Exception as _e:
+                            print(f"[补强] 采点失败({_e})，跳过本次补强")
+                        # 保存预览图（不管采点是否成功，只要 carry_mask 有效就显示）
+                        try:
+                            _cap_al = cv2.VideoCapture(video_path)
+                            _cap_al.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
+                            _ret_al, _rgb_al = _cap_al.read()
+                            _cap_al.release()
+                            if _ret_al:
+                                _vis_al = _rgb_al.copy()
+                                _vis_al[carry_mask] = (
+                                    _vis_al[carry_mask].astype(float) * 0.6
+                                    + np.array([0, 200, 80]) * 0.4
+                                ).astype(np.uint8)
+                                if _reinforce_inject:
+                                    for _p in _reinforce_inject["fg_points"]:
+                                        cv2.circle(_vis_al, (int(_p[0]), int(_p[1])), 8, (0, 255, 255), -1)
+                                        cv2.circle(_vis_al, (int(_p[0]), int(_p[1])), 9, (0, 0, 0), 1)
+                                n_pts = len(_reinforce_inject["fg_points"]) if _reinforce_inject else 0
+                                cv2.putText(_vis_al,
+                                            f"SAM2-reinforce t={chunk_start_s:.0f}s  pts(cyan):{n_pts}",
+                                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                                cv2.putText(_vis_al, "[carry_mask green | SAM2 mask preserved]",
+                                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 80), 2)
+                                _preview_name = f"relabel_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
+                                cv2.imwrite(os.path.join(out_dir, _preview_name), _vis_al)
+                                print(f"[补强] 预览图已保存: {_preview_name}")
+                        except Exception as _pe:
+                            print(f"[补强] 预览图保存失败: {_pe}")
 
             tmp_dir, frame_names, actual = extract_chunk_to_dir(
                 video_path, chunk_start_abs, chunk_end_abs,
@@ -741,6 +996,7 @@ def main():
 
             try:
                 inject_this_chunk = []
+                # 注入 food_labels.json 里的额外关键帧
                 for abs_f, kf in inject_map.items():
                     if chunk_start_abs <= abs_f < chunk_end_abs:
                         local_f = abs_f - chunk_start_abs
@@ -750,6 +1006,9 @@ def main():
                             "bg_points":   kf.get("bg_points", []),
                             "label":       kf.get("label", ""),
                         })
+                # 注入补强点（local_frame=0，和 carry_mask 同帧，追加前景点）
+                if _reinforce_inject is not None:
+                    inject_this_chunk.append(_reinforce_inject)
 
                 # carry_mask 需要缩放到推理分辨率传给下一批
                 carry_mask_infer = None
@@ -771,6 +1030,22 @@ def main():
                 else:
                     carry_mask = carry_mask_raw
                 print(f"[SAM2] 批次 {chunk_i+1} 追踪完成，{len(chunk_masks)} 帧")
+
+                # ── mask 面积异常检测：若本批平均占比 > 60% 且比上批大 3 倍 → 强制下批重标点 ──
+                if len(chunk_masks) > 0:
+                    _total_px = infer_wh[0] * infer_wh[1] if do_resize else VW * VH
+                    _ratios   = [m.sum() / _total_px * 100
+                                 for m in chunk_masks.values() if m is not None]
+                    _mean_ratio = float(np.mean(_ratios)) if _ratios else 0.0
+                    if (_auto_label_func is not None
+                            and _mean_ratio > 60.0
+                            and _mean_ratio > prev_mask_ratio * 3.0
+                            and prev_mask_ratio > 0.5):
+                        carry_mask = None
+                        last_relabel_s = -999   # 强制下批立即重标点
+                        print(f"[异常检测] 批次{chunk_i+1} 平均mask={_mean_ratio:.1f}%"
+                              f"（上批{prev_mask_ratio:.1f}%），追踪失控！强制下批重标点")
+                    prev_mask_ratio = _mean_ratio
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 print(f"[清理] 临时帧已删除")
@@ -790,6 +1065,10 @@ def main():
                                             np.zeros((infer_wh[1], infer_wh[0]), dtype=bool))
                 mask      = upscale_mask(raw_mask, orig_wh) if do_resize else raw_mask
                 mask_src  = "SAM2"
+
+                # ── wok 约束后处理：mask AND 预计算的锅内区域 ────────────────
+                if _wok_rgb_constraint is not None:
+                    mask = mask & _wok_rgb_constraint
 
                 vis       = render_overlay(frame, mask, MASK_COLOR, MASK_ALPHA)
                 temp_mean = temp_min = temp_max = float("nan")
@@ -851,18 +1130,17 @@ def main():
                             f"Frame {abs_idx}  t={time_s:.1f}s  Mask={mask_ratio:.1f}%  [SAM2]",
                             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
-                # ── IR mask 自动分割温度 ──────────────────────────────────────
+                # ── IR mask 自动分割温度（K-means 双峰分类）──────────────────
+                # 锅内温度分布是双峰：高温峰=锅壁/锅底，低温峰=食物
+                # K-means 自适应分类，比固定百分位更准确
                 ir_mask_temp = float("nan")
                 if wok_mask_ir is not None and temp_data is not None:
                     ir_idx_wok = int(abs_idx * ir_fps_ratio)
                     if ir_idx_wok < temp_data.shape[0]:
                         t_frame_wok = temp_data[ir_idx_wok]
                         wok_temps   = t_frame_wok[wok_mask_ir]
-                        if len(wok_temps) > 0:
-                            t_thresh = np.percentile(wok_temps, IR_FOOD_PCT)
-                            food_ir  = wok_mask_ir & (t_frame_wok <= t_thresh)
-                            if food_ir.sum() > 0:
-                                ir_mask_temp = float(np.mean(t_frame_wok[food_ir]))
+                        if len(wok_temps) >= 10:
+                            ir_mask_temp = _kmeans_food_temp(wok_temps)
                 if not np.isnan(ir_mask_temp):
                     ir_mask_history.append((time_s, ir_mask_temp))
 
@@ -883,12 +1161,12 @@ def main():
                                             roi_history=roi_history,
                                             ir_mask_history=ir_mask_history)
                 writer.write(np.vstack([vis, info_bar, chart_bar]))
-                csv_lines.append(
-                    f"{abs_idx},{local_idx},{time_s:.3f},"
-                    f"{mask.sum()},{mask_ratio:.2f},"
-                    f"{temp_mean:.2f},{temp_min:.2f},{temp_max:.2f},"
-                    f"{roi_temp_mean:.2f},{ir_mask_temp:.2f}"
-                )
+                # 三策略数据分别记录
+                sam2_rows.append([abs_idx, local_idx, time_s,
+                                  int(mask.sum()), round(mask_ratio, 2),
+                                  temp_mean, temp_min, temp_max])
+                roi_rows.append([abs_idx, local_idx, time_s, roi_temp_mean])
+                ir_rows.append([abs_idx, local_idx, time_s, ir_mask_temp])
                 if local_in_chunk % 50 == 0:
                     print(f"  写帧: {local_in_chunk+1}/{actual}  "
                           f"mask={mask_ratio:.1f}%  temp={temp_mean:.1f}°C", end="\r")
@@ -994,11 +1272,9 @@ def main():
 
             chart_bar = draw_temp_chart(temp_history, time_s, VW, CHART_H, CURVE_WIN_S)
             writer.write(np.vstack([vis, info_bar, chart_bar]))
-            csv_lines.append(
-                f"{abs_idx},{local_idx},{time_s:.3f},"
-                f"{mask.sum()},{mask_ratio:.2f},"
-                f"{temp_mean:.2f},{temp_min:.2f},{temp_max:.2f}"
-            )
+            sam2_rows.append([abs_idx, local_idx, time_s,
+                              int(mask.sum()), round(mask_ratio, 2),
+                              temp_mean, temp_min, temp_max])
 
         cap.release()
         print()
@@ -1006,22 +1282,41 @@ def main():
 
     writer.release()
 
-    # ── 保存 CSV ──────────────────────────────────────────────────────────────
-    with open(out_csv, "w", encoding="utf-8") as f:
-        f.write("\n".join(csv_lines))
-
     print(f"\n\n✅ 追踪完成！")
     print(f"   结果目录:   {out_dir}")
     print(f"   可视化视频: {out_video_viz}")
-    print(f"   温度日志:   {out_csv}")
     print(f"   共处理 {global_local} 帧")
 
-    # ── 保存 Excel ────────────────────────────────────────────────────────────
-    _save_excel(out_csv, out_xlsx)
+    # ── 保存三策略独立 Excel ──────────────────────────────────────────────────
+    _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir)
 
-    # ── 绘制温度曲线 ──────────────────────────────────────────────────────────
-    if temp_data is not None:
-        _plot_temp_curve(out_csv, out_curve)
+    # ── 绘制三策略温度曲线 PNG ────────────────────────────────────────────────
+    _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_curve)
+
+    # ── 拼合 RGB + IR 视频 ────────────────────────────────────────────────────
+    if temp_data is not None and wok_cfg is not None:
+        out_combined = os.path.join(out_dir, "track_result_combined.mp4")
+        ir_fps_val   = fps * ir_fps_ratio   # 估算 IR 帧率
+        print(f"\n[拼合] 开始生成 RGB+IR 并排视频...")
+        stitch_rgb_ir(
+            rgb_viz_path=out_video_viz,
+            temp_data=temp_data,
+            ir_fps=ir_fps_val,
+            wok_cfg=wok_cfg,
+            out_path=out_combined,
+            rgb_start_frame=start_frame,
+            rgb_fps=fps,
+            pct=IR_FOOD_PCT,
+        )
+        print(f"   并排视频: {out_combined}")
+        # 删除中间产物（纯 RGB viz 视频），只保留最终并排视频
+        try:
+            os.remove(out_video_viz)
+            print(f"   已删除中间文件: track_result_viz.mp4")
+        except Exception:
+            pass
+    else:
+        print("[拼合] 缺少温度数据或锅区域配置，跳过 IR 拼合")
 
     # 清理空的 tmp 根目录（如果为空）
     try:
@@ -1147,6 +1442,240 @@ def _plot_temp_curve(csv_path, out_path=None):
     plt.savefig(out, dpi=120)
     plt.close()
     print(f"[温度曲线] 已保存: {out}")
+
+
+# ── 三策略数据保存 ────────────────────────────────────────────────────────────
+
+def _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir):
+    """
+    输出三个独立 xlsx 文件，每个对应一种温度策略：
+      temp_sam2.xlsx  — SAM2 mask 追踪温度
+      temp_roi.xlsx   — ROI 固定圆圈温度
+      temp_ir.xlsx    — IR 自动分割（锅内低温区）温度
+    """
+    if not _HAS_OPENPYXL:
+        print("[Excel] 未安装 openpyxl，跳过。pip install openpyxl")
+        return
+
+    def _make_wb(headers, rows, fill_color):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "逐帧数据"
+        hdr_fill = PatternFill("solid", fgColor=fill_color)
+        hdr_font = Font(bold=True, color="FFFFFF")
+        for c, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=c, value=h)
+            cell.fill = hdr_fill
+            cell.font = hdr_font
+            cell.alignment = Alignment(horizontal="center")
+        valid_rows = []
+        for r_idx, row in enumerate(rows, 2):
+            clean = [v if not isinstance(v, float) or not np.isnan(v)
+                     else None for v in row]
+            for c_idx, val in enumerate(clean, 1):
+                ws.cell(row=r_idx, column=c_idx,
+                        value=round(val, 3) if isinstance(val, float) else val)
+            valid_rows.append(clean)
+        # 汇总 sheet
+        ws2 = wb.create_sheet("汇总统计")
+        temps = [r[-1] for r in valid_rows
+                 if r[-1] is not None and not np.isnan(r[-1])]
+        times = [r[2] for r in valid_rows
+                 if r[-1] is not None and not np.isnan(r[-1])]
+        if temps:
+            stats = [
+                ("总帧数",        len(rows)),
+                ("有效温度帧数",  len(temps)),
+                ("追踪时长(s)",   round(rows[-1][2]-rows[0][2], 1) if rows else 0),
+                ("温度均值(°C)",  round(float(np.mean(temps)), 2)),
+                ("温度最大(°C)",  round(float(np.max(temps)),  2)),
+                ("温度最小(°C)",  round(float(np.min(temps)),  2)),
+                ("温度标准差",    round(float(np.std(temps)),   2)),
+                ("峰值时刻(s)",   round(times[int(np.argmax(temps))], 1)),
+            ]
+        else:
+            stats = [("总帧数", len(rows)), ("有效温度帧数", 0)]
+        ws2.cell(row=1, column=1, value="统计项").font = Font(bold=True)
+        ws2.cell(row=1, column=2, value="数值").font   = Font(bold=True)
+        for i, (k, v) in enumerate(stats, 2):
+            ws2.cell(row=i, column=1, value=k)
+            ws2.cell(row=i, column=2, value=v)
+        ws2.column_dimensions["A"].width = 20
+        ws2.column_dimensions["B"].width = 14
+        return wb, len(valid_rows)
+
+    # SAM2
+    h1 = ["帧号(绝对)","帧号(相对)","时间(s)","Mask像素","Mask%",
+          "均值(°C)","最小(°C)","最大(°C)"]
+    wb1, n1 = _make_wb(h1, sam2_rows, "1F4E79")
+    p1 = os.path.join(out_dir, "temp_sam2.xlsx")
+    wb1.save(p1)
+    print(f"[Excel] SAM2  → {p1}  ({n1} 行)")
+
+    # ROI
+    h2 = ["帧号(绝对)","帧号(相对)","时间(s)","ROI均值(°C)"]
+    wb2, n2 = _make_wb(h2, roi_rows, "833C00")
+    p2 = os.path.join(out_dir, "temp_roi.xlsx")
+    wb2.save(p2)
+    print(f"[Excel] ROI   → {p2}  ({n2} 行)")
+
+    # IR
+    h3 = ["帧号(绝对)","帧号(相对)","时间(s)","IR自动均值(°C)"]
+    wb3, n3 = _make_wb(h3, ir_rows, "375623")
+    p3 = os.path.join(out_dir, "temp_ir.xlsx")
+    wb3.save(p3)
+    print(f"[Excel] IR    → {p3}  ({n3} 行)")
+
+
+def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path):
+    """绘制三条温度曲线对比图（matplotlib）"""
+    def _extract(rows, val_col):
+        xs, ys = [], []
+        for r in rows:
+            v = r[val_col]
+            if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                xs.append(r[2])   # time_s
+                ys.append(float(v))
+        return xs, ys
+
+    fig, ax = plt.subplots(figsize=(14, 4))
+
+    t_sam2, v_sam2 = _extract(sam2_rows, 5)   # temp_mean
+    t_roi,  v_roi  = _extract(roi_rows,  3)   # roi_temp_mean
+    t_ir,   v_ir   = _extract(ir_rows,   3)   # ir_mask_temp
+
+    if t_sam2:
+        # min/max 带
+        t_min = [r[6] for r in sam2_rows if r[6] is not None and not np.isnan(r[6])]
+        t_max = [r[7] for r in sam2_rows if r[7] is not None and not np.isnan(r[7])]
+        if t_min and t_max and len(t_min) == len(t_sam2):
+            ax.fill_between(t_sam2, t_min, t_max, alpha=0.15, color="#FF7F0E")
+        ax.plot(t_sam2, v_sam2, color="#FF7F0E", lw=1.5, label="SAM2 Mask")
+    if t_roi:
+        ax.plot(t_roi,  v_roi,  color="#1F77B4", lw=1.5, label="ROI Fixed")
+    if t_ir:
+        ax.plot(t_ir,   v_ir,   color="#2CA02C", lw=1.5, label="IR Auto")
+
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Temperature (°C)")
+    ax.set_title("Food Temperature — Three Strategies Comparison")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"[温度曲线] 已保存: {out_path}")
+
+
+# ── RGB + IR 视频拼合 ─────────────────────────────────────────────────────────
+
+def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
+                  out_path, rgb_start_frame, rgb_fps, pct=40):
+    """
+    新布局：
+      ┌─────────────────────────────────────────────────┐
+      │  RGB纯视频（带mask）  │  IR热图（等高，上下对齐）  │
+      ├─────────────────────────────────────────────────┤
+      │       INFO BAR — 三种策略温度数值（全宽，放大）    │
+      ├─────────────────────────────────────────────────┤
+      │       温度曲线图（三条曲线，全宽，放大）           │
+      └─────────────────────────────────────────────────┘
+
+    从已生成的 track_result_viz.mp4 里裁取：
+      - 纯视频区：rows 0 .. VH-1
+      - info_bar ：rows VH .. VH+INFO_H-1
+      - chart    ：rows VH+INFO_H .. end
+    然后按新布局拼合。
+    """
+    # 动态导入，避免循环依赖
+    import sys as _sys
+    _tools = os.path.join(_HERE, "..", "tools")
+    if _tools not in _sys.path:
+        _sys.path.insert(0, _tools)
+    from ir_mask_viz import render_ir_frame
+
+    cap = cv2.VideoCapture(rgb_viz_path)
+    if not cap.isOpened():
+        print(f"[拼合] 无法打开 RGB 视频: {rgb_viz_path}")
+        return
+
+    rgb_total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    out_fps    = cap.get(cv2.CAP_PROP_FPS) or rgb_fps
+    viz_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))   # viz 视频宽（= VW = 1600）
+    viz_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))  # viz 视频高（= VH+INFO_H+CHART_H）
+
+    # viz 里各区域高度（与 main() 里的常量保持一致）
+    pure_h  = viz_h - INFO_H - CHART_H   # 纯视频高度（= VH = 1200）
+    pure_w  = viz_w                       # 纯视频宽度（= VW = 1600）
+
+    n_ir = temp_data.shape[0]
+
+    # IR 渲染尺寸：等比缩放到与纯视频同高（pure_h），上下对齐
+    ir_aspect = temp_data.shape[2] / temp_data.shape[1]   # ir_w / ir_h
+    ir_out_h  = pure_h
+    ir_out_w  = int(round(ir_out_h * ir_aspect))
+    if ir_out_w % 2 != 0:
+        ir_out_w += 1
+
+    # 合并视频总宽度 = RGB宽 + IR宽
+    total_w = pure_w + ir_out_w
+
+    # 底部 info + chart 放大高度（比原来更高，视觉更清晰）
+    new_info_h  = int(INFO_H  * 1.8)   # ≈ 90px
+    new_chart_h = int(CHART_H * 1.8)   # ≈ 216px
+    if new_info_h  % 2 != 0: new_info_h  += 1
+    if new_chart_h % 2 != 0: new_chart_h += 1
+
+    total_h = pure_h + new_info_h + new_chart_h
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(out_path, fourcc, out_fps, (total_w, total_h))
+
+    print(f"[拼合] 纯视频: RGB={pure_w}×{pure_h}  IR={ir_out_w}×{ir_out_h}")
+    print(f"[拼合] 底部面板: info={new_info_h}px  chart={new_chart_h}px  全宽={total_w}px")
+    print(f"[拼合] 输出帧尺寸: {total_w}×{total_h}  共 {rgb_total} 帧")
+
+    for idx in range(rgb_total):
+        ret, viz_frame = cap.read()
+        if not ret:
+            break
+
+        # ── 裁取各区域 ───────────────────────────────────────────────────────
+        pure_rgb  = viz_frame[0:pure_h, :]                           # 纯视频帧
+        info_src  = viz_frame[pure_h:pure_h + INFO_H, :]             # info bar（原始小）
+        chart_src = viz_frame[pure_h + INFO_H:pure_h + INFO_H + CHART_H, :]  # chart（原始小）
+
+        # ── 渲染 IR 帧（等高对齐）─────────────────────────────────────────────
+        time_s  = (rgb_start_frame + idx) / rgb_fps
+        ir_idx  = min(int(round(time_s * ir_fps)), n_ir - 1)
+        ir_img  = render_ir_frame(
+            temp_data[ir_idx], wok_cfg, pct=pct,
+            out_w=ir_out_w, out_h=ir_out_h
+        )
+
+        # ── 上方：RGB | IR 并排（等高，上下对齐）─────────────────────────────
+        top_panel = np.hstack([pure_rgb, ir_img])   # (pure_h, total_w, 3)
+
+        # ── 底部 info bar：放大到全宽 ──────────────────────────────────────────
+        # 先在 info_src 两侧填充黑色，扩展到 total_w，再放大高度
+        # 简单做法：直接 resize 到 (total_w, new_info_h)
+        info_big = cv2.resize(info_src, (total_w, new_info_h),
+                              interpolation=cv2.INTER_LINEAR)
+
+        # ── 底部 chart：同样放大到全宽 ─────────────────────────────────────────
+        chart_big = cv2.resize(chart_src, (total_w, new_chart_h),
+                               interpolation=cv2.INTER_LINEAR)
+
+        # ── 拼合 ──────────────────────────────────────────────────────────────
+        combined = np.vstack([top_panel, info_big, chart_big])
+        writer.write(combined)
+
+        if idx % 200 == 0:
+            print(f"  拼合帧 {idx}/{rgb_total}  IR帧={ir_idx}", end="\r")
+
+    cap.release()
+    writer.release()
+    print(f"\n[拼合] 完成: {out_path}")
 
 
 if __name__ == "__main__":
