@@ -665,8 +665,36 @@ def main():
         TEMP_NPY_PATH = find_temp_npy(video_path)
     temp_data, ir_total_frames = load_temp_data(TEMP_NPY_PATH)
 
-    # 计算 IR/RGB 帧率比例（用于时间对齐）
-    # 两路流同时开始录制，用各自总帧数推算帧率比
+    # ── 加载逐帧时间戳文件（用于精确帧对齐）────────────────────────────────
+    # 新录制数据会有 rgb_YYYYMMDD_HHMMSS_ts.npy 和 temp_YYYYMMDD_HHMMSS_ts.npy
+    # 老录制数据没有时间戳文件，fallback 到帧率比例估算
+    _rgb_ts = None   # shape (N_rgb,) float64 Unix 时间戳
+    _ir_ts  = None   # shape (N_ir,)  float64 Unix 时间戳
+
+    if temp_data is not None:
+        _ir_ts_path = TEMP_NPY_PATH.replace(".npy", "_ts.npy") if TEMP_NPY_PATH else None
+        if _ir_ts_path and os.path.exists(_ir_ts_path):
+            _ir_ts = np.load(_ir_ts_path)
+            print(f"[时间戳] IR 时间戳已加载: {os.path.basename(_ir_ts_path)}  {len(_ir_ts)} 帧")
+
+    _rgb_ts_path = os.path.splitext(os.path.basename(video_path))[0]
+    _rgb_ts_path = _rgb_ts_path.replace("rgb_", "") if _rgb_ts_path.startswith("rgb_") else _rgb_ts_path
+    _rgb_ts_file = os.path.join(os.path.dirname(os.path.abspath(video_path)),
+                                f"rgb_{_rgb_ts_path}_ts.npy")
+    # 也兼容直接以 rgb_YYYYMMDD_HHMMSS_ts.npy 命名的情况
+    _rgb_ts_file2 = os.path.splitext(os.path.abspath(video_path))[0] + "_ts.npy"
+    for _ts_candidate in [_rgb_ts_file2, _rgb_ts_file]:
+        if os.path.exists(_ts_candidate):
+            _rgb_ts = np.load(_ts_candidate)
+            print(f"[时间戳] RGB 时间戳已加载: {os.path.basename(_ts_candidate)}  {len(_rgb_ts)} 帧")
+            break
+
+    if _rgb_ts is not None and _ir_ts is not None:
+        print(f"[时间戳] 启用时间戳帧对齐模式（精度 ~40ms）")
+    else:
+        print(f"[时间戳] 时间戳文件不完整，fallback 到帧率比例估算")
+
+    # 计算 IR/RGB 帧率比例（用于时间对齐，无时间戳时使用）
     ir_fps_ratio = 1.0   # 默认 1:1
     if temp_data is not None and total_frames > 0:
         ir_fps_ratio = ir_total_frames / total_frames
@@ -674,6 +702,15 @@ def main():
         print(f"[帧率对齐] RGB {fps:.1f}fps × {total_frames}帧 | "
               f"IR ~{ir_fps_est:.1f}fps × {ir_total_frames}帧 | "
               f"比例 {ir_fps_ratio:.4f}")
+
+    def _get_ir_idx(rgb_abs_idx: int) -> int:
+        """根据 RGB 帧号查找最近邻 IR 帧号（有时间戳用时间戳，无则用帧率比例）"""
+        if _rgb_ts is not None and _ir_ts is not None:
+            if rgb_abs_idx < len(_rgb_ts):
+                t = _rgb_ts[rgb_abs_idx]
+                return int(np.argmin(np.abs(_ir_ts - t)))
+            # 超出时间戳范围，退化到比例
+        return min(int(rgb_abs_idx * ir_fps_ratio), ir_total_frames - 1)
 
     # ── 设备 ──────────────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -725,8 +762,8 @@ def main():
         ir_w_wok = temp_data.shape[2]
         wok_mask_ir = np.zeros((ir_h_wok, ir_w_wok), dtype=np.uint8)
         cv2.ellipse(wok_mask_ir,
-                    (wok_cfg["cx"], wok_cfg["cy"]),
-                    (wok_cfg["rx"], wok_cfg["ry"]),
+                    (int(wok_cfg["cx"]), int(wok_cfg["cy"])),
+                    (int(wok_cfg["rx"]), int(wok_cfg["ry"])),
                     0, 0, 360, 255, -1)
         wok_mask_ir = wok_mask_ir > 0
         print(f"[IR Mask] 已加载锅区域: {wok_cfg_path}")
@@ -735,6 +772,19 @@ def main():
               f"覆盖 {wok_mask_ir.sum()} 像素")
     else:
         print(f"[IR Mask] 未找到 wok_region.json 或无温度数据，跳过 IR 自动分割温度")
+
+    # ── 动态 wok 中心跟踪状态（方案B：用温度梯度跟踪锅中心漂移）───────────────
+    # 手持拍摄时相机抖动导致 IR 中锅的位置帧间偏移，用高温区质心动态修正 cx/cy
+    # rx/ry 保持 wok_region.json 里的固定值不变
+    _wok_cx = float(wok_cfg["cx"]) if wok_cfg is not None else 0.0
+    _wok_cy = float(wok_cfg["cy"]) + 10.0 if wok_cfg is not None else 0.0   # +10px 向下补偿（标定系统偏差）
+    _wok_rx = float(wok_cfg["rx"]) if wok_cfg is not None else 0.0
+    _wok_ry = float(wok_cfg["ry"]) if wok_cfg is not None else 0.0
+    _WOK_MAX_DRIFT = 25   # 单批允许的最大质心漂移（IR px），防止极端帧跳变
+                          # 旋转轴法精度高，可适当放宽（原15→25）
+    # 动态 wok 中心历史记录：list of (abs_frame, cx, cy)
+    # 拼合视频时按帧号查表，让 IR 椭圆随实际锅位置移动
+    _wok_cx_history = [(start_frame, _wok_cx, _wok_cy)]
 
     # ── 分批追踪主循环（SAM2 + 光流混合）────────────────────────────────────
     # 真正的混合模式：
@@ -799,6 +849,20 @@ def main():
                 _rng_al      = np.random.default_rng(42)
                 _auto_label_func = _al_ir_mask
                 print(f"[自动重标点] 已加载，每 {RELABEL_INTERVAL_S}s 重新标点并重置SAM2")
+                # ── 旋转轴在 RGB 坐标系中的位置（永久背景点，不得标注为前景）──
+                # wok_cfg cx/cy 是 IR 坐标，反投影到 RGB
+                try:
+                    _ir_center = np.array([[[float(_wok_cfg_al["cx"]),
+                                             float(_wok_cfg_al["cy"])]]], dtype=np.float32)
+                    _rgb_center = cv2.perspectiveTransform(_ir_center, _H_inv_al)[0][0]
+                    _AXIS_CX_RGB = float(_rgb_center[0])
+                    _AXIS_CY_RGB = float(_rgb_center[1])
+                    _AXIS_EXCL_R = 90   # 旋转轴排除半径（RGB px）
+                    print(f"[旋转轴] RGB坐标: ({_AXIS_CX_RGB:.0f}, {_AXIS_CY_RGB:.0f})"
+                          f"  排除半径={_AXIS_EXCL_R}px")
+                except Exception as _axe:
+                    _AXIS_CX_RGB = _AXIS_CY_RGB = _AXIS_EXCL_R = None
+                    print(f"[旋转轴] 坐标计算失败({_axe})，跳过排除")
             else:
                 print(f"[自动重标点] 无温度数据或单应矩阵，禁用")
         except ImportError as e:
@@ -807,6 +871,7 @@ def main():
     last_relabel_s = start_frame / fps   # 上次重标点的时间（秒）
     prev_mask_ratio = 0.0                # 上批末帧 mask 面积占比（%），用于异常检测
     last_reinforce_wok_pct = 0.0         # 上次补强时 mask 占 wok 区域的%（骤降检测用）
+    _in_recovery = False                 # 重置后进入 recovery 模式，每批强制检查直到恢复
 
     # ── 预计算 wok RGB mask（用于每帧后处理约束，避免循环内重复计算）────────
     _wok_rgb_constraint = None   # (VH, VW) bool
@@ -818,6 +883,7 @@ def main():
             _wok_rgb_constraint = _wok_proj > 64
             print(f"[wok约束] 预计算 RGB锅区域 mask  覆盖像素: {_wok_rgb_constraint.sum()}")
         except Exception as _we:
+
             print(f"[wok约束] 预计算失败({_we})，跳过约束")
 
     # ── 保存初始关键帧预览图 ──────────────────────────────────────────────────
@@ -859,19 +925,143 @@ def main():
             print(f"[批次 {chunk_i+1}/{n_chunks}] 帧 {chunk_start_abs} ~ {chunk_end_abs-1}"
                   f"  ({chunk_len} 帧)")
 
+            # ── 动态 wok 中心更新（旋转轴检测法）─────────────────────────────
+            # 原理：锅中心有一个固定旋转轴（从锅底凸起），温度偏低（类似食材温度）
+            # 被高温锅壁圆环包围。用以下步骤定位旋转轴中心 = 锅的真实几何圆心：
+            #   1. 在宽松椭圆内找高温像素（> 85百分位）= 锅壁热环
+            #   2. 形态学闭运算填充热环，得到完整锅圈
+            #   3. 在锅圈内部找最大低温连通域（< 50百分位）= 旋转轴
+            #   4. 旋转轴质心 = 锅的几何圆心
+            if (wok_cfg is not None and temp_data is not None
+                    and _wok_mask_al is not None and homography is not None):
+                try:
+                    _ir_idx_wok_upd = _get_ir_idx(chunk_start_abs)
+                    _ir_frm_wok_upd = temp_data[_ir_idx_wok_upd]
+                    _ir_h_ud = _ir_frm_wok_upd.shape[0]
+                    _ir_w_ud = _ir_frm_wok_upd.shape[1]
+                    # 宽松椭圆（1.5×）搜索范围
+                    _loose_mask = np.zeros((_ir_h_ud, _ir_w_ud), dtype=np.uint8)
+                    cv2.ellipse(_loose_mask,
+                                (int(round(_wok_cx)), int(round(_wok_cy))),
+                                (int(round(_wok_rx * 1.5)), int(round(_wok_ry * 1.5))),
+                                0, 0, 360, 255, -1)
+                    _loose_mask = _loose_mask > 0
+                    _all_temps_ud = _ir_frm_wok_upd[_loose_mask]
+                    if len(_all_temps_ud) >= 100:
+                        # Step1: 高温热环（> 85百分位）
+                        _t85 = float(np.percentile(_all_temps_ud, 85))
+                        _hot_ring = (_ir_frm_wok_upd >= _t85) & _loose_mask
+                        _hot_u8 = _hot_ring.astype(np.uint8) * 255
+                        # Step2: 形态学闭运算填充热环成完整锅圈
+                        _kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                        _hot_closed = cv2.morphologyEx(_hot_u8, cv2.MORPH_CLOSE, _kc)
+                        # Step3: 在锅圈闭合区域内找低温连通域（旋转轴）
+                        # 低温阈值：宽松椭圆内 < 50百分位
+                        _t50 = float(np.percentile(_all_temps_ud, 50))
+                        _cold_mask = ((_ir_frm_wok_upd < _t50) & _loose_mask).astype(np.uint8) * 255
+                        # 只保留热环闭合区域内部的低温区
+                        # 用热环填充图的"洞"：flood fill 从边缘开始标记外部
+                        _filled = _hot_closed.copy()
+                        _flood_seed = np.zeros((_ir_h_ud + 2, _ir_w_ud + 2), dtype=np.uint8)
+                        cv2.floodFill(_filled, _flood_seed, (0, 0), 128)
+                        # 未被 flood 到的区域（原为0且非128）= 热环内部空洞
+                        _interior = ((_filled == 0)).astype(np.uint8) * 255
+                        # 旋转轴候选 = 内部空洞 AND 低温
+                        _axis_candidate = cv2.bitwise_and(_cold_mask, _interior)
+                        # Step4: 找最大连通域质心
+                        _cc_n, _cc_labels, _cc_stats, _cc_cents = cv2.connectedComponentsWithStats(
+                            _axis_candidate, connectivity=8
+                        )
+                        _cx_new, _cy_new = None, None
+                        if _cc_n > 1:
+                            # 找面积最大的前景连通域（排除背景=0）
+                            _fg_stats = _cc_stats[1:]
+                            _fg_cents = _cc_cents[1:]
+                            _max_idx  = int(np.argmax(_fg_stats[:, cv2.CC_STAT_AREA]))
+                            _cx_new   = float(_fg_cents[_max_idx][0])
+                            _cy_new   = float(_fg_cents[_max_idx][1])
+                        # 如果旋转轴法失败，退化到热环质心
+                        if _cx_new is None:
+                            _ys_h, _xs_h = np.where(_hot_ring)
+                            if len(_xs_h) >= 50:
+                                _cx_new = float(np.mean(_xs_h))
+                                _cy_new = float(np.mean(_ys_h))
+                        if _cx_new is not None:
+                            _drift = (((_cx_new - _wok_cx)**2 + (_cy_new - _wok_cy)**2)**0.5)
+                            if _drift <= _WOK_MAX_DRIFT:
+                                if _drift > 0.5:
+                                    _cx_old, _cy_old = _wok_cx, _wok_cy
+                                    _wok_cx, _wok_cy = _cx_new, _cy_new + 10.0   # +10px 向下补偿
+                                    _wm_new = np.zeros((_ir_h_ud, _ir_w_ud), dtype=np.uint8)
+                                    cv2.ellipse(_wm_new,
+                                                (int(round(_wok_cx)), int(round(_wok_cy))),
+                                                (int(round(_wok_rx)), int(round(_wok_ry))),
+                                                0, 0, 360, 255, -1)
+                                    wok_mask_ir = _wm_new > 0
+                                    _wok_mask_al = wok_mask_ir.copy()
+                                    _H_inv_wok2 = np.linalg.inv(homography)
+                                    _wok_u8_2   = wok_mask_ir.astype(np.uint8) * 255
+                                    _wok_proj2  = cv2.warpPerspective(_wok_u8_2, _H_inv_wok2, (VW, VH))
+                                    _wok_rgb_constraint = _wok_proj2 > 64
+                                    _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
+                                    print(f"[wok更新] t={chunk_start_s:.1f}s  "
+                                          f"cx: {_cx_old:.1f}->{_wok_cx:.1f}  "
+                                          f"cy: {_cy_old:.1f}->{_wok_cy:.1f}  "
+                                          f"drift={_drift:.1f}px (旋转轴法)")
+                            else:
+                                print(f"[wok更新] t={chunk_start_s:.1f}s  "
+                                      f"drift={_drift:.1f}px>{_WOK_MAX_DRIFT}px，跳过（防跳变）")
+                except Exception as _wud_e:
+                    pass   # 更新失败不影响主流程
+
             # ── 检查是否需要自动补强（每 N 秒从 carry_mask 内部采点注入第一帧）────
             # 新策略：carry_mask 始终保留（不置 None），只用 SAM2 自己的末帧 mask 定位，
             # IR 只做稳定性检查（决定要不要补强），不再参与任何标注点生成。
             _reinforce_inject = None   # 本批第一帧要注入的补强点
-            if (carry_mask is not None
-                    and chunk_i > 0
-                    and (chunk_start_s - last_relabel_s) >= RELABEL_INTERVAL_S):
+
+            # ── C：异常场景检测（白烟/空锅/锅直立）→ 冻结 carry_mask，跳过补强 ──
+            # 检测锅内 RGB 区域的亮度均值和方差：
+            #   白烟：均值 > 150 AND 方差 < 800（整锅均匀偏白）
+            #   空锅/锅直立：均值 < 25（整锅极暗，食材不在画面中）
+            _scene_frozen = False
+            if carry_mask is not None and chunk_i > 0 and _wok_rgb_constraint is not None:
+                try:
+                    _cap_sc = cv2.VideoCapture(video_path)
+                    _cap_sc.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
+                    _ret_sc, _rgb_sc = _cap_sc.read()
+                    _cap_sc.release()
+                    if _ret_sc:
+                        _gray_sc = cv2.cvtColor(_rgb_sc, cv2.COLOR_BGR2GRAY)
+                        _wok_px_sc = _gray_sc[_wok_rgb_constraint]
+                        if len(_wok_px_sc) > 0:
+                            _mean_sc = float(np.mean(_wok_px_sc))
+                            _var_sc  = float(np.var(_wok_px_sc))
+                            if _mean_sc > 150 and _var_sc < 800:
+                                _scene_frozen = True
+                                print(f"[冻结] t={chunk_start_s:.1f}s  检测到白烟/均匀高亮"
+                                      f"(mean={_mean_sc:.0f}>150, var={_var_sc:.0f}<800)，"
+                                      f"冻结carry_mask，跳过补强")
+                            elif _mean_sc < 25:
+                                _scene_frozen = True
+                                print(f"[冻结] t={chunk_start_s:.1f}s  检测到空锅/锅直立"
+                                      f"(mean={_mean_sc:.0f}<25)，冻结carry_mask，跳过补强")
+                except Exception as _sc_e:
+                    pass   # 检测失败不影响主流程
+
+            # recovery 模式下：每批都检查（不等 RELABEL_INTERVAL_S）；正常模式下按间隔检查
+            _should_check = (
+                not _scene_frozen
+                and carry_mask is not None
+                and chunk_i > 0
+                and (_in_recovery or (chunk_start_s - last_relabel_s) >= RELABEL_INTERVAL_S)
+            )
+            if _should_check:
                 # ── IR 稳定性检查（只判断要不要补强，不采点）─────────────────
+                # recovery 模式下强制跳过方差检查，必须尝试 IR 采点
                 _do_reinforce = True
-                if _auto_label_func is not None and temp_data is not None:
+                if not _in_recovery and _auto_label_func is not None and temp_data is not None:
                     try:
-                        _ir_idx_al = int(chunk_start_abs * ir_fps_ratio)
-                        _ir_idx_al = min(_ir_idx_al, temp_data.shape[0] - 1)
+                        _ir_idx_al = _get_ir_idx(chunk_start_abs)
                         _ir_frame_al = temp_data[_ir_idx_al]
                         from auto_label import load_wok_cfg as _lwc, build_wok_mask as _bwm
                         _wok_temps_chk = _ir_frame_al[_wok_mask_al]
@@ -881,8 +1071,22 @@ def main():
                             print(f"[补强] t={chunk_start_s:.1f}s  锅倾斜/翻炒(var={_var_chk:.1f})，跳过")
                     except Exception:
                         pass   # 检查失败则默认补强
+                if _in_recovery:
+                    print(f"[recovery] t={chunk_start_s:.1f}s  recovery模式，强制IR采点（跳过方差检查）")
 
                 if _do_reinforce:
+                    # ── 颜色过滤：读取当前批起始帧的灰度图，用于过滤黑色区域补强点 ──
+                    _rgb_ref_gray = None
+                    try:
+                        _cap_ref = cv2.VideoCapture(video_path)
+                        _cap_ref.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
+                        _ret_ref, _rgb_ref = _cap_ref.read()
+                        _cap_ref.release()
+                        if _ret_ref:
+                            _rgb_ref_gray = cv2.cvtColor(_rgb_ref, cv2.COLOR_BGR2GRAY)
+                    except Exception:
+                        pass
+
                     # ── 检查 carry_mask 是否还在锅内（位置检查，比面积检查更可靠）────
                     # 指标：mask 与锅内区域(wok_rgb_constraint)的交集 / mask 自身面积
                     # < 60% 说明 mask 大部分跑到锅外/搅拌爪/金属部件上 → 强制重置
@@ -923,45 +1127,32 @@ def main():
                                   f"mask面积骤降({last_reinforce_wok_pct:.0f}%→{_mask_vs_wok:.0f}%，"
                                   f"跌幅{_drop_pct:.0f}%>70%)，重置SAM2→初始标注点")
                     if _need_reset:
-                        # ── 先保存重置预览图（用跑偏的 carry_mask 可视化，方便排查）──
+                        # ── 记录重置原因（预览图在 IR 采点完成后保存）─────────
+                        _rst_reason = "RESET"
+                        if _mask_vs_wok < 2.0:
+                            _rst_reason = f"RESET: mask过小({_mask_vs_wok:.1f}%<2%)"
+                        elif last_reinforce_wok_pct > 5.0 and _drop_pct > 70.0:
+                            _rst_reason = f"RESET: 骤降({last_reinforce_wok_pct:.0f}%→{_mask_vs_wok:.0f}%)"
+                        elif _mask_vs_wok > 35.0:
+                            _rst_reason = f"RESET: mask过大({_mask_vs_wok:.0f}%>wok35%)"
+                        elif _overlap_pct < 60.0:
+                            _rst_reason = f"RESET: 偏离锅内(overlap={_overlap_pct:.0f}%)"
+                        # 保留跑偏时的帧和 mask，供稍后保存预览图
+                        _rst_carry_mask = carry_mask   # 跑偏的旧 mask（可能是 None）
+                        _rst_rgb_frame  = None
                         try:
                             _cap_rst = cv2.VideoCapture(video_path)
                             _cap_rst.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
                             _ret_rst, _rgb_rst = _cap_rst.read()
                             _cap_rst.release()
                             if _ret_rst:
-                                _vis_rst = _rgb_rst.copy()
-                                # 用红色半透明显示跑偏的 carry_mask
-                                if carry_mask is not None and carry_mask.any():
-                                    _vis_rst[carry_mask] = (
-                                        _vis_rst[carry_mask].astype(float) * 0.5
-                                        + np.array([0, 0, 220]) * 0.5
-                                    ).astype(np.uint8)
-                                # 标注重置原因（取最后触发的那条）
-                                _rst_reason = "RESET"
-                                if _mask_vs_wok < 2.0:
-                                    _rst_reason = f"RESET: mask过小({_mask_vs_wok:.1f}%<2%)"
-                                elif last_reinforce_wok_pct > 5.0 and _drop_pct > 70.0:
-                                    _rst_reason = f"RESET: 骤降({last_reinforce_wok_pct:.0f}%→{_mask_vs_wok:.0f}%)"
-                                elif _mask_vs_wok > 35.0:
-                                    _rst_reason = f"RESET: mask过大({_mask_vs_wok:.0f}%>wok35%)"
-                                elif _overlap_pct < 60.0:
-                                    _rst_reason = f"RESET: 偏离锅内(overlap={_overlap_pct:.0f}%)"
-                                cv2.putText(_vis_rst, _rst_reason,
-                                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                                            1.0, (0, 0, 255), 2)
-                                cv2.putText(_vis_rst,
-                                            f"t={chunk_start_s:.0f}s  f={chunk_start_abs}  [blue=bad_mask]",
-                                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
-                                            0.75, (80, 80, 255), 2)
-                                _rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
-                                cv2.imwrite(os.path.join(out_dir, _rst_name), _vis_rst)
-                                print(f"[重置] 预览图已保存: {_rst_name}  原因: {_rst_reason}")
-                        except Exception as _rpe:
-                            print(f"[重置] 预览图保存失败: {_rpe}")
+                                _rst_rgb_frame = _rgb_rst
+                        except Exception:
+                            pass
 
                         carry_mask = None
                         last_relabel_s = chunk_start_s
+                        _in_recovery = True   # 进入 recovery 模式，下批立即检查
                         # ── 尝试用 IR 当前帧低温区定位食材，生成新前景点 ────────
                         # 原理：食材温度 < 锅壁温度，取锅内低温像素 → 反投影到 RGB
                         _ir_fg_pts = []
@@ -969,8 +1160,7 @@ def main():
                                 and _wok_mask_al is not None and _H_inv_al is not None
                                 and _rng_al is not None):
                             try:
-                                _ir_idx_rst = min(int(chunk_start_abs * ir_fps_ratio),
-                                                  temp_data.shape[0] - 1)
+                                _ir_idx_rst = _get_ir_idx(chunk_start_abs)
                                 _ir_frm_rst = temp_data[_ir_idx_rst]
                                 _wok_t_rst  = _ir_frm_rst[_wok_mask_al]
                                 if len(_wok_t_rst) >= 10:
@@ -993,7 +1183,17 @@ def main():
                                         _pts_rgb_h = _pts_rgb_h[:2] / _pts_rgb_h[2]
                                         for _xi, _yi in _pts_rgb_h.T:
                                             _xi, _yi = float(_xi), float(_yi)
+                                            # 排除旋转轴附近的点
+                                            if _AXIS_CX_RGB is not None:
+                                                _d = ((_xi - _AXIS_CX_RGB)**2 + (_yi - _AXIS_CY_RGB)**2)**0.5
+                                                if _d < _AXIS_EXCL_R:
+                                                    continue
                                             if 0 <= _xi < VW and 0 <= _yi < VH:
+                                                # 颜色过滤：亮度 < 40 = 黑色锅底，丢弃
+                                                if _rgb_ref_gray is not None:
+                                                    _bv = int(_rgb_ref_gray[int(_yi), int(_xi)])
+                                                    if _bv < 40:
+                                                        continue
                                                 _ir_fg_pts.append([_xi, _yi])
                                         if _ir_fg_pts:
                                             print(f"[补强] t={chunk_start_s:.1f}s  "
@@ -1002,46 +1202,258 @@ def main():
                             except Exception as _re:
                                 print(f"[补强] IR定位失败({_re})，重置后用初始标注点")
                         if _ir_fg_pts:
-                            # 把 IR 定位点作为下一批的补强注入（carry_mask=None 时走初始点路径，
-                            # 但可以通过 inject_keyframes 在第 0 帧追加点）
+                            # 旋转轴中心作为固定背景点
+                            _axis_bg = []
+                            if _AXIS_CX_RGB is not None:
+                                _axis_bg = [[_AXIS_CX_RGB, _AXIS_CY_RGB]]
                             _reinforce_inject = {
                                 "local_frame": 0,
                                 "fg_points":   _ir_fg_pts,
-                                "bg_points":   [],
+                                "bg_points":   _axis_bg,
                                 "label":       "IR-reset",
                             }
-                    else:
-                        # ── mask 正常，从内部腐蚀区域采点补强 ────────────────────
-                        try:
-                            _cm_u8 = carry_mask.astype(np.uint8) * 255
-                            _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
-                            _inner = cv2.erode(_cm_u8, _ek)
-                            _ys_r, _xs_r = np.where(_inner > 0)
-                            _n_reinforce = 6
-                            if len(_xs_r) >= _n_reinforce:
-                                _idx_r = _rng_al.choice(len(_xs_r), size=_n_reinforce, replace=False)
-                                _fg_reinforce = [[float(_xs_r[i]), float(_ys_r[i])] for i in _idx_r]
-                            elif len(_xs_r) > 0:
-                                _cx_r = float(np.mean(_xs_r)); _cy_r = float(np.mean(_ys_r))
-                                _ys2, _xs2 = np.where(_cm_u8 > 0)
-                                _dists = np.sqrt((_xs2-_cx_r)**2 + (_ys2-_cy_r)**2)
-                                _sel = np.argsort(_dists)[:_n_reinforce]
-                                _fg_reinforce = [[float(_xs2[i]), float(_ys2[i])] for i in _sel]
-                            else:
-                                _fg_reinforce = []
 
-                            if _fg_reinforce:
-                                _reinforce_inject = {
-                                    "local_frame": 0,
-                                    "fg_points":   _fg_reinforce,
-                                    "bg_points":   [],
-                                }
-                                last_relabel_s = chunk_start_s
-                                last_reinforce_wok_pct = _mask_vs_wok   # 记录本次补强时面积（骤降检测用）
-                                print(f"[补强] t={chunk_start_s:.1f}s  mask正常({_mask_vs_wok:.0f}%)"
-                                      f"  从SAM2末帧内部采点FG={len(_fg_reinforce)}")
-                        except Exception as _e:
-                            print(f"[补强] 采点失败({_e})，跳过本次补强")
+                        # ── 保存重置预览图（在 IR 采点完成后，能看到新前景点）──
+                        try:
+                            if _rst_rgb_frame is not None:
+                                _vis_rst = _rst_rgb_frame.copy()
+                                # 蓝色半透明显示跑偏的旧 mask（如果有）
+                                if _rst_carry_mask is not None and _rst_carry_mask.any():
+                                    _vis_rst[_rst_carry_mask] = (
+                                        _vis_rst[_rst_carry_mask].astype(float) * 0.5
+                                        + np.array([0, 0, 220]) * 0.5
+                                    ).astype(np.uint8)
+                                # 青色圆点显示 IR 新前景点
+                                if _reinforce_inject is not None:
+                                    for _p in _reinforce_inject["fg_points"]:
+                                        cv2.circle(_vis_rst, (int(_p[0]), int(_p[1])), 10, (0, 255, 255), -1)
+                                        cv2.circle(_vis_rst, (int(_p[0]), int(_p[1])), 11, (0, 0, 0), 1)
+                                # 信息文字
+                                n_new_pts = len(_reinforce_inject["fg_points"]) if _reinforce_inject else 0
+                                cv2.putText(_vis_rst, _rst_reason,
+                                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                                            1.0, (0, 0, 255), 2)
+                                cv2.putText(_vis_rst,
+                                            f"t={chunk_start_s:.0f}s  f={chunk_start_abs}"
+                                            f"  [blue=old_mask | cyan=new_pts({n_new_pts})]",
+                                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.75, (0, 255, 255), 2)
+                                _rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
+                                cv2.imwrite(os.path.join(out_dir, _rst_name), _vis_rst)
+                                print(f"[重置] 预览图已保存: {_rst_name}  原因: {_rst_reason}"
+                                      f"  新前景点: {n_new_pts}")
+                        except Exception as _rpe:
+                            print(f"[重置] 预览图保存失败: {_rpe}")
+
+                    else:
+                        # ── mask 正常：IR-IoU 检查（语义反转检测）──────────────
+                        # 原理：SAM2 mask 与 IR 低温区（真实食材位置）的 IoU
+                        # 如果重叠 < 15%，说明 SAM2 追踪到了错误区域（锅壁/旋转轴）
+                        # 在这种情况下强制重置，比等待面积检查更快更准
+                        _ir_iou_ok = True   # 默认通过（无 IR 数据时不触发）
+                        if (temp_data is not None and homography is not None
+                                and _wok_mask_al is not None and _H_inv_al is not None
+                                and carry_mask is not None and carry_mask.any()):
+                            try:
+                                _ir_idx_iou = _get_ir_idx(chunk_start_abs)
+                                _ir_frm_iou = temp_data[_ir_idx_iou]
+                                _wok_t_iou  = _ir_frm_iou[_wok_mask_al]
+                                if len(_wok_t_iou) >= 10:
+                                    _t_iou = float(np.percentile(_wok_t_iou, 40))
+                                    _food_ir_iou = (_ir_frm_iou < _t_iou) & _wok_mask_al
+                                    # 把 IR 低温区反投影到 RGB 坐标系
+                                    _ys_iou, _xs_iou = np.where(_food_ir_iou)
+                                    if len(_xs_iou) >= 10:
+                                        _pts_iou_h = np.stack([
+                                            _xs_iou.astype(float),
+                                            _ys_iou.astype(float),
+                                            np.ones(len(_xs_iou))
+                                        ])
+                                        _pts_rgb_iou = _H_inv_al @ _pts_iou_h
+                                        _pts_rgb_iou = _pts_rgb_iou[:2] / _pts_rgb_iou[2]
+                                        # 构建 IR 食材区域 RGB mask
+                                        _ir_food_rgb = np.zeros((VH, VW), dtype=bool)
+                                        _xi_iou = np.clip(np.round(_pts_rgb_iou[0]).astype(int), 0, VW-1)
+                                        _yi_iou = np.clip(np.round(_pts_rgb_iou[1]).astype(int), 0, VH-1)
+                                        _ir_food_rgb[_yi_iou, _xi_iou] = True
+                                        # 膨胀一下，容忍标定误差（~15px）
+                                        _ir_food_rgb_u8 = _ir_food_rgb.astype(np.uint8) * 255
+                                        _kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+                                        _ir_food_rgb_u8 = cv2.dilate(_ir_food_rgb_u8, _kd)
+                                        _ir_food_rgb = _ir_food_rgb_u8 > 0
+                                        # 计算 IoU：carry_mask 与 IR 低温区的重叠
+                                        _inter = int((carry_mask & _ir_food_rgb).sum())
+                                        _union = int((carry_mask | _ir_food_rgb).sum())
+                                        _iou = _inter / max(_union, 1) * 100
+                                        if _iou < 8.0:
+                                            _ir_iou_ok = False
+                                            print(f"[IR-IoU] t={chunk_start_s:.1f}s  "
+                                                  f"IoU={_iou:.1f}%<8%，SAM2 mask 与食材区域严重不符，"
+                                                  f"强制重置")
+                            except Exception as _iou_e:
+                                pass   # IoU 检查失败不影响主流程
+
+                        if not _ir_iou_ok:
+                            # 强制重置（复用 _need_reset 路径的逻辑）
+                            _rst_reason = f"RESET: IR-IoU语义反转"
+                            _rst_carry_mask = carry_mask
+                            _rst_rgb_frame  = None
+                            try:
+                                _cap_iou_rst = cv2.VideoCapture(video_path)
+                                _cap_iou_rst.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
+                                _ret_iou_rst, _rgb_iou_rst = _cap_iou_rst.read()
+                                _cap_iou_rst.release()
+                                if _ret_iou_rst:
+                                    _rst_rgb_frame = _rgb_iou_rst
+                            except Exception:
+                                pass
+                            carry_mask = None
+                            last_relabel_s = chunk_start_s
+                            _in_recovery = True
+                            _reinforce_inject = None
+                            # 尝试 IR 采点
+                            _ir_fg_pts_iou = []
+                            if (temp_data is not None and homography is not None
+                                    and _wok_mask_al is not None and _H_inv_al is not None
+                                    and _rng_al is not None):
+                                try:
+                                    _ir_idx_r2 = _get_ir_idx(chunk_start_abs)
+                                    _ir_frm_r2 = temp_data[_ir_idx_r2]
+                                    _wok_t_r2  = _ir_frm_r2[_wok_mask_al]
+                                    if len(_wok_t_r2) >= 10:
+                                        _t_r2 = float(np.percentile(_wok_t_r2, 35))
+                                        _food_r2 = (_ir_frm_r2 < _t_r2) & _wok_mask_al
+                                        _ys_r2, _xs_r2 = np.where(_food_r2)
+                                        if len(_xs_r2) >= 6:
+                                            _sel_r2 = _rng_al.choice(len(_xs_r2), size=min(8, len(_xs_r2)), replace=False)
+                                            _pts_r2_h = np.stack([_xs_r2[_sel_r2].astype(float),
+                                                                   _ys_r2[_sel_r2].astype(float),
+                                                                   np.ones(len(_sel_r2))])
+                                            _pts_rgb_r2 = _H_inv_al @ _pts_r2_h
+                                            _pts_rgb_r2 = _pts_rgb_r2[:2] / _pts_rgb_r2[2]
+                                            for _xi2, _yi2 in _pts_rgb_r2.T:
+                                                _xi2, _yi2 = float(_xi2), float(_yi2)
+                                                if _AXIS_CX_RGB is not None:
+                                                    if ((_xi2-_AXIS_CX_RGB)**2+(_yi2-_AXIS_CY_RGB)**2)**0.5 < _AXIS_EXCL_R:
+                                                        continue
+                                                if 0 <= _xi2 < VW and 0 <= _yi2 < VH:
+                                                    if _rgb_ref_gray is not None and int(_rgb_ref_gray[int(_yi2), int(_xi2)]) < 40:
+                                                        continue
+                                                    _ir_fg_pts_iou.append([_xi2, _yi2])
+                                except Exception:
+                                    pass
+                            if _ir_fg_pts_iou:
+                                _axis_bg_iou = [[_AXIS_CX_RGB, _AXIS_CY_RGB]] if _AXIS_CX_RGB is not None else []
+                                _reinforce_inject = {"local_frame": 0, "fg_points": _ir_fg_pts_iou, "bg_points": _axis_bg_iou, "label": "IR-IoU-reset"}
+                            # 保存预览图
+                            try:
+                                if _rst_rgb_frame is not None:
+                                    _vis_iou = _rst_rgb_frame.copy()
+                                    if _rst_carry_mask is not None and _rst_carry_mask.any():
+                                        _vis_iou[_rst_carry_mask] = (_vis_iou[_rst_carry_mask].astype(float) * 0.5 + np.array([0, 0, 220]) * 0.5).astype(np.uint8)
+                                    if _reinforce_inject:
+                                        for _p in _reinforce_inject["fg_points"]:
+                                            cv2.circle(_vis_iou, (int(_p[0]), int(_p[1])), 10, (0, 255, 255), -1)
+                                    cv2.putText(_vis_iou, _rst_reason, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                                    cv2.putText(_vis_iou, f"t={chunk_start_s:.0f}s  [blue=bad_mask | cyan=new_pts]",
+                                                (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+                                    _iou_rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}_iou.jpg"
+                                    cv2.imwrite(os.path.join(out_dir, _iou_rst_name), _vis_iou)
+                                    print(f"[IR-IoU] 预览图已保存: {_iou_rst_name}")
+                            except Exception:
+                                pass
+                        else:
+                            # ── mask 正常且 IoU 通过：每批必做 IR 低温区采点补强 ──
+                            # 这样每次补强都以物理温度为锚点，不依赖 SAM2 漂移 mask
+                            pass  # 继续下面的正常补强逻辑
+
+                        # ── mask 正常（IoU 通过）：每批必做 IR 低温区采点 ──
+                        _fg_reinforce = []
+                        _used_ir_reinforce = False
+                        if _ir_iou_ok and (temp_data is not None and homography is not None
+                                and _wok_mask_al is not None and _H_inv_al is not None
+                                and _rng_al is not None):
+                            try:
+                                _ir_idx_rein = _get_ir_idx(chunk_start_abs)
+                                _ir_frm_rein = temp_data[_ir_idx_rein]
+                                _wok_t_rein  = _ir_frm_rein[_wok_mask_al]
+                                if len(_wok_t_rein) >= 10:
+                                    _t_rein = float(np.percentile(_wok_t_rein, 35))
+                                    _food_rein = (_ir_frm_rein < _t_rein) & _wok_mask_al
+                                    _ys_rein, _xs_rein = np.where(_food_rein)
+                                    if len(_xs_rein) >= 6:
+                                        _sel_rein = _rng_al.choice(len(_xs_rein),
+                                                                    size=min(6, len(_xs_rein)),
+                                                                    replace=False)
+                                        _pts_rein_h = np.stack([
+                                            _xs_rein[_sel_rein].astype(float),
+                                            _ys_rein[_sel_rein].astype(float),
+                                            np.ones(len(_sel_rein))
+                                        ])
+                                        _pts_rgb_rein = _H_inv_al @ _pts_rein_h
+                                        _pts_rgb_rein = _pts_rgb_rein[:2] / _pts_rgb_rein[2]
+                                        for _xi, _yi in _pts_rgb_rein.T:
+                                            _xi, _yi = float(_xi), float(_yi)
+                                            # 排除旋转轴区域
+                                            if _AXIS_CX_RGB is not None:
+                                                _d = ((_xi-_AXIS_CX_RGB)**2+(_yi-_AXIS_CY_RGB)**2)**0.5
+                                                if _d < _AXIS_EXCL_R:
+                                                    continue
+                                            if 0 <= _xi < VW and 0 <= _yi < VH:
+                                                # 颜色过滤：亮度 < 40 = 黑色锅底，丢弃
+                                                if _rgb_ref_gray is not None:
+                                                    _bv = int(_rgb_ref_gray[int(_yi), int(_xi)])
+                                                    if _bv < 40:
+                                                        continue
+                                                _fg_reinforce.append([_xi, _yi])
+                                        if _fg_reinforce:
+                                            _used_ir_reinforce = True
+                                            print(f"[补强] t={chunk_start_s:.1f}s  "
+                                                  f"IR采点FG={len(_fg_reinforce)}"
+                                                  f"  阈值={_t_rein:.1f}°C")
+                            except Exception as _re2:
+                                print(f"[补强] IR采点失败({_re2})，回退腐蚀")
+
+                        # 若 IR 采点失败，回退到腐蚀 carry_mask（排除旋转轴区域）
+                        # 注意：_ir_iou_ok=False 时 carry_mask 已置 None，跳过
+                        if not _fg_reinforce and _ir_iou_ok and carry_mask is not None:
+                            try:
+                                _cm_u8 = carry_mask.astype(np.uint8) * 255
+                                _ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (40, 40))
+                                _inner = cv2.erode(_cm_u8, _ek)
+                                _ys_r, _xs_r = np.where(_inner > 0)
+                                # 排除旋转轴附近的候选点
+                                if _AXIS_CX_RGB is not None and len(_xs_r) > 0:
+                                    _dists_ax = np.sqrt((_xs_r-_AXIS_CX_RGB)**2+(_ys_r-_AXIS_CY_RGB)**2)
+                                    _mask_ax = _dists_ax >= _AXIS_EXCL_R
+                                    _xs_r, _ys_r = _xs_r[_mask_ax], _ys_r[_mask_ax]
+                                _n_reinforce = 6
+                                if len(_xs_r) >= _n_reinforce:
+                                    _idx_r = _rng_al.choice(len(_xs_r), size=_n_reinforce, replace=False)
+                                    _fg_reinforce = [[float(_xs_r[i]), float(_ys_r[i])] for i in _idx_r]
+                                elif len(_xs_r) > 0:
+                                    _fg_reinforce = [[float(_xs_r[i]), float(_ys_r[i])]
+                                                     for i in range(len(_xs_r))]
+                            except Exception as _e:
+                                print(f"[补强] 腐蚀采点也失败({_e})，跳过本次补强")
+
+                        # 旋转轴中心作为固定背景点
+                        _axis_bg_rein = []
+                        if _AXIS_CX_RGB is not None:
+                            _axis_bg_rein = [[_AXIS_CX_RGB, _AXIS_CY_RGB]]
+
+                        if _fg_reinforce:
+                            _reinforce_inject = {
+                                "local_frame": 0,
+                                "fg_points":   _fg_reinforce,
+                                "bg_points":   _axis_bg_rein,
+                            }
+                            last_relabel_s = chunk_start_s
+                            last_reinforce_wok_pct = _mask_vs_wok
+                            _in_recovery = False   # 补强成功，退出 recovery 模式
+                            src = "IR" if _used_ir_reinforce else "erode"
+                            print(f"[补强] t={chunk_start_s:.1f}s  mask正常({_mask_vs_wok:.0f}%)"
+                                  f"  FG={len(_fg_reinforce)} [{src}]")
                         # 保存预览图（不管采点是否成功，只要 carry_mask 有效就显示）
                         try:
                             _cap_al = cv2.VideoCapture(video_path)
@@ -1118,6 +1530,49 @@ def main():
                 # ── 对 carry_mask 也做 wok 约束，防止面积检查出现 >100% ──────
                 if carry_mask is not None and _wok_rgb_constraint is not None:
                     carry_mask = carry_mask & _wok_rgb_constraint
+
+                # ── B：carry_mask 连通域可靠性检查 ────────────────────────────
+                # 检查两个指标，任一不满足则标记 carry_mask 为不可信（置 None）：
+                #   1. 最大连通域面积 / wok 区域面积 > 25%（接近整锅）
+                #   2. 有效连通域数量 > 5 个（碎片化，SAM2 追踪失控）
+                if carry_mask is not None and _wok_rgb_constraint is not None:
+                    _cm_u8_b = carry_mask.astype(np.uint8) * 255
+                    _cc_n, _cc_labels, _cc_stats, _ = cv2.connectedComponentsWithStats(
+                        _cm_u8_b, connectivity=8
+                    )
+                    # _cc_stats[0] = 背景，跳过；从 1 开始是前景连通域
+                    _fg_components = _cc_stats[1:]   # 去掉背景
+                    _wok_px_b = int(_wok_rgb_constraint.sum())
+                    _carry_unreliable = False
+                    if len(_fg_components) > 0:
+                        _max_cc_area = int(_fg_components[:, cv2.CC_STAT_AREA].max())
+                        _max_cc_pct  = _max_cc_area / max(_wok_px_b, 1) * 100
+                        # 过滤掉面积 < 0.5% wok 的碎片，只数"有效"连通域
+                        _min_cc_px   = max(100, int(_wok_px_b * 0.005))
+                        _valid_cc    = int((_fg_components[:, cv2.CC_STAT_AREA] >= _min_cc_px).sum())
+                        if _max_cc_pct > 50.0:
+                            _carry_unreliable = True
+                            print(f"[B-check] 批次{chunk_i+1}末 carry_mask 最大连通域"
+                                  f"={_max_cc_pct:.1f}%>50%（接近整锅），标记不可信")
+                        elif _valid_cc > 5:
+                            _carry_unreliable = True
+                            print(f"[B-check] 批次{chunk_i+1}末 carry_mask 有效连通域"
+                                  f"={_valid_cc}>5（碎片化），标记不可信")
+                    if _carry_unreliable:
+                        # 不直接 None，而是缩小为仅保留最大连通域（减少硬重置次数）
+                        if len(_fg_components) > 0:
+                            _max_cc_idx = int(_fg_components[:, cv2.CC_STAT_AREA].argmax()) + 1
+                            carry_mask = (_cc_labels == _max_cc_idx)
+                            _new_pct = carry_mask.sum() / max(_wok_px_b, 1) * 100
+                            if _new_pct > 25.0:
+                                # 最大单连通域还是过大，才真正 discard
+                                carry_mask = None
+                                print(f"[B-check] 最大单连通域仍={_new_pct:.1f}%>25%，"
+                                      f"discard carry_mask")
+                            else:
+                                print(f"[B-check] 保留最大单连通域({_new_pct:.1f}%)，"
+                                      f"丢弃其余碎片")
+
                 print(f"[SAM2] 批次 {chunk_i+1} 追踪完成，{len(chunk_masks)} 帧")
 
                 # ── mask 面积异常检测：若本批平均占比 > 60% 且比上批大 3 倍 → 强制下批重标点 ──
@@ -1164,7 +1619,7 @@ def main():
                 if temp_data is not None and homography is not None:
                     ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
                     ir_mask    = map_mask_to_ir(mask, homography, (ir_h, ir_w))
-                    ir_idx     = int(abs_idx * ir_fps_ratio)
+                    ir_idx     = _get_ir_idx(abs_idx)
                     if ir_idx < temp_data.shape[0]:
                         t_frame    = temp_data[ir_idx]
                         food_temps = t_frame[ir_mask]
@@ -1183,7 +1638,7 @@ def main():
                 if roi_cfg is not None and temp_data is not None and homography is not None:
                     try:
                         ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
-                        ir_idx_roi = int(abs_idx * ir_fps_ratio)
+                        ir_idx_roi = _get_ir_idx(abs_idx)
                         if ir_idx_roi < temp_data.shape[0]:
                             # RGB 圆心 → IR 坐标
                             rgb_pt = np.array([[[float(roi_cfg["rgb_cx"]),
@@ -1224,7 +1679,7 @@ def main():
                 # K-means 自适应分类，比固定百分位更准确
                 ir_mask_temp = float("nan")
                 if wok_mask_ir is not None and temp_data is not None:
-                    ir_idx_wok = int(abs_idx * ir_fps_ratio)
+                    ir_idx_wok = _get_ir_idx(abs_idx)
                     if ir_idx_wok < temp_data.shape[0]:
                         t_frame_wok = temp_data[ir_idx_wok]
                         wok_temps   = t_frame_wok[wok_mask_ir]
@@ -1331,7 +1786,7 @@ def main():
             if temp_data is not None and homography is not None:
                 ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
                 ir_mask    = map_mask_to_ir(mask, homography, (ir_h, ir_w))
-                ir_idx     = int(abs_idx * ir_fps_ratio)
+                ir_idx     = _get_ir_idx(abs_idx)
                 if ir_idx < temp_data.shape[0]:
                     t_frame    = temp_data[ir_idx]
                     food_temps = t_frame[ir_mask]
@@ -1371,7 +1826,7 @@ def main():
 
     writer.release()
 
-    print(f"\n\n✅ 追踪完成！")
+    print(f"\n\n[DONE] 追踪完成！")
     print(f"   结果目录:   {out_dir}")
     print(f"   可视化视频: {out_video_viz}")
     print(f"   共处理 {global_local} 帧")
@@ -1396,6 +1851,7 @@ def main():
             rgb_start_frame=start_frame,
             rgb_fps=fps,
             pct=IR_FOOD_PCT,
+            wok_cx_history=_wok_cx_history,
         )
         print(f"   并排视频: {out_combined}")
         # 删除中间产物（纯 RGB viz 视频），只保留最终并排视频
@@ -1659,7 +2115,8 @@ def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path):
 # ── RGB + IR 视频拼合 ─────────────────────────────────────────────────────────
 
 def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
-                  out_path, rgb_start_frame, rgb_fps, pct=40):
+                  out_path, rgb_start_frame, rgb_fps, pct=40,
+                  wok_cx_history=None):
     """
     新布局：
       ┌─────────────────────────────────────────────────┐
@@ -1720,9 +2177,33 @@ def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, out_fps, (total_w, total_h))
 
+    # ── 预处理 wok_cx_history 为快速查表结构 ─────────────────────────────────
+    # _wok_cx_history: list of (abs_frame, cx, cy)，按 abs_frame 升序
+    # 对每个 RGB 帧（abs_frame = rgb_start_frame + idx），找 <=abs_frame 的最新记录
+    _hist_sorted = sorted(wok_cx_history, key=lambda x: x[0]) if wok_cx_history else []
+    # 预提取帧号列表，方便二分查找
+    _hist_frames = [h[0] for h in _hist_sorted]
+
+    def _get_dynamic_wok(abs_frame):
+        """返回 abs_frame 时刻的动态 wok_cfg（shallow copy + 替换 cx/cy）"""
+        if not _hist_sorted:
+            return wok_cfg
+        # 找最后一个 <= abs_frame 的记录
+        import bisect
+        pos = bisect.bisect_right(_hist_frames, abs_frame) - 1
+        if pos < 0:
+            return wok_cfg
+        _, cx, cy = _hist_sorted[pos]
+        dyn = dict(wok_cfg)
+        dyn["cx"] = cx
+        dyn["cy"] = cy
+        return dyn
+
     print(f"[拼合] 纯视频: RGB={pure_w}×{pure_h}  IR={ir_out_w}×{ir_out_h}")
     print(f"[拼合] 底部面板: info={new_info_h}px  chart={new_chart_h}px  全宽={total_w}px")
     print(f"[拼合] 输出帧尺寸: {total_w}×{total_h}  共 {rgb_total} 帧")
+    if _hist_sorted:
+        print(f"[拼合] 动态椭圆：使用 {len(_hist_sorted)} 个 wok 中心历史记录")
 
     for idx in range(rgb_total):
         ret, viz_frame = cap.read()
@@ -1735,10 +2216,12 @@ def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
         chart_src = viz_frame[pure_h + INFO_H:pure_h + INFO_H + CHART_H, :]  # chart（原始小）
 
         # ── 渲染 IR 帧（等高对齐）─────────────────────────────────────────────
-        time_s  = (rgb_start_frame + idx) / rgb_fps
-        ir_idx  = min(int(round(time_s * ir_fps)), n_ir - 1)
+        time_s     = (rgb_start_frame + idx) / rgb_fps
+        ir_idx     = min(int(round(time_s * ir_fps)), n_ir - 1)
+        abs_frame  = rgb_start_frame + idx
+        dyn_wok    = _get_dynamic_wok(abs_frame)
         ir_img  = render_ir_frame(
-            temp_data[ir_idx], wok_cfg, pct=pct,
+            temp_data[ir_idx], dyn_wok, pct=pct,
             out_w=ir_out_w, out_h=ir_out_h
         )
 

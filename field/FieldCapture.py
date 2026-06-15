@@ -103,6 +103,8 @@ is_recording    = False
 video_writer    = None
 ir_video_writer = None   # IR 伪彩色视频写入器
 temp_list       = []
+rgb_ts_list     = []     # RGB 逐帧时间戳（Unix float64）
+ir_ts_list      = []     # IR 逐帧时间戳（Unix float64）
 frame_count     = 0
 temp_count      = 0
 ir_frame_count  = 0
@@ -191,7 +193,7 @@ def sdk_login(dll):
 # ============================================================
 
 def on_video_frame(handle, video_info_ptr, ivs_ptr, user_data):
-    global latest_rgb, is_recording, video_writer, frame_count, rec_ts
+    global latest_rgb, is_recording, video_writer, frame_count, rec_ts, rgb_ts_list
     try:
         vi = video_info_ptr.contents
         if vi.width <= 0 or vi.height <= 0:
@@ -217,6 +219,7 @@ def on_video_frame(handle, video_info_ptr, ivs_ptr, user_data):
                 video_writer = cv2.VideoWriter(fname, fourcc, 25.0, (vi.width, vi.height))
                 print(f"[视频] 开始写入: {fname}")
             video_writer.write(bgr)
+            rgb_ts_list.append(time.time())   # 记录本帧时间戳
             frame_count += 1
 
     except Exception as e:
@@ -224,7 +227,7 @@ def on_video_frame(handle, video_info_ptr, ivs_ptr, user_data):
 
 
 def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
-    global latest_ir, is_recording, temp_list, temp_count
+    global latest_ir, is_recording, temp_list, temp_count, ir_ts_list
     global ir_video_writer, ir_frame_count, rec_ts
     try:
         ti = temp_info_ptr.contents
@@ -244,6 +247,7 @@ def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
         if is_recording:
             # 保存温度矩阵（精度数据）
             temp_list.append(celsius)
+            ir_ts_list.append(time.time())    # 记录本帧时间戳
             temp_count += 1
 
             # 同步录制 IR 伪彩色视频
@@ -251,9 +255,9 @@ def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 ts = rec_ts if rec_ts else datetime.now().strftime("%Y%m%d_%H%M%S")
                 ir_fname = os.path.join(_DATA_DIR, f"ir_{ts}.mp4")
-                # IR 帧率由实际回调频率决定，这里用 25fps 作为标称值
+                # IR 实际回调约 40fps，标称帧率设为 40.0 确保视频播放时长正常
                 ir_video_writer = cv2.VideoWriter(
-                    ir_fname, fourcc, 25.0, (IR_VIDEO_W, IR_VIDEO_H)
+                    ir_fname, fourcc, 40.0, (IR_VIDEO_W, IR_VIDEO_H)
                 )
                 print(f"[IR视频] 开始写入: {ir_fname}")
 
@@ -547,6 +551,8 @@ def main():
                 rec_ts          = datetime.now().strftime("%Y%m%d_%H%M%S")  # 统一时间戳
                 is_recording    = True
                 temp_list       = []
+                rgb_ts_list     = []
+                ir_ts_list      = []
                 frame_count     = 0
                 temp_count      = 0
                 ir_frame_count  = 0
@@ -557,6 +563,8 @@ def main():
 
         elif key == ord('q') or key == ord('Q'):
             print("\n[停止] 正在保存数据...")
+            # 无论 ROI 有没有手动编辑，都强制保存一份当前状态
+            save_roi_config(PREVIEW_W, PREVIEW_H, rgb_orig_w, rgb_orig_h)
             break
 
     # 6. 停止流
@@ -575,7 +583,7 @@ def main():
         ir_video_writer.release()
         print(f"[OK] IR 视频已保存，共 {ir_frame_count} 帧  ({IR_VIDEO_W}×{IR_VIDEO_H})")
 
-    # 8. 保存温度矩阵（使用 rec_ts，与视频保持同一时间戳）
+    # 8. 保存温度矩阵 + 逐帧时间戳（使用 rec_ts，与视频保持同一时间戳）
     ts = rec_ts if rec_ts else datetime.now().strftime("%Y%m%d_%H%M%S")
     if len(temp_list) > 0:
         stack = np.stack(temp_list, axis=0)
@@ -586,8 +594,20 @@ def main():
         t_all_max = np.max(stack)
         t_all_min = np.min(stack)
         print(f"     温度范围: {t_all_min:.1f}℃ ~ {t_all_max:.1f}℃")
+        # 保存 IR 逐帧时间戳
+        if len(ir_ts_list) > 0:
+            ir_ts_arr  = np.array(ir_ts_list, dtype=np.float64)
+            ir_ts_name = os.path.join(_DATA_DIR, f"temp_{ts}_ts.npy")
+            np.save(ir_ts_name, ir_ts_arr)
+            print(f"[OK] IR 时间戳已保存: {ir_ts_name}  ({len(ir_ts_arr)} 帧)")
     else:
         print("[警告] 未采集到温度数据（是否忘记按 S 开始录制？）")
+    # 保存 RGB 逐帧时间戳
+    if len(rgb_ts_list) > 0:
+        rgb_ts_arr  = np.array(rgb_ts_list, dtype=np.float64)
+        rgb_ts_name = os.path.join(_DATA_DIR, f"rgb_{ts}_ts.npy")
+        np.save(rgb_ts_name, rgb_ts_arr)
+        print(f"[OK] RGB 时间戳已保存: {rgb_ts_name}  ({len(rgb_ts_arr)} 帧)")
 
     # 9. 登出
     dll.IRC_NET_Logout(handle)
