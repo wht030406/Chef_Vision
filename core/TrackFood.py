@@ -1276,37 +1276,60 @@ def main():
                                 _ir_frm_iou = temp_data[_ir_idx_iou]
                                 _wok_t_iou  = _ir_frm_iou[_wok_mask_al]
                                 if len(_wok_t_iou) >= 10:
-                                    _t_iou = float(np.percentile(_wok_t_iou, 40))
-                                    _food_ir_iou = (_ir_frm_iou < _t_iou) & _wok_mask_al
-                                    # 把 IR 低温区反投影到 RGB 坐标系
-                                    _ys_iou, _xs_iou = np.where(_food_ir_iou)
-                                    if len(_xs_iou) >= 10:
-                                        _pts_iou_h = np.stack([
-                                            _xs_iou.astype(float),
-                                            _ys_iou.astype(float),
-                                            np.ones(len(_xs_iou))
-                                        ])
-                                        _pts_rgb_iou = _H_inv_al @ _pts_iou_h
-                                        _pts_rgb_iou = _pts_rgb_iou[:2] / _pts_rgb_iou[2]
-                                        # 构建 IR 食材区域 RGB mask
-                                        _ir_food_rgb = np.zeros((VH, VW), dtype=bool)
-                                        _xi_iou = np.clip(np.round(_pts_rgb_iou[0]).astype(int), 0, VW-1)
-                                        _yi_iou = np.clip(np.round(_pts_rgb_iou[1]).astype(int), 0, VH-1)
-                                        _ir_food_rgb[_yi_iou, _xi_iou] = True
-                                        # 膨胀一下，容忍标定误差（~15px）
-                                        _ir_food_rgb_u8 = _ir_food_rgb.astype(np.uint8) * 255
-                                        _kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
-                                        _ir_food_rgb_u8 = cv2.dilate(_ir_food_rgb_u8, _kd)
-                                        _ir_food_rgb = _ir_food_rgb_u8 > 0
-                                        # 计算 IoU：carry_mask 与 IR 低温区的重叠
-                                        _inter = int((carry_mask & _ir_food_rgb).sum())
-                                        _union = int((carry_mask | _ir_food_rgb).sum())
-                                        _iou = _inter / max(_union, 1) * 100
-                                        if _iou < 8.0:
-                                            _ir_iou_ok = False
-                                            print(f"[IR-IoU] t={chunk_start_s:.1f}s  "
-                                                  f"IoU={_iou:.1f}%<8%，SAM2 mask 与食材区域严重不符，"
-                                                  f"强制重置")
+                                    # 用 K-means 双峰分类代替固定 P40 阈值：
+                                    # K-means 自适应找食材（低温类）和锅壁（高温类）的分界
+                                    # 返回 NaN = 锅内温度均匀（锅直立/无热食材），跳过 IoU 检查
+                                    _km_c_low  = float(np.percentile(_wok_t_iou, 10))
+                                    _km_c_high = float(np.percentile(_wok_t_iou, 90))
+                                    for _ in range(20):
+                                        _km_d_low  = np.abs(_wok_t_iou - _km_c_low)
+                                        _km_d_high = np.abs(_wok_t_iou - _km_c_high)
+                                        _km_food   = _km_d_low <= _km_d_high
+                                        _km_nl = float(np.mean(_wok_t_iou[_km_food]))  if _km_food.any()  else _km_c_low
+                                        _km_nh = float(np.mean(_wok_t_iou[~_km_food])) if (~_km_food).any() else _km_c_high
+                                        if abs(_km_nl - _km_c_low) < 0.1 and abs(_km_nh - _km_c_high) < 0.1:
+                                            break
+                                        _km_c_low, _km_c_high = _km_nl, _km_nh
+                                    if (_km_c_high - _km_c_low) < 30.0:
+                                        # 锅内温度均匀，无法区分食材和锅壁，跳过 IoU 检查
+                                        _wok_t_iou = None   # 标记跳过
+                                    else:
+                                        # 用 K-means 低温类像素构建食材 mask
+                                        _km_d_low2  = np.abs(_ir_frm_iou[_wok_mask_al] - _km_c_low)
+                                        _km_d_high2 = np.abs(_ir_frm_iou[_wok_mask_al] - _km_c_high)
+                                        _food_flat  = _km_d_low2 <= _km_d_high2
+                                        _food_ir_iou = np.zeros(_ir_frm_iou.shape, dtype=bool)
+                                        _food_ir_iou[_wok_mask_al] = _food_flat
+                                    if _wok_t_iou is not None:
+                                        # 把 IR 低温区反投影到 RGB 坐标系
+                                        _ys_iou, _xs_iou = np.where(_food_ir_iou)
+                                        if len(_xs_iou) >= 10:
+                                            _pts_iou_h = np.stack([
+                                                _xs_iou.astype(float),
+                                                _ys_iou.astype(float),
+                                                np.ones(len(_xs_iou))
+                                            ])
+                                            _pts_rgb_iou = _H_inv_al @ _pts_iou_h
+                                            _pts_rgb_iou = _pts_rgb_iou[:2] / _pts_rgb_iou[2]
+                                            # 构建 IR 食材区域 RGB mask
+                                            _ir_food_rgb = np.zeros((VH, VW), dtype=bool)
+                                            _xi_iou = np.clip(np.round(_pts_rgb_iou[0]).astype(int), 0, VW-1)
+                                            _yi_iou = np.clip(np.round(_pts_rgb_iou[1]).astype(int), 0, VH-1)
+                                            _ir_food_rgb[_yi_iou, _xi_iou] = True
+                                            # 膨胀一下，容忍标定误差（~15px）
+                                            _ir_food_rgb_u8 = _ir_food_rgb.astype(np.uint8) * 255
+                                            _kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+                                            _ir_food_rgb_u8 = cv2.dilate(_ir_food_rgb_u8, _kd)
+                                            _ir_food_rgb = _ir_food_rgb_u8 > 0
+                                            # 计算 IoU：carry_mask 与 IR 低温区的重叠
+                                            _inter = int((carry_mask & _ir_food_rgb).sum())
+                                            _union = int((carry_mask | _ir_food_rgb).sum())
+                                            _iou = _inter / max(_union, 1) * 100
+                                            if _iou < 8.0:
+                                                _ir_iou_ok = False
+                                                print(f"[IR-IoU] t={chunk_start_s:.1f}s  "
+                                                      f"IoU={_iou:.1f}%<8%，SAM2 mask 与食材区域严重不符，"
+                                                      f"强制重置")
                             except Exception as _iou_e:
                                 pass   # IoU 检查失败不影响主流程
 
