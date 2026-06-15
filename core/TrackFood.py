@@ -873,6 +873,15 @@ def main():
     last_reinforce_wok_pct = 0.0         # 上次补强时 mask 占 wok 区域的%（骤降检测用）
     _in_recovery = False                 # 重置后进入 recovery 模式，每批强制检查直到恢复
 
+    # ── 场景异常检测滚动历史（相对阈值用）──────────────────────────────────────
+    # 保留最近 _SCENE_WIN 批正常帧的 RGB 亮度均值/方差 和 IR 均值/方差
+    # 用滚动均值/方差作为"正常基准"，避免绝对阈值失效
+    _SCENE_WIN          = 8    # 滚动窗口批数
+    _rgb_mean_history   = []   # 近 N 批正常状态的 RGB 锅内亮度均值
+    _rgb_var_history    = []   # 近 N 批正常状态的 RGB 锅内亮度方差
+    _ir_mean_history    = []   # 近 N 批正常状态的 IR 锅内温度均值
+    _ir_var_history     = []   # 近 N 批正常状态的 IR 锅内温度方差
+
     # ── 预计算 wok RGB mask（用于每帧后处理约束，避免循环内重复计算）────────
     _wok_rgb_constraint = None   # (VH, VW) bool
     if wok_mask_ir is not None and homography is not None:
@@ -1019,11 +1028,14 @@ def main():
             # IR 只做稳定性检查（决定要不要补强），不再参与任何标注点生成。
             _reinforce_inject = None   # 本批第一帧要注入的补强点
 
-            # ── C：异常场景检测（白烟/空锅/锅直立）→ 冻结 carry_mask，跳过补强 ──
-            # 检测锅内 RGB 区域的亮度均值和方差：
-            #   白烟：均值 > 150 AND 方差 < 800（整锅均匀偏白）
-            #   空锅/锅直立：均值 < 25（整锅极暗，食材不在画面中）
+            # ── C：异常场景检测（白烟/锅直立）→ 冻结 carry_mask，跳过补强 ──────
+            # 使用相对阈值：与近 _SCENE_WIN 批的滚动均值比较，避免绝对值失效
+            # 需要至少 3 批历史才启用相对检测，否则 fallback 到宽松绝对值
             _scene_frozen = False
+            _cur_rgb_mean = None
+            _cur_rgb_var  = None
+            _cur_ir_mean  = None
+            _cur_ir_var   = None
             if carry_mask is not None and chunk_i > 0 and _wok_rgb_constraint is not None:
                 try:
                     _cap_sc = cv2.VideoCapture(video_path)
@@ -1031,22 +1043,78 @@ def main():
                     _ret_sc, _rgb_sc = _cap_sc.read()
                     _cap_sc.release()
                     if _ret_sc:
-                        _gray_sc = cv2.cvtColor(_rgb_sc, cv2.COLOR_BGR2GRAY)
+                        _gray_sc   = cv2.cvtColor(_rgb_sc, cv2.COLOR_BGR2GRAY)
                         _wok_px_sc = _gray_sc[_wok_rgb_constraint]
                         if len(_wok_px_sc) > 0:
-                            _mean_sc = float(np.mean(_wok_px_sc))
-                            _var_sc  = float(np.var(_wok_px_sc))
-                            if _mean_sc > 150 and _var_sc < 800:
-                                _scene_frozen = True
-                                print(f"[冻结] t={chunk_start_s:.1f}s  检测到白烟/均匀高亮"
-                                      f"(mean={_mean_sc:.0f}>150, var={_var_sc:.0f}<800)，"
-                                      f"冻结carry_mask，跳过补强")
-                            elif _mean_sc < 25:
-                                _scene_frozen = True
-                                print(f"[冻结] t={chunk_start_s:.1f}s  检测到空锅/锅直立"
-                                      f"(mean={_mean_sc:.0f}<25)，冻结carry_mask，跳过补强")
+                            _cur_rgb_mean = float(np.mean(_wok_px_sc))
+                            _cur_rgb_var  = float(np.var(_wok_px_sc))
+                            # IR 当前批均值/方差（用于锅直立检测）
+                            if temp_data is not None and _wok_mask_al is not None:
+                                _ir_idx_sc = _get_ir_idx(chunk_start_abs)
+                                _ir_sc     = temp_data[_ir_idx_sc]
+                                _wok_t_sc  = _ir_sc[_wok_mask_al]
+                                if len(_wok_t_sc) >= 10:
+                                    _cur_ir_mean = float(np.mean(_wok_t_sc))
+                                    _cur_ir_var  = float(np.var(_wok_t_sc))
+                            n_hist = len(_rgb_mean_history)
+                            if n_hist >= 3:
+                                # ── 相对阈值检测 ──────────────────────────
+                                _ref_rgb_mean = float(np.mean(_rgb_mean_history[-_SCENE_WIN:]))
+                                _ref_rgb_var  = float(np.mean(_rgb_var_history[-_SCENE_WIN:]))
+                                # 白烟：RGB 均值突然升高 >50% 且方差骤降到参考值 20% 以下
+                                _smoke_flag = (
+                                    _cur_rgb_mean > _ref_rgb_mean * 1.5
+                                    and _cur_rgb_var < max(_ref_rgb_var * 0.2, 50.0)
+                                )
+                                # 锅直立（IR）：IR 均值突然升高 >15°C 且方差骤降到参考值 30% 以下
+                                _tilt_flag = False
+                                if (_cur_ir_mean is not None and _cur_ir_var is not None
+                                        and len(_ir_mean_history) >= 3):
+                                    _ref_ir_mean = float(np.mean(_ir_mean_history[-_SCENE_WIN:]))
+                                    _ref_ir_var  = float(np.mean(_ir_var_history[-_SCENE_WIN:]))
+                                    _tilt_flag = (
+                                        _cur_ir_mean > _ref_ir_mean + 15.0
+                                        and _cur_ir_var < max(_ref_ir_var * 0.3, 50.0)
+                                    )
+                                if _smoke_flag:
+                                    _scene_frozen = True
+                                    print(f"[冻结] t={chunk_start_s:.1f}s  检测到白烟/均匀高亮"
+                                          f"(rgb_mean={_cur_rgb_mean:.0f} vs ref={_ref_rgb_mean:.0f}×1.5"
+                                          f", rgb_var={_cur_rgb_var:.0f}<ref×0.2={_ref_rgb_var*0.2:.0f})，"
+                                          f"冻结carry_mask")
+                                elif _tilt_flag:
+                                    _scene_frozen = True
+                                    print(f"[冻结] t={chunk_start_s:.1f}s  检测到锅直立/无食材"
+                                          f"(ir_mean={_cur_ir_mean:.1f}°C>ref+15={_ref_ir_mean+15:.1f}°C"
+                                          f", ir_var={_cur_ir_var:.0f}<ref×0.3={_ref_ir_var*0.3:.0f})，"
+                                          f"冻结carry_mask")
+                            else:
+                                # ── 历史不足：宽松绝对值 fallback ────────
+                                if _cur_rgb_mean > 190 and _cur_rgb_var < 300:
+                                    _scene_frozen = True
+                                    print(f"[冻结] t={chunk_start_s:.1f}s  "
+                                          f"(fallback)白烟/高亮(mean={_cur_rgb_mean:.0f}>190"
+                                          f", var={_cur_rgb_var:.0f}<300)，冻结carry_mask")
                 except Exception as _sc_e:
                     pass   # 检测失败不影响主流程
+
+            # ── 正常批次：更新滚动历史（用于下批的相对阈值参考）──────────────
+            # 只在非冻结状态下更新，冻结批次的异常值不计入基准
+            if not _scene_frozen:
+                if _cur_rgb_mean is not None and _cur_rgb_var is not None:
+                    _rgb_mean_history.append(_cur_rgb_mean)
+                    _rgb_var_history.append(_cur_rgb_var)
+                    if len(_rgb_mean_history) > _SCENE_WIN * 2:
+                        _rgb_mean_history = _rgb_mean_history[-_SCENE_WIN:]
+                        _rgb_var_history  = _rgb_var_history[-_SCENE_WIN:]
+                if _cur_ir_mean is not None and _cur_ir_var is not None:
+                    _ir_mean_history.append(_cur_ir_mean)
+                    _ir_var_history.append(_cur_ir_var)
+                    if len(_ir_mean_history) > _SCENE_WIN * 2:
+                        _ir_mean_history = _ir_mean_history[-_SCENE_WIN:]
+                        _ir_var_history  = _ir_var_history[-_SCENE_WIN:]
+            elif chunk_i > 0:
+                print(f"[场景冻结] 本批不计入基准历史（rgb_hist={len(_rgb_mean_history)}批）")
 
             # recovery 模式下：每批都检查（不等 RELABEL_INTERVAL_S）；正常模式下按间隔检查
             _should_check = (
