@@ -69,8 +69,8 @@ def make_wok_mask(ir_h, ir_w, cfg):
     """生成锅内区域 mask（椭圆形）"""
     mask = np.zeros((ir_h, ir_w), dtype=np.uint8)
     cv2.ellipse(mask,
-                (cfg["cx"], cfg["cy"]),
-                (cfg["rx"], cfg["ry"]),
+                (int(cfg["cx"]), int(cfg["cy"])),
+                (int(cfg["rx"]), int(cfg["ry"])),
                 0, 0, 360, 255, -1)
     return mask > 0
 
@@ -162,19 +162,71 @@ def setup_wok_region(npy_path):
         cv2.imshow(win, draw())
         key = cv2.waitKey(30) & 0xFF
         if key in (ord('s'), ord('S')):
-            os.makedirs(os.path.dirname(WOK_CFG_PATH), exist_ok=True)
-            cfg_save = {"cx": cx, "cy": cy, "rx": rx, "ry": ry,
-                        "ir_h": ir_h, "ir_w": ir_w}
-            with open(WOK_CFG_PATH, "w") as f:
-                json.dump(cfg_save, f, indent=2)
-            print(f"[OK] 锅区域已保存: {WOK_CFG_PATH}")
-            print(f"     cx={cx} cy={cy} rx={rx} ry={ry}")
             break
         elif key in (ord('q'), ord('Q')):
             print("[退出] 未保存锅区域")
+            cv2.destroyAllWindows()
+            return
+
+    # ── Phase 2：点标旋转轴中心 ──────────────────────────────────────────────
+    axis_cx, axis_cy = cx, cy   # 默认用椭圆中心
+    axis_confirmed = [False]
+
+    def draw_axis():
+        t_min = float(ref_frame.min())
+        t_max = float(ref_frame.max())
+        norm = ((ref_frame - t_min) / max(t_max - t_min, 0.1) * 255).astype(np.uint8)
+        img = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+        img = cv2.resize(img, (disp_w, disp_h))
+        # 绘制椭圆（灰色，已确认）
+        dcx, dcy = to_disp(cx, cy)
+        drx, dry = int(rx * SCALE), int(ry * SCALE)
+        cv2.ellipse(img, (dcx, dcy), (drx, dry), 0, 0, 360, (100, 100, 100), 1)
+        # 绘制旋转轴标记
+        ax, ay = to_disp(axis_cx, axis_cy)
+        cv2.circle(img, (ax, ay), 8, (0, 255, 255), -1)
+        cv2.circle(img, (ax, ay), 9, (255, 255, 255), 1)
+        cv2.line(img, (ax - 14, ay), (ax + 14, ay), (0, 255, 255), 1)
+        cv2.line(img, (ax, ay - 14), (ax, ay + 14), (0, 255, 255), 1)
+        cv2.putText(img, "Phase 2: 点击旋转轴中心（炒菜机搅拌轴的位置）",
+                    (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+        cv2.putText(img,
+                    f"axis_cx={axis_cx} axis_cy={axis_cy}  "
+                    f"[S]=确认保存  [Q]=跳过(使用椭圆中心)",
+                    (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 255, 200), 1)
+        return img
+
+    def axis_mouse_cb(event, x, y, flags, param):
+        nonlocal axis_cx, axis_cy
+        if event == cv2.EVENT_LBUTTONDOWN:
+            axis_cx, axis_cy = to_ir(x, y)
+
+    cv2.setWindowTitle(win, "Phase 2: 点击旋转轴中心 — [S]=保存 [Q]=跳过")
+    cv2.setMouseCallback(win, axis_mouse_cb)
+
+    while True:
+        cv2.imshow(win, draw_axis())
+        key = cv2.waitKey(30) & 0xFF
+        if key in (ord('s'), ord('S')):
+            axis_confirmed[0] = True
+            break
+        elif key in (ord('q'), ord('Q')):
+            # 跳过，用椭圆中心作为旋转轴
+            axis_cx, axis_cy = cx, cy
             break
 
     cv2.destroyAllWindows()
+
+    os.makedirs(os.path.dirname(WOK_CFG_PATH), exist_ok=True)
+    cfg_save = {"cx": cx, "cy": cy, "rx": rx, "ry": ry,
+                "axis_cx": axis_cx, "axis_cy": axis_cy,
+                "ir_h": ir_h, "ir_w": ir_w}
+    with open(WOK_CFG_PATH, "w") as f:
+        json.dump(cfg_save, f, indent=2)
+    print(f"[OK] 锅区域已保存: {WOK_CFG_PATH}")
+    print(f"     cx={cx} cy={cy} rx={rx} ry={ry}")
+    print(f"     axis_cx={axis_cx} axis_cy={axis_cy}"
+          f"{'  (手动标注)' if axis_confirmed[0] else '  (默认=椭圆中心)'}")
 
 
 # ── 温度曲线绘制 ──────────────────────────────────────────────────────────────
@@ -371,6 +423,72 @@ def main():
     print(f"   温度日志: {csv_path}")
     print(f"\n下一步：如需调整锅区域，运行:")
     print(f"  python tools/ir_mask_viz.py --setup")
+
+
+def render_ir_frame(temp_frame, wok_cfg, pct=40,
+                    out_w=512, out_h=384):
+    """
+    渲染单帧 IR 热力图（带亮紫色菜区域边线），供外部调用。
+
+    参数：
+        temp_frame : np.ndarray (ir_h, ir_w) float，单帧温度矩阵
+        wok_cfg    : dict，锅区域配置 {cx, cy, rx, ry}
+        pct        : int，菜区域百分位阈值（默认40）
+        out_w/out_h: 输出帧尺寸
+
+    返回：
+        np.ndarray (out_h, out_w, 3) BGR，渲染好的 IR 帧
+    """
+    ir_h, ir_w = temp_frame.shape
+    scale_x = out_w / ir_w
+    scale_y = out_h / ir_h
+
+    # 温度分割
+    wok_mask_ = make_wok_mask(ir_h, ir_w, wok_cfg)
+    wok_temps = temp_frame[wok_mask_]
+    if len(wok_temps) > 0:
+        t_thresh  = np.percentile(wok_temps, pct)
+        food_mask = wok_mask_ & (temp_frame <= t_thresh)
+        m_u8 = food_mask.astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_OPEN,  kernel)
+        m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_CLOSE, kernel)
+        food_mask = m_u8 > 127
+    else:
+        food_mask = np.zeros((ir_h, ir_w), dtype=bool)
+
+    # 伪彩色渲染
+    t_min_f = float(np.min(temp_frame))
+    t_max_f = float(np.max(temp_frame))
+    norm    = ((temp_frame - t_min_f) / max(t_max_f - t_min_f, 0.1) * 255).astype(np.uint8)
+    ir_img  = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+    ir_img  = cv2.resize(ir_img, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+
+    # 叠加锅区域边界（白色椭圆）
+    cv2.ellipse(ir_img,
+                (int(wok_cfg["cx"] * scale_x), int(wok_cfg["cy"] * scale_y)),
+                (int(wok_cfg["rx"] * scale_x), int(wok_cfg["ry"] * scale_y)),
+                0, 0, 360, (255, 255, 255), 1)
+
+    # 叠加菜 mask（半透明白色 + 亮紫色轮廓）
+    food_resized = cv2.resize(food_mask.astype(np.uint8) * 255,
+                              (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+    food_bool = food_resized > 127
+    ir_img[food_bool] = (ir_img[food_bool].astype(float) * 0.65 +
+                         np.array([255, 255, 255]) * 0.35).astype(np.uint8)
+    contours, _ = cv2.findContours(food_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(ir_img, contours, -1, (255, 0, 200), 2)
+
+    # 温度信息文字
+    mask_ratio = food_mask.sum() / wok_mask_.sum() * 100 if wok_mask_.sum() > 0 else 0
+    food_temps_vals = temp_frame[food_mask]
+    temp_mean = float(np.mean(food_temps_vals)) if len(food_temps_vals) >= MIN_FOOD_AREA else float("nan")
+    cv2.putText(ir_img, f"mask={mask_ratio:.1f}%  avg={temp_mean:.1f}C",
+                (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    cv2.putText(ir_img, f"MAX:{t_max_f:.1f}C  MIN:{t_min_f:.1f}C  Pct<={pct}%",
+                (8, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+
+    return ir_img
 
 
 if __name__ == "__main__":

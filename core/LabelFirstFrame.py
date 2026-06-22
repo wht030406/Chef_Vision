@@ -63,7 +63,7 @@ import argparse
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ── 配置 ─────────────────────────────────────────────────────────────────────
-VIDEO_PATH   = os.path.join(_HERE, "..", "test_data", "test2", "rgb_20260529_115116.mp4")
+VIDEO_PATH   = os.path.join(_HERE, "..", "test_data", "test4", "rgb_20260616_151415.mp4")
 OUTPUT_JSON  = os.path.join(_HERE, "food_labels.json")
 SKIP_FRAMES  = 30      # ← → 键每次跳多少帧
 
