@@ -1851,12 +1851,13 @@ def main():
             # 改进后：IR 只做"粗定位"，从 IR mask 内采样前景点存入 _next_inject，
             #         下批 SAM2 接收这些点 + carry_mask 一起精细化边界
             if _irfix_count > actual * 0.5 and _irfix_last_mask is not None:
-                # carry_mask 置 None：让下批 SAM2 从 IR 前景点重新做视觉分割，
-                # 得到精细边界，而不是从 IR 粗 mask 块状边界出发
-                carry_mask = None
+                # carry_mask 仍用 IR 末帧 mask 覆盖（确保跨批位置正确）
+                carry_mask = _irfix_last_mask.copy()
+                _wok_px_ni = int(_wok_rgb_constraint.sum()) if _wok_rgb_constraint is not None else 1
+                _new_mask_pct = carry_mask.sum() / max(_wok_px_ni, 1) * 100
                 print(f"[IR-fix接管] 批次{chunk_i+1} 命中率={_irfix_count}/{actual}"
                       f"={_irfix_count/actual*100:.0f}%>50%，"
-                      f"carry_mask置None，下批SAM2将从IR前景点重新分割（精细化）")
+                      f"carry_mask更新为IR末帧({_new_mask_pct:.1f}%wok)")
                 # 从 IR 末帧 mask 内部采样前景点 → 存入 _next_inject，下批 SAM2 精细化
                 if (_H_inv_al is not None and _rng_al is not None
                         and _wok_rgb_constraint is not None):
