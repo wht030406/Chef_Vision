@@ -848,11 +848,6 @@ def main():
                 _ir_h_al = temp_data.shape[1]
                 _ir_w_al = temp_data.shape[2]
                 _wok_mask_al = _al_build_mask(_wok_cfg_al, _ir_h_al, _ir_w_al)
-                # 对 wok mask 内缩 3px，防止椭圆边缘冷区（锅外低温）混入 K-means 食材类
-                _wok_erode_k  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-                _wok_mask_al  = cv2.erode(
-                    _wok_mask_al.astype(np.uint8) * 255, _wok_erode_k
-                ).astype(bool)
                 _H_inv_al    = np.linalg.inv(homography)
                 _rng_al      = np.random.default_rng(42)
                 _auto_label_func = _al_ir_mask
@@ -1015,11 +1010,7 @@ def main():
                                                 (int(round(_wok_rx)), int(round(_wok_ry))),
                                                 0, 0, 360, 255, -1)
                                     wok_mask_ir = _wm_new > 0
-                                    # 同步内缩 3px，与初始化保持一致
-                                    _wok_mask_al = cv2.erode(
-                                        wok_mask_ir.astype(np.uint8) * 255,
-                                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-                                    ).astype(bool)
+                                    _wok_mask_al = wok_mask_ir.copy()
                                     _H_inv_wok2 = np.linalg.inv(homography)
                                     _wok_u8_2   = wok_mask_ir.astype(np.uint8) * 255
                                     _wok_proj2  = cv2.warpPerspective(_wok_u8_2, _H_inv_wok2, (VW, VH))
