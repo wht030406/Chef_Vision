@@ -651,39 +651,13 @@ def main():
         bottom_fg_points = bottom_bg_points = []
         bottom_start_frame = start_frame
 
-    # ── 加载 wok_rgb_region（RGB 锅区域椭圆）────────────────────────────────
-    # 优先读 food_labels.json 里手动标注的 wok_rgb_region，
-    # fallback 到 _wok_rgb_constraint（IR 反投影）
-    wok_rgb_cx = wok_rgb_cy = wok_rgb_rx = wok_rgb_ry = None
-    wok_rgb_mask_static = None   # (VH, VW) bool，初始静态椭圆 mask
+    # ── wok_rgb_region 的读取参数（先存起来，等 VH/VW 初始化后再构建 mask）──
+    _wok_rgb_json = {}
     try:
         with open(LABELS_JSON, "r", encoding="utf-8") as _f_wok:
-            _wok_json = json.load(_f_wok)
-        if "wok_rgb_region" in _wok_json:
-            _wr = _wok_json["wok_rgb_region"]
-            wok_rgb_cx = float(_wr["cx"])
-            wok_rgb_cy = float(_wr["cy"])
-            wok_rgb_rx = float(_wr["rx"])
-            wok_rgb_ry = float(_wr["ry"])
-            print(f"[wok_rgb] 已加载 RGB 锅椭圆: "
-                  f"cx={wok_rgb_cx:.0f} cy={wok_rgb_cy:.0f} "
-                  f"rx={wok_rgb_rx:.0f} ry={wok_rgb_ry:.0f}")
-            # 构建静态 mask（供 inverse_mask 约束）
-            _wm_static = np.zeros((VH, VW), dtype=np.uint8)
-            cv2.ellipse(_wm_static,
-                        (int(round(wok_rgb_cx)), int(round(wok_rgb_cy))),
-                        (int(round(wok_rgb_rx)), int(round(wok_rgb_ry))),
-                        0, 0, 360, 255, -1)
-            wok_rgb_mask_static = _wm_static > 0
-    except Exception as _we2:
-        print(f"[wok_rgb] 未找到 wok_rgb_region，inverse_mask 将 fallback 到 IR 反投影约束")
-
-    # 动态 wok_rgb 中心（每批用锅底 SAM2 mask 质心更新）
-    _wok_rgb_cx_dyn = wok_rgb_cx   # 当前批次的动态中心 x
-    _wok_rgb_cy_dyn = wok_rgb_cy   # 当前批次的动态中心 y
-    _WOK_RGB_MAX_DRIFT = 40        # 单批最大允许漂移（RGB px）
-    _bottom_carry = None           # 锅底 SAM2 跨批 carry_mask
-    _bottom_inject_map = {kf["frame"]: kf for kf in bottom_keyframes[1:]}
+            _wok_rgb_json = json.load(_f_wok)
+    except Exception:
+        pass
 
     if not os.path.exists(video_path):
         print(f"[错误] 找不到视频: {video_path}")
@@ -701,6 +675,33 @@ def main():
     print(f"[视频] 分辨率: {VW}x{VH}  总帧数: {total_frames}  FPS: {fps:.1f}")
     print(f"[视频] 追踪范围: 第 {start_frame} ~ {total_frames} 帧，共 {track_frames} 帧")
     print(f"[分批] 每批 {CHUNK_SIZE} 帧，共需 {(track_frames + CHUNK_SIZE - 1)//CHUNK_SIZE} 批")
+
+    # ── 加载 wok_rgb_region（在 VH/VW 已知后构建静态 mask）───────────────────
+    wok_rgb_cx = wok_rgb_cy = wok_rgb_rx = wok_rgb_ry = None
+    wok_rgb_mask_static = None
+    _wok_rgb_cx_dyn = _wok_rgb_cy_dyn = None
+    _WOK_RGB_MAX_DRIFT = 40
+    _bottom_carry = None
+    _bottom_inject_map = {kf["frame"]: kf for kf in bottom_keyframes[1:]}
+    if "wok_rgb_region" in _wok_rgb_json:
+        _wr = _wok_rgb_json["wok_rgb_region"]
+        wok_rgb_cx = float(_wr["cx"])
+        wok_rgb_cy = float(_wr["cy"])
+        wok_rgb_rx = float(_wr["rx"])
+        wok_rgb_ry = float(_wr["ry"])
+        print(f"[wok_rgb] 已加载 RGB 锅椭圆: "
+              f"cx={wok_rgb_cx:.0f} cy={wok_rgb_cy:.0f} "
+              f"rx={wok_rgb_rx:.0f} ry={wok_rgb_ry:.0f}")
+        _wm_static = np.zeros((VH, VW), dtype=np.uint8)
+        cv2.ellipse(_wm_static,
+                    (int(round(wok_rgb_cx)), int(round(wok_rgb_cy))),
+                    (int(round(wok_rgb_rx)), int(round(wok_rgb_ry))),
+                    0, 0, 360, 255, -1)
+        wok_rgb_mask_static = _wm_static > 0
+        _wok_rgb_cx_dyn = wok_rgb_cx
+        _wok_rgb_cy_dyn = wok_rgb_cy
+    else:
+        print(f"[wok_rgb] 未找到 wok_rgb_region，inverse_mask 将 fallback 到 IR 反投影约束")
 
     # ── 预构建关键帧注入表：{abs_frame: kf_dict} ──────────────────────────────
     # 只包含 extra_kfs（index>=1），第一个关键帧已经作为初始标注点使用
