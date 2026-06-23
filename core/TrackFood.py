@@ -698,6 +698,7 @@ def main():
                     (int(round(wok_rgb_rx)), int(round(wok_rgb_ry))),
                     0, 0, 360, 255, -1)
         wok_rgb_mask_static = _wm_static > 0
+        # 初始动态中心先用手动标注值，等 homography 加载后再用 IR 反投影覆盖
         _wok_rgb_cx_dyn = wok_rgb_cx
         _wok_rgb_cy_dyn = wok_rgb_cy
     else:
@@ -712,6 +713,29 @@ def main():
     if os.path.exists(HOMOGRAPHY_PATH):
         homography = np.load(HOMOGRAPHY_PATH)
         print(f"[单应矩阵] 已加载: {HOMOGRAPHY_PATH}  shape: {homography.shape}")
+        # 用 homography 逆矩阵把 IR 锅中心反投影到 RGB，初始化动态中心
+        # 避免首批用手动标注坐标和 IR 反投影之间的系统性偏差（~200px 跳变）
+        if wok_rgb_cx is not None:
+            try:
+                _H_inv_init = np.linalg.inv(homography)
+                # wok_cfg 在此处尚未加载，直接读 wok_region.json 获取 IR 锅中心
+                _wok_json_path = os.path.join(_HERE, "..", "data", "wok_region.json")
+                _ir_cx0, _ir_cy0 = 0.0, 0.0
+                if os.path.exists(_wok_json_path):
+                    with open(_wok_json_path) as _wf:
+                        _wj = json.load(_wf)
+                    _ir_cx0 = float(_wj.get("cx", 0.0))
+                    _ir_cy0 = float(_wj.get("cy", 0.0))
+                if _ir_cx0 == 0.0 and _ir_cy0 == 0.0:
+                    raise ValueError("wok_region.json cx/cy 为零，跳过初始化")
+                _ir_init = np.array([[[_ir_cx0, _ir_cy0]]], dtype=np.float32)
+                _rgb_init = cv2.perspectiveTransform(_ir_init, _H_inv_init)[0][0]
+                _wok_rgb_cx_dyn = float(_rgb_init[0])
+                _wok_rgb_cy_dyn = float(_rgb_init[1])
+                print(f"[wok_rgb初始化] IR({_ir_cx0:.0f},{_ir_cy0:.0f})"
+                      f" → RGB({_wok_rgb_cx_dyn:.0f},{_wok_rgb_cy_dyn:.0f}) (反投影)")
+            except Exception as _init_e:
+                print(f"[wok_rgb初始化] 反投影失败({_init_e})，保留手动标注坐标")
     else:
         print(f"[单应矩阵] 未找到 {HOMOGRAPHY_PATH}，跳过温度融合")
 
