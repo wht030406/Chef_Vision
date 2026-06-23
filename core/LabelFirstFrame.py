@@ -3,44 +3,49 @@ LabelFirstFrame.py — 手动定位食材入锅帧 + 交互标注（支持多关
 
 功能：
 1. 弹出 OpenCV 交互窗口，让用户用键盘跳帧到食材入锅的位置
-2. 用户点前景/背景点标注食材
+2. 用户点前景/背景点标注食材（或锅底）
 3. 保存结果到 food_labels.json，供 TrackFood.py 使用
 
 food_labels.json 结构（多关键帧格式）：
 {
   "video_path": "rgb_20260428_121157.mp4",
   "fps": 25.0,
-  "keyframes": [
+  "keyframes": [        <- 食材标注（正向追踪）
     {
       "frame":      780,
       "time_s":     31.2,
       "label":      "肉（初始帧）",
       "fg_points":  [[x, y], ...],
       "bg_points":  [[x, y], ...]
-    },
+    }
+  ],
+  "bottom_keyframes": [ <- 锅底标注（反向追踪，inverse mask = 锅区域 - 锅底）
     {
-      "frame":      1500,
-      "time_s":     60.0,
-      "label":      "青椒入锅",
-      "fg_points":  [[x, y], ...],
-      "bg_points":  []
+      "frame":      780,
+      "time_s":     31.2,
+      "label":      "锅底初始标注",
+      "fg_points":  [[x, y], ...],   <- 点在锅底暗纹/烧焦区
+      "bg_points":  [[x, y], ...]    <- 点在食材/锅壁
     }
   ]
 }
 
 用法：
-  # 初始标注（新建文件，覆盖旧格式）
+  # 初始标注食材（新建文件，覆盖旧格式）
   python LabelFirstFrame.py
 
-  # 追加模式：在第 N 帧追加新关键帧标注
+  # 追加模式：在第 N 帧追加新食材关键帧标注
   python LabelFirstFrame.py --append --frame 1500
+
+  # 标注锅底（反向语义，结果存入 bottom_keyframes）
+  python LabelFirstFrame.py --bottom
 
   # 追加并指定标签说明
   python LabelFirstFrame.py --append --frame 1500 --label "青椒入锅"
 
 操作键：
-  左键点击      → 添加前景点（绿色圆点，点在食材上）
-  右键点击      → 添加背景点（红色圆点，点在锅底/锅外）
+  左键点击      → 添加前景点（绿色圆点，食材模式=食材/锅底模式=锅底暗纹）
+  右键点击      → 添加背景点（红色圆点，食材模式=锅底锅外/锅底模式=食材锅壁）
   Z 键          → 撤销上一个点
   S 键          → 保存并退出
   Q 键          → 退出不保存
@@ -171,8 +176,11 @@ def main():
     parser = argparse.ArgumentParser(description="食材关键帧标注工具")
     parser.add_argument("--append",  action="store_true",
                         help="追加模式：在已有 JSON 中追加新关键帧（不覆盖旧标注）")
+    parser.add_argument("--bottom",  action="store_true",
+                        help="锅底标注模式：标注锅底区域（保存到 bottom_keyframes），"
+                             "TrackFood 会用 inverse mask（锅区域-锅底）追踪食材")
     parser.add_argument("--frame",   type=int, default=None,
-                        help="追加模式下，直接跳到指定帧号开始标注")
+                        help="追加/锅底模式下，直接跳到指定帧号开始标注")
     parser.add_argument("--label",   type=str, default=None,
                         help="本次标注的说明标签，如 '青椒入锅'")
     parser.add_argument("--video",   type=str, default=VIDEO_PATH,
@@ -209,7 +217,17 @@ def main():
     existing_kf_count = len(data["keyframes"])
 
     # ── 确定模式和起始帧 ──────────────────────────────────────────────────────
-    if args.append:
+    is_bottom = args.bottom   # 锅底标注模式
+    if is_bottom:
+        existing_bottom_count = len(data.get("bottom_keyframes", []))
+        mode_label  = args.label or "锅底初始标注"
+        current_idx = args.frame if args.frame is not None else 0
+        current_idx = max(0, min(current_idx, total_frames - 1))
+        print(f"[锅底模式] 标注锅底区域，结果存入 bottom_keyframes")
+        print(f"[锅底模式] 标签: {mode_label}  起始帧: {current_idx}")
+        print("[锅底模式] 左键点锅底暗纹/烧焦区（绿），右键点食材/锅壁（红）")
+        print()
+    elif args.append:
         if existing_kf_count == 0:
             print("[提示] JSON 中暂无关键帧，追加模式等同于初始标注")
         mode_label = args.label or f"关键帧 #{existing_kf_count + 1}"
@@ -305,7 +323,27 @@ def main():
                 "bg_points": bg_points,
             }
 
-            if args.append:
+            if is_bottom:
+                # 锅底模式：存入 bottom_keyframes
+                if "bottom_keyframes" not in data:
+                    data["bottom_keyframes"] = []
+                bkfs = data["bottom_keyframes"]
+                existing_bframes = [kf["frame"] for kf in bkfs]
+                if current_idx in existing_bframes:
+                    bidx = existing_bframes.index(current_idx)
+                    print(f"[锅底] 帧 {current_idx} 已存在，覆盖该条目")
+                    bkfs[bidx] = new_kf
+                else:
+                    bkfs.append(new_kf)
+                    bkfs.sort(key=lambda k: k["frame"])
+                with open(output_json, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                print(f"\n✅ 锅底标注已保存到: {output_json}")
+                print(f"   bottom_keyframes 共 {len(bkfs)} 条：")
+                for kf in bkfs:
+                    print(f"     帧 {kf['frame']:6d} ({kf['time_s']:.1f}s)  "
+                          f"标签={kf['label']}  FG={len(kf['fg_points'])}  BG={len(kf['bg_points'])}")
+            elif args.append:
                 # 追加：检查是否已有同帧号，有则覆盖，否则追加
                 existing_frames = [kf["frame"] for kf in data["keyframes"]]
                 if current_idx in existing_frames:
@@ -316,14 +354,14 @@ def main():
                     data["keyframes"].append(new_kf)
                     # 按帧号排序
                     data["keyframes"].sort(key=lambda k: k["frame"])
+                save_labels(data, output_json)
             else:
                 # 初始模式：替换或新建第一个关键帧
                 if data["keyframes"]:
                     data["keyframes"][0] = new_kf
                 else:
                     data["keyframes"].append(new_kf)
-
-            save_labels(data, output_json)
+                save_labels(data, output_json)
             break
 
         # ── 退出不保存 ────────────────────────────────────────────────────────

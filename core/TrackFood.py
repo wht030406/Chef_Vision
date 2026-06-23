@@ -100,15 +100,25 @@ def load_labels(path):
     加载标注文件，兼容新格式（多关键帧列表）和旧格式（flat 单帧）。
 
     返回:
-        video_path  : str
-        start_frame : int           第一个关键帧的帧号（追踪起始点）
-        keyframes   : list[dict]    所有关键帧，按 frame 升序排列
-          每条: {"frame": int, "fg_points": [...], "bg_points": [...], "label": str}
+        video_path       : str
+        start_frame      : int           第一个关键帧的帧号（追踪起始点）
+        keyframes        : list[dict]    食材关键帧，按 frame 升序排列
+        bottom_keyframes : list[dict]    锅底关键帧（可为空列表）
     """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     print(f"[标注] 视频: {data['video_path']}")
+
+    # 加载锅底关键帧（bottom_keyframes，可选）
+    bottom_kfs = []
+    if "bottom_keyframes" in data:
+        bottom_kfs = sorted(data["bottom_keyframes"], key=lambda k: k["frame"])
+        print(f"[锅底] 共 {len(bottom_kfs)} 个锅底关键帧（反向语义追踪）：")
+        for kf in bottom_kfs:
+            print(f"  帧 {kf['frame']:6d} ({kf['time_s']:.1f}s)  "
+                  f"标签={kf.get('label','')}  "
+                  f"FG={len(kf['fg_points'])}  BG={len(kf['bg_points'])}")
 
     if "keyframes" in data:
         # ── 新格式 ────────────────────────────────────────────────────────────
@@ -124,7 +134,7 @@ def load_labels(path):
                   f"标签={kf.get('label','')}  "
                   f"FG={len(kf['fg_points'])}  BG={len(kf['bg_points'])}")
         start_frame = kfs[0]["frame"]
-        return data["video_path"], start_frame, kfs
+        return data["video_path"], start_frame, kfs, bottom_kfs
     else:
         # ── 旧格式兼容 ────────────────────────────────────────────────────────
         fg_all = data["fg_points"]
@@ -141,7 +151,7 @@ def load_labels(path):
             "fg_points": fg,
             "bg_points": bg,
         }
-        return data["video_path"], start_frame, [kf]
+        return data["video_path"], start_frame, [kf], bottom_kfs
 
 
 def find_temp_npy(video_path):
@@ -618,7 +628,7 @@ def main():
         print("请先运行 LabelFirstFrame.py 完成标注")
         sys.exit(1)
 
-    video_path, start_frame, keyframes = load_labels(LABELS_JSON)
+    video_path, start_frame, keyframes, bottom_keyframes = load_labels(LABELS_JSON)
     # 第一个关键帧用于初始标注
     first_kf  = keyframes[0]
     fg_points = first_kf["fg_points"]
@@ -629,6 +639,17 @@ def main():
         print(f"[多关键帧] 将在以下帧注入额外前景标注：")
         for kf in extra_kfs:
             print(f"  帧 {kf['frame']}  标签={kf.get('label','')}  FG={len(kf['fg_points'])}")
+    # 锅底关键帧（用于反向追踪）
+    has_bottom = len(bottom_keyframes) > 0
+    if has_bottom:
+        bottom_first_kf  = bottom_keyframes[0]
+        bottom_fg_points = bottom_first_kf["fg_points"]
+        bottom_bg_points = bottom_first_kf["bg_points"]
+        bottom_start_frame = bottom_first_kf["frame"]
+        print(f"[锅底反向] 将从帧 {bottom_start_frame} 开始追踪锅底（反向语义）")
+    else:
+        bottom_fg_points = bottom_bg_points = []
+        bottom_start_frame = start_frame
 
     if not os.path.exists(video_path):
         print(f"[错误] 找不到视频: {video_path}")
@@ -728,12 +749,14 @@ def main():
     OUT_H    = VH + INFO_H + CHART_H          # 原始帧高 + 文字条 + 曲线图
     writer   = cv2.VideoWriter(out_video_viz, fourcc, fps, (VW, OUT_H))
     # 三策略逐帧数据（各自独立存储，输出为单独表格）
-    sam2_rows   = []   # [frame_abs, frame_rel, time_s, mask_pixels, mask_ratio, mean, min, max]
-    roi_rows    = []   # [frame_abs, frame_rel, time_s, roi_temp_mean]
-    ir_rows     = []   # [frame_abs, frame_rel, time_s, ir_mask_temp]
+    sam2_rows        = []   # [frame_abs, frame_rel, time_s, mask_pixels, mask_ratio, mean, min, max]
+    roi_rows         = []   # [frame_abs, frame_rel, time_s, roi_temp_mean]
+    ir_rows          = []   # [frame_abs, frame_rel, time_s, ir_mask_temp]
+    inverse_rows     = []   # [frame_abs, frame_rel, time_s, inverse_temp_mean]  锅底反向语义
     temp_history     = []   # list of (time_s, temp_mean)，SAM2 mask 温度历史
     roi_history      = []   # list of (time_s, roi_temp)，ROI 区域温度历史
     ir_mask_history  = []   # list of (time_s, ir_mask_temp)，IR 自动分割温度历史
+    inverse_history  = []   # list of (time_s, temp_mean)，锅底反向语义温度历史
 
     # ── 加载 ROI 配置 ─────────────────────────────────────────────────────────
     roi_cfg = None
