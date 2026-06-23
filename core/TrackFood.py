@@ -651,6 +651,40 @@ def main():
         bottom_fg_points = bottom_bg_points = []
         bottom_start_frame = start_frame
 
+    # ── 加载 wok_rgb_region（RGB 锅区域椭圆）────────────────────────────────
+    # 优先读 food_labels.json 里手动标注的 wok_rgb_region，
+    # fallback 到 _wok_rgb_constraint（IR 反投影）
+    wok_rgb_cx = wok_rgb_cy = wok_rgb_rx = wok_rgb_ry = None
+    wok_rgb_mask_static = None   # (VH, VW) bool，初始静态椭圆 mask
+    try:
+        with open(LABELS_JSON, "r", encoding="utf-8") as _f_wok:
+            _wok_json = json.load(_f_wok)
+        if "wok_rgb_region" in _wok_json:
+            _wr = _wok_json["wok_rgb_region"]
+            wok_rgb_cx = float(_wr["cx"])
+            wok_rgb_cy = float(_wr["cy"])
+            wok_rgb_rx = float(_wr["rx"])
+            wok_rgb_ry = float(_wr["ry"])
+            print(f"[wok_rgb] 已加载 RGB 锅椭圆: "
+                  f"cx={wok_rgb_cx:.0f} cy={wok_rgb_cy:.0f} "
+                  f"rx={wok_rgb_rx:.0f} ry={wok_rgb_ry:.0f}")
+            # 构建静态 mask（供 inverse_mask 约束）
+            _wm_static = np.zeros((VH, VW), dtype=np.uint8)
+            cv2.ellipse(_wm_static,
+                        (int(round(wok_rgb_cx)), int(round(wok_rgb_cy))),
+                        (int(round(wok_rgb_rx)), int(round(wok_rgb_ry))),
+                        0, 0, 360, 255, -1)
+            wok_rgb_mask_static = _wm_static > 0
+    except Exception as _we2:
+        print(f"[wok_rgb] 未找到 wok_rgb_region，inverse_mask 将 fallback 到 IR 反投影约束")
+
+    # 动态 wok_rgb 中心（每批用锅底 SAM2 mask 质心更新）
+    _wok_rgb_cx_dyn = wok_rgb_cx   # 当前批次的动态中心 x
+    _wok_rgb_cy_dyn = wok_rgb_cy   # 当前批次的动态中心 y
+    _WOK_RGB_MAX_DRIFT = 40        # 单批最大允许漂移（RGB px）
+    _bottom_carry = None           # 锅底 SAM2 跨批 carry_mask
+    _bottom_inject_map = {kf["frame"]: kf for kf in bottom_keyframes[1:]}
+
     if not os.path.exists(video_path):
         print(f"[错误] 找不到视频: {video_path}")
         sys.exit(1)
@@ -1655,6 +1689,64 @@ def main():
 
                 print(f"[SAM2] 批次 {chunk_i+1} 追踪完成，{len(chunk_masks)} 帧")
 
+                # ── 锅底第二次 SAM2 追踪（反向语义）────────────────────────────
+                bottom_chunk_masks = {}
+                if has_bottom and chunk_start_abs >= bottom_start_frame:
+                    try:
+                        # 锅底注入关键帧（_bottom_inject_map）
+                        _bottom_inject = []
+                        for _abs_bf, _bkf in _bottom_inject_map.items():
+                            if chunk_start_abs <= _abs_bf < chunk_end_abs:
+                                _bottom_inject.append({
+                                    "local_frame": _abs_bf - chunk_start_abs,
+                                    "fg_points":   _bkf["fg_points"],
+                                    "bg_points":   _bkf.get("bg_points", []),
+                                    "label":       _bkf.get("label", ""),
+                                })
+                        # 锅底 carry_mask 缩放到推理分辨率
+                        _bc_infer = None
+                        if _bottom_carry is not None and do_resize:
+                            _bc_infer = upscale_mask(_bottom_carry, infer_wh)
+                        else:
+                            _bc_infer = _bottom_carry
+                        bottom_chunk_masks, _bottom_carry_raw = track_chunk(
+                            predictor, tmp_dir, frame_names,
+                            bottom_fg_points, bottom_bg_points,
+                            carry_mask=_bc_infer,
+                            inject_keyframes=_bottom_inject,
+                        )
+                        _bottom_carry = upscale_mask(_bottom_carry_raw, orig_wh) \
+                            if (do_resize and _bottom_carry_raw is not None) \
+                            else _bottom_carry_raw
+                        print(f"[锅底SAM2] 批次 {chunk_i+1} 锅底追踪完成，"
+                              f"{len(bottom_chunk_masks)} 帧")
+                        # 动态更新 wok_rgb 中心：用锅底 mask 质心
+                        if wok_rgb_cx is not None:
+                            try:
+                                _last_b_idx = len(frame_names) - 1
+                                _bm_last = bottom_chunk_masks.get(_last_b_idx)
+                                if _bm_last is not None:
+                                    _bm_up = upscale_mask(_bm_last, orig_wh) \
+                                        if do_resize else _bm_last
+                                    _bm_ys, _bm_xs = np.where(_bm_up)
+                                    if len(_bm_xs) >= 20:
+                                        _bcx_new = float(np.mean(_bm_xs))
+                                        _bcy_new = float(np.mean(_bm_ys))
+                                        _bd = ((_bcx_new - _wok_rgb_cx_dyn)**2
+                                               + (_bcy_new - _wok_rgb_cy_dyn)**2)**0.5
+                                        if _bd <= _WOK_RGB_MAX_DRIFT:
+                                            if _bd > 1.0:
+                                                print(f"[wok_rgb动态] t={chunk_start_s:.1f}s  "
+                                                      f"cx: {_wok_rgb_cx_dyn:.0f}->{_bcx_new:.0f}  "
+                                                      f"cy: {_wok_rgb_cy_dyn:.0f}->{_bcy_new:.0f}  "
+                                                      f"drift={_bd:.1f}px")
+                                            _wok_rgb_cx_dyn = _bcx_new
+                                            _wok_rgb_cy_dyn = _bcy_new
+                            except Exception as _bdyn_e:
+                                pass  # 动态更新失败不影响主流程
+                    except Exception as _be:
+                        print(f"[锅底SAM2] 批次 {chunk_i+1} 追踪失败: {_be}")
+
                 # ── mask 面积异常检测：若本批平均占比 > 60% 且比上批大 3 倍 → 强制下批重标点 ──
                 if len(chunk_masks) > 0:
                     _total_px = infer_wh[0] * infer_wh[1] if do_resize else VW * VH
@@ -1865,6 +1957,50 @@ def main():
                                   temp_mean, temp_min, temp_max])
                 roi_rows.append([abs_idx, local_idx, time_s, roi_temp_mean])
                 ir_rows.append([abs_idx, local_idx, time_s, ir_mask_temp])
+
+                # ── 锅底反向语义温度统计 ──────────────────────────────────────
+                # inverse_mask = wok_rgb_ellipse(动态) & ~bottom_sam2_mask
+                # 即：锅内除锅底以外的区域 = 食材区域（另一种语义）
+                inverse_temp_mean = float("nan")
+                if has_bottom and bottom_chunk_masks:
+                    try:
+                        _bm_raw = bottom_chunk_masks.get(local_in_chunk)
+                        if _bm_raw is not None:
+                            _bm_full = upscale_mask(_bm_raw, orig_wh) if do_resize else _bm_raw
+                            # 构建动态锅椭圆 mask（用更新后的中心）
+                            if wok_rgb_mask_static is not None:
+                                # 用动态中心重建椭圆
+                                _dyn_wok_mask = np.zeros((VH, VW), dtype=np.uint8)
+                                cv2.ellipse(_dyn_wok_mask,
+                                            (int(round(_wok_rgb_cx_dyn)),
+                                             int(round(_wok_rgb_cy_dyn))),
+                                            (int(round(wok_rgb_rx)),
+                                             int(round(wok_rgb_ry))),
+                                            0, 0, 360, 255, -1)
+                                _dyn_wok_bool = _dyn_wok_mask > 0
+                            else:
+                                # fallback：用 IR 反投影的锅约束
+                                _dyn_wok_bool = (_wok_rgb_constraint
+                                                 if _wok_rgb_constraint is not None
+                                                 else np.ones((VH, VW), dtype=bool))
+                            # inverse_mask = 锅内区域 AND NOT 锅底
+                            _inv_mask = _dyn_wok_bool & ~_bm_full
+                            if _inv_mask.any() and temp_data is not None and homography is not None:
+                                ir_h_inv, ir_w_inv = temp_data.shape[1], temp_data.shape[2]
+                                ir_mask_inv = map_mask_to_ir(_inv_mask, homography,
+                                                             (ir_h_inv, ir_w_inv))
+                                ir_idx_inv  = _get_ir_idx(abs_idx)
+                                if ir_idx_inv < temp_data.shape[0]:
+                                    t_frame_inv  = temp_data[ir_idx_inv]
+                                    inv_temps    = t_frame_inv[ir_mask_inv]
+                                    if len(inv_temps) > 0:
+                                        inverse_temp_mean = float(np.mean(inv_temps))
+                    except Exception as _inv_e:
+                        pass  # 计算失败不影响主流程
+                if not np.isnan(inverse_temp_mean):
+                    inverse_history.append((time_s, inverse_temp_mean))
+                inverse_rows.append([abs_idx, local_idx, time_s, inverse_temp_mean])
+
                 if local_in_chunk % 50 == 0:
                     print(f"  写帧: {local_in_chunk+1}/{actual}  "
                           f"mask={mask_ratio:.1f}%  temp={temp_mean:.1f}°C", end="\r")
@@ -2027,11 +2163,13 @@ def main():
     print(f"   可视化视频: {out_video_viz}")
     print(f"   共处理 {global_local} 帧")
 
-    # ── 保存三策略独立 Excel ──────────────────────────────────────────────────
-    _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir)
+    # ── 保存三策略独立 Excel（含 inverse）────────────────────────────────────
+    _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir,
+                     inverse_rows=inverse_rows if has_bottom else None)
 
-    # ── 绘制三策略温度曲线 PNG ────────────────────────────────────────────────
-    _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_curve)
+    # ── 绘制三策略温度曲线 PNG（含 inverse）──────────────────────────────────
+    _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_curve,
+                       inverse_rows=inverse_rows if has_bottom else None)
 
     # ── 拼合 RGB + IR 视频 ────────────────────────────────────────────────────
     if temp_data is not None and wok_cfg is not None:
@@ -2187,12 +2325,13 @@ def _plot_temp_curve(csv_path, out_path=None):
 
 # ── 三策略数据保存 ────────────────────────────────────────────────────────────
 
-def _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir):
+def _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir, inverse_rows=None):
     """
-    输出三个独立 xlsx 文件，每个对应一种温度策略：
-      temp_sam2.xlsx  — SAM2 mask 追踪温度
-      temp_roi.xlsx   — ROI 固定圆圈温度
-      temp_ir.xlsx    — IR 自动分割（锅内低温区）温度
+    输出三（或四）个独立 xlsx 文件，每个对应一种温度策略：
+      temp_sam2.xlsx    — SAM2 mask 追踪温度
+      temp_roi.xlsx     — ROI 固定圆圈温度
+      temp_ir.xlsx      — IR 自动分割（锅内低温区）温度
+      temp_inverse.xlsx — 锅底反向语义（锅内区域 - 锅底 mask）温度（可选）
     """
     if not _HAS_OPENPYXL:
         print("[Excel] 未安装 openpyxl，跳过。pip install openpyxl")
@@ -2267,8 +2406,16 @@ def _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir):
     wb3.save(p3)
     print(f"[Excel] IR    → {p3}  ({n3} 行)")
 
+    # Inverse（锅底反向语义，可选）
+    if inverse_rows:
+        h4 = ["帧号(绝对)","帧号(相对)","时间(s)","Inverse均值(°C)"]
+        wb4, n4 = _make_wb(h4, inverse_rows, "4B2E84")
+        p4 = os.path.join(out_dir, "temp_inverse.xlsx")
+        wb4.save(p4)
+        print(f"[Excel] Inv   → {p4}  ({n4} 行)")
 
-def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path):
+
+def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path, inverse_rows=None):
     """绘制三条温度曲线对比图（matplotlib）"""
     def _extract(rows, val_col):
         xs, ys = [], []
@@ -2296,10 +2443,17 @@ def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path):
         ax.plot(t_roi,  v_roi,  color="#1F77B4", lw=1.5, label="ROI Fixed")
     if t_ir:
         ax.plot(t_ir,   v_ir,   color="#2CA02C", lw=1.5, label="IR Auto")
+    if inverse_rows:
+        t_inv, v_inv = _extract(inverse_rows, 3)
+        if t_inv:
+            ax.plot(t_inv, v_inv, color="#9B59B6", lw=1.5,
+                    linestyle="--", label="Inverse (Wok−Bottom)")
 
+    title = ("Food Temperature — Four Strategies Comparison"
+             if inverse_rows else "Food Temperature — Three Strategies Comparison")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Temperature (°C)")
-    ax.set_title("Food Temperature — Three Strategies Comparison")
+    ax.set_title(title)
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
