@@ -780,9 +780,11 @@ def main():
     predictor = build_sam2_predictor(device)
 
     # ── 输出视频准备 ──────────────────────────────────────────────────────────
-    fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
-    OUT_H    = VH + INFO_H + CHART_H          # 原始帧高 + 文字条 + 曲线图
-    writer   = cv2.VideoWriter(out_video_viz, fourcc, fps, (VW, OUT_H))
+    fourcc      = cv2.VideoWriter_fourcc(*"mp4v")
+    OUT_H       = VH + INFO_H + CHART_H          # 原始帧高 + 文字条 + 曲线图
+    writer      = cv2.VideoWriter(out_video_viz, fourcc, fps, (VW, OUT_H))
+    out_inv_viz = os.path.join(out_dir, "track_result_inv_viz.mp4")
+    writer_inv  = cv2.VideoWriter(out_inv_viz, fourcc, fps, (VW, OUT_H)) if has_bottom else None
     # 三策略逐帧数据（各自独立存储，输出为单独表格）
     sam2_rows        = []   # [frame_abs, frame_rel, time_s, mask_pixels, mask_ratio, mean, min, max]
     roi_rows         = []   # [frame_abs, frame_rel, time_s, roi_temp_mean]
@@ -2002,6 +2004,52 @@ def main():
                     inverse_history.append((time_s, inverse_temp_mean))
                 inverse_rows.append([abs_idx, local_idx, time_s, inverse_temp_mean])
 
+                # ── 写 inverse 叠加帧（锅底反向 RGB 视频）────────────────────
+                if writer_inv is not None:
+                    if has_bottom and bottom_chunk_masks:
+                        _bm_r2 = bottom_chunk_masks.get(local_in_chunk)
+                        if _bm_r2 is not None:
+                            _bm_f2 = upscale_mask(_bm_r2, orig_wh) if do_resize else _bm_r2
+                            # inverse_mask = 动态锅椭圆 AND NOT 锅底
+                            if wok_rgb_mask_static is not None:
+                                _dyn2 = np.zeros((VH, VW), dtype=np.uint8)
+                                cv2.ellipse(_dyn2,
+                                            (int(round(_wok_rgb_cx_dyn)),
+                                             int(round(_wok_rgb_cy_dyn))),
+                                            (int(round(wok_rgb_rx)),
+                                             int(round(wok_rgb_ry))),
+                                            0, 0, 360, 255, -1)
+                                _inv_vis_mask = (_dyn2 > 0) & ~_bm_f2
+                            else:
+                                _fb = (_wok_rgb_constraint
+                                       if _wok_rgb_constraint is not None
+                                       else np.ones((VH, VW), dtype=bool))
+                                _inv_vis_mask = _fb & ~_bm_f2
+                            vis_inv = render_overlay(frame, _inv_vis_mask,
+                                                     (200, 80, 255), MASK_ALPHA)
+                            # 标题
+                            cv2.putText(vis_inv,
+                                        f"Inverse(Wok-Bottom)  t={time_s:.1f}s"
+                                        f"  Inv={inverse_temp_mean:.1f}C" if not np.isnan(inverse_temp_mean)
+                                        else f"Inverse(Wok-Bottom)  t={time_s:.1f}s",
+                                        (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                        (200, 80, 255), 2)
+                        else:
+                            vis_inv = frame.copy()
+                    else:
+                        vis_inv = frame.copy()
+                    inv_info = np.zeros((INFO_H, VW, 3), dtype=np.uint8)
+                    cv2.putText(inv_info,
+                                f"Frame {abs_idx}  t={time_s:.1f}s  [Inverse/Bottom]",
+                                (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                (200, 80, 255), 1)
+                    cv2.putText(inv_info,
+                                (f"Inv:{inverse_temp_mean:.1f}C" if not np.isnan(inverse_temp_mean)
+                                 else "Inv:N/A"),
+                                (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                                (200, 100, 255), 1)
+                    writer_inv.write(np.vstack([vis_inv, inv_info, chart_bar]))
+
                 if local_in_chunk % 50 == 0:
                     print(f"  写帧: {local_in_chunk+1}/{actual}  "
                           f"mask={mask_ratio:.1f}%  temp={temp_mean:.1f}°C", end="\r")
@@ -2173,6 +2221,9 @@ def main():
                        inverse_rows=inverse_rows if has_bottom else None)
 
     # ── 拼合 RGB + IR 视频 ────────────────────────────────────────────────────
+    if writer_inv is not None:
+        writer_inv.release()
+
     if temp_data is not None and wok_cfg is not None:
         out_combined = os.path.join(out_dir, "track_result_combined.mp4")
         ir_fps_val   = fps * ir_fps_ratio   # 估算 IR 帧率
@@ -2187,6 +2238,7 @@ def main():
             rgb_fps=fps,
             pct=IR_FOOD_PCT,
             wok_cx_history=_wok_cx_history,
+            inv_viz_path=out_inv_viz if (has_bottom and os.path.exists(out_inv_viz)) else None,
         )
         print(f"   并排视频: {out_combined}")
         # 删除中间产物（纯 RGB viz 视频），只保留最终并排视频
@@ -2467,24 +2519,17 @@ def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path, inverse_rows=None
 
 def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
                   out_path, rgb_start_frame, rgb_fps, pct=40,
-                  wok_cx_history=None):
+                  wok_cx_history=None, inv_viz_path=None):
     """
-    新布局：
-      ┌─────────────────────────────────────────────────┐
-      │  RGB纯视频（带mask）  │  IR热图（等高，上下对齐）  │
-      ├─────────────────────────────────────────────────┤
-      │       INFO BAR — 三种策略温度数值（全宽，放大）    │
-      ├─────────────────────────────────────────────────┤
-      │       温度曲线图（三条曲线，全宽，放大）           │
-      └─────────────────────────────────────────────────┘
-
-    从已生成的 track_result_viz.mp4 里裁取：
-      - 纯视频区：rows 0 .. VH-1
-      - info_bar ：rows VH .. VH+INFO_H-1
-      - chart    ：rows VH+INFO_H .. end
-    然后按新布局拼合。
+    布局（有 inv_viz_path 时三栏，否则两栏）：
+      ┌──────────────────────────────────────────────────────────────┐
+      │  RGB食材追踪  │  RGB反向语义（可选）  │  IR热图（等高对齐）  │
+      ├──────────────────────────────────────────────────────────────┤
+      │            INFO BAR（全宽放大）                              │
+      ├──────────────────────────────────────────────────────────────┤
+      │            温度曲线图（全宽放大）                            │
+      └──────────────────────────────────────────────────────────────┘
     """
-    # 动态导入，避免循环依赖
     import sys as _sys
     _tools = os.path.join(_HERE, "..", "tools")
     if _tools not in _sys.path:
@@ -2496,30 +2541,36 @@ def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
         print(f"[拼合] 无法打开 RGB 视频: {rgb_viz_path}")
         return
 
+    # 打开 inv 视频（如果存在）
+    cap_inv = None
+    if inv_viz_path and os.path.exists(inv_viz_path):
+        cap_inv = cv2.VideoCapture(inv_viz_path)
+        if not cap_inv.isOpened():
+            cap_inv = None
+
     rgb_total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     out_fps    = cap.get(cv2.CAP_PROP_FPS) or rgb_fps
-    viz_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))   # viz 视频宽（= VW = 1600）
-    viz_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))  # viz 视频高（= VH+INFO_H+CHART_H）
+    viz_w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    viz_h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # viz 里各区域高度（与 main() 里的常量保持一致）
-    pure_h  = viz_h - INFO_H - CHART_H   # 纯视频高度（= VH = 1200）
-    pure_w  = viz_w                       # 纯视频宽度（= VW = 1600）
+    pure_h  = viz_h - INFO_H - CHART_H
+    pure_w  = viz_w
 
     n_ir = temp_data.shape[0]
 
-    # IR 渲染尺寸：等比缩放到与纯视频同高（pure_h），上下对齐
-    ir_aspect = temp_data.shape[2] / temp_data.shape[1]   # ir_w / ir_h
+    # IR 等比缩放到 pure_h 高
+    ir_aspect = temp_data.shape[2] / temp_data.shape[1]
     ir_out_h  = pure_h
     ir_out_w  = int(round(ir_out_h * ir_aspect))
     if ir_out_w % 2 != 0:
         ir_out_w += 1
 
-    # 合并视频总宽度 = RGB宽 + IR宽
-    total_w = pure_w + ir_out_w
+    # 三栏时总宽 = RGB食材 + RGB反向 + IR；两栏时 = RGB + IR
+    n_rgb_cols = 2 if cap_inv is not None else 1
+    total_w = pure_w * n_rgb_cols + ir_out_w
 
-    # 底部 info + chart 放大高度（比原来更高，视觉更清晰）
-    new_info_h  = int(INFO_H  * 1.8)   # ≈ 90px
-    new_chart_h = int(CHART_H * 1.8)   # ≈ 216px
+    new_info_h  = int(INFO_H  * 1.8)
+    new_chart_h = int(CHART_H * 1.8)
     if new_info_h  % 2 != 0: new_info_h  += 1
     if new_chart_h % 2 != 0: new_chart_h += 1
 
@@ -2528,18 +2579,12 @@ def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, out_fps, (total_w, total_h))
 
-    # ── 预处理 wok_cx_history 为快速查表结构 ─────────────────────────────────
-    # _wok_cx_history: list of (abs_frame, cx, cy)，按 abs_frame 升序
-    # 对每个 RGB 帧（abs_frame = rgb_start_frame + idx），找 <=abs_frame 的最新记录
     _hist_sorted = sorted(wok_cx_history, key=lambda x: x[0]) if wok_cx_history else []
-    # 预提取帧号列表，方便二分查找
     _hist_frames = [h[0] for h in _hist_sorted]
 
     def _get_dynamic_wok(abs_frame):
-        """返回 abs_frame 时刻的动态 wok_cfg（shallow copy + 替换 cx/cy）"""
         if not _hist_sorted:
             return wok_cfg
-        # 找最后一个 <= abs_frame 的记录
         import bisect
         pos = bisect.bisect_right(_hist_frames, abs_frame) - 1
         if pos < 0:
@@ -2550,6 +2595,8 @@ def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
         dyn["cy"] = cy
         return dyn
 
+    mode_str = "三栏(RGB食材+RGB反向+IR)" if cap_inv else "两栏(RGB+IR)"
+    print(f"[拼合] 模式: {mode_str}")
     print(f"[拼合] 纯视频: RGB={pure_w}×{pure_h}  IR={ir_out_w}×{ir_out_h}")
     print(f"[拼合] 底部面板: info={new_info_h}px  chart={new_chart_h}px  全宽={total_w}px")
     print(f"[拼合] 输出帧尺寸: {total_w}×{total_h}  共 {rgb_total} 帧")
@@ -2561,35 +2608,38 @@ def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
         if not ret:
             break
 
-        # ── 裁取各区域 ───────────────────────────────────────────────────────
-        pure_rgb  = viz_frame[0:pure_h, :]                           # 纯视频帧
-        info_src  = viz_frame[pure_h:pure_h + INFO_H, :]             # info bar（原始小）
-        chart_src = viz_frame[pure_h + INFO_H:pure_h + INFO_H + CHART_H, :]  # chart（原始小）
+        pure_rgb  = viz_frame[0:pure_h, :]
+        info_src  = viz_frame[pure_h:pure_h + INFO_H, :]
+        chart_src = viz_frame[pure_h + INFO_H:pure_h + INFO_H + CHART_H, :]
 
-        # ── 渲染 IR 帧（等高对齐）─────────────────────────────────────────────
-        time_s     = (rgb_start_frame + idx) / rgb_fps
-        ir_idx     = min(int(round(time_s * ir_fps)), n_ir - 1)
-        abs_frame  = rgb_start_frame + idx
-        dyn_wok    = _get_dynamic_wok(abs_frame)
-        ir_img  = render_ir_frame(
+        # 读反向语义帧（裁取纯视频区）
+        inv_rgb = None
+        if cap_inv is not None:
+            ret_inv, viz_inv = cap_inv.read()
+            if ret_inv:
+                inv_rgb = viz_inv[0:pure_h, :]
+            else:
+                inv_rgb = np.zeros_like(pure_rgb)
+
+        # IR 帧
+        time_s    = (rgb_start_frame + idx) / rgb_fps
+        ir_idx    = min(int(round(time_s * ir_fps)), n_ir - 1)
+        abs_frame = rgb_start_frame + idx
+        dyn_wok   = _get_dynamic_wok(abs_frame)
+        ir_img    = render_ir_frame(
             temp_data[ir_idx], dyn_wok, pct=pct,
             out_w=ir_out_w, out_h=ir_out_h
         )
 
-        # ── 上方：RGB | IR 并排（等高，上下对齐）─────────────────────────────
-        top_panel = np.hstack([pure_rgb, ir_img])   # (pure_h, total_w, 3)
+        # 上方拼合
+        if inv_rgb is not None:
+            top_panel = np.hstack([pure_rgb, inv_rgb, ir_img])
+        else:
+            top_panel = np.hstack([pure_rgb, ir_img])
 
-        # ── 底部 info bar：放大到全宽 ──────────────────────────────────────────
-        # 先在 info_src 两侧填充黑色，扩展到 total_w，再放大高度
-        # 简单做法：直接 resize 到 (total_w, new_info_h)
-        info_big = cv2.resize(info_src, (total_w, new_info_h),
-                              interpolation=cv2.INTER_LINEAR)
+        info_big  = cv2.resize(info_src,  (total_w, new_info_h),  interpolation=cv2.INTER_LINEAR)
+        chart_big = cv2.resize(chart_src, (total_w, new_chart_h), interpolation=cv2.INTER_LINEAR)
 
-        # ── 底部 chart：同样放大到全宽 ─────────────────────────────────────────
-        chart_big = cv2.resize(chart_src, (total_w, new_chart_h),
-                               interpolation=cv2.INTER_LINEAR)
-
-        # ── 拼合 ──────────────────────────────────────────────────────────────
         combined = np.vstack([top_panel, info_big, chart_big])
         writer.write(combined)
 
@@ -2597,6 +2647,8 @@ def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
             print(f"  拼合帧 {idx}/{rgb_total}  IR帧={ir_idx}", end="\r")
 
     cap.release()
+    if cap_inv is not None:
+        cap_inv.release()
     writer.release()
     print(f"\n[拼合] 完成: {out_path}")
 
