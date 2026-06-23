@@ -1723,28 +1723,24 @@ def main():
                             else _bottom_carry_raw
                         print(f"[锅底SAM2] 批次 {chunk_i+1} 锅底追踪完成，"
                               f"{len(bottom_chunk_masks)} 帧")
-                        # 动态更新 wok_rgb 中心：用锅底 mask 质心
-                        if wok_rgb_cx is not None:
+                        # 动态更新 wok_rgb 中心：用 IR 旋转轴法已算好的 _wok_cx/_wok_cy
+                        # 直接用 homography 逆矩阵反投影，精度与 IR 一致，不受锅底mask质心偏移影响
+                        if wok_rgb_cx is not None and _H_inv_al is not None:
                             try:
-                                _last_b_idx = len(frame_names) - 1
-                                _bm_last = bottom_chunk_masks.get(_last_b_idx)
-                                if _bm_last is not None:
-                                    _bm_up = upscale_mask(_bm_last, orig_wh) \
-                                        if do_resize else _bm_last
-                                    _bm_ys, _bm_xs = np.where(_bm_up)
-                                    if len(_bm_xs) >= 20:
-                                        _bcx_new = float(np.mean(_bm_xs))
-                                        _bcy_new = float(np.mean(_bm_ys))
-                                        _bd = ((_bcx_new - _wok_rgb_cx_dyn)**2
-                                               + (_bcy_new - _wok_rgb_cy_dyn)**2)**0.5
-                                        if _bd <= _WOK_RGB_MAX_DRIFT:
-                                            if _bd > 1.0:
-                                                print(f"[wok_rgb动态] t={chunk_start_s:.1f}s  "
-                                                      f"cx: {_wok_rgb_cx_dyn:.0f}->{_bcx_new:.0f}  "
-                                                      f"cy: {_wok_rgb_cy_dyn:.0f}->{_bcy_new:.0f}  "
-                                                      f"drift={_bd:.1f}px")
-                                            _wok_rgb_cx_dyn = _bcx_new
-                                            _wok_rgb_cy_dyn = _bcy_new
+                                _ir_pt_rgb = np.array([[[_wok_cx, _wok_cy]]], dtype=np.float32)
+                                _rgb_pt = cv2.perspectiveTransform(_ir_pt_rgb, _H_inv_al)[0][0]
+                                _bcx_new = float(_rgb_pt[0])
+                                _bcy_new = float(_rgb_pt[1])
+                                if (0 <= _bcx_new < VW and 0 <= _bcy_new < VH):
+                                    _bd = ((_bcx_new - _wok_rgb_cx_dyn)**2
+                                           + (_bcy_new - _wok_rgb_cy_dyn)**2)**0.5
+                                    if _bd > 1.0:
+                                        print(f"[wok_rgb动态] t={chunk_start_s:.1f}s  "
+                                              f"cx: {_wok_rgb_cx_dyn:.0f}->{_bcx_new:.0f}  "
+                                              f"cy: {_wok_rgb_cy_dyn:.0f}->{_bcy_new:.0f}  "
+                                              f"drift={_bd:.1f}px (IR反投影)")
+                                    _wok_rgb_cx_dyn = _bcx_new
+                                    _wok_rgb_cy_dyn = _bcy_new
                             except Exception as _bdyn_e:
                                 pass  # 动态更新失败不影响主流程
                     except Exception as _be:
@@ -2650,7 +2646,35 @@ def stitch_rgb_ir(rgb_viz_path, temp_data, ir_fps, wok_cfg,
     if cap_inv is not None:
         cap_inv.release()
     writer.release()
-    print(f"\n[拼合] 完成: {out_path}")
+    print(f"\n[拼合] 完成(mp4v): {out_path}")
+
+    # ── ffmpeg 转码为 H.264（兼容 Windows Media Player / 普通播放器）─────────
+    # mp4v 在超宽分辨率（>4096px）下部分播放器无法打开，H.264 兼容性最好
+    _h264_path = out_path.replace(".mp4", "_h264.mp4")
+    try:
+        import subprocess
+        _ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-i", out_path,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            _h264_path
+        ]
+        print(f"[ffmpeg] 转码为 H.264: {os.path.basename(_h264_path)}")
+        _ret = subprocess.run(_ffmpeg_cmd, capture_output=True, timeout=600)
+        if _ret.returncode == 0 and os.path.exists(_h264_path):
+            os.replace(_h264_path, out_path)   # 用 H.264 版本覆盖原文件
+            print(f"[ffmpeg] 转码完成，已覆盖原文件: {out_path}")
+        else:
+            _err = _ret.stderr.decode("utf-8", errors="ignore")[-500:]
+            print(f"[ffmpeg] 转码失败（returncode={_ret.returncode}），保留 mp4v 版本")
+            print(f"[ffmpeg] stderr: {_err}")
+    except FileNotFoundError:
+        print("[ffmpeg] 未找到 ffmpeg，跳过转码（原 mp4v 版本可用 VLC 播放）")
+    except Exception as _ffe:
+        print(f"[ffmpeg] 转码异常: {_ffe}")
 
 
 if __name__ == "__main__":
