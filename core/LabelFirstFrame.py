@@ -174,17 +174,20 @@ def draw_frame(frame, fg_points, bg_points, frame_idx, total_frames, fps,
 
 def run_wok_rgb_label(cap, total_frames, fps, W, H, data, output_json, start_idx=0):
     """
-    用户在 RGB 帧上点锅边缘 5+ 个点，按 S 自动拟合椭圆并保存到
-    food_labels.json["wok_rgb_region"] = {cx, cy, rx, ry, frame, time_s}
+    用户在 RGB 帧上点锅边缘 5+ 个点，并单独点一个锅中心锚点，按 S 自动拟合椭圆并保存到
+    food_labels.json["wok_rgb_region"] = {cx, cy, rx, ry, center_x, center_y, frame, time_s}
     """
-    win = "WokRGB — 点锅边缘5+点，S保存，Q退出，Z撤销"
+    win = "WokRGB — 左键点锅边缘，右键点锅中心，S保存，Q退出，Z撤销"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, min(W, 1280), min(H + 10, 740))
 
     edge_pts = []   # [[x, y], ...]
+    center_pt = None
     current_idx = start_idx
+    status_msg = "左键点锅边缘>=5个，右键点锅中心，S/Enter保存"
 
     def _draw(frame_bgr):
+        nonlocal center_pt, status_msg
         vis = frame_bgr.copy()
         # 已有椭圆（来自 JSON）
         existing = data.get("wok_rgb_region")
@@ -196,10 +199,20 @@ def run_wok_rgb_label(cap, total_frames, fps, W, H, data, output_json, start_idx
             cv2.putText(vis, f"Existing: cx={existing['cx']:.0f} cy={existing['cy']:.0f} "
                              f"rx={existing['rx']:.0f} ry={existing['ry']:.0f}",
                         (10, H - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+            if "center_x" in existing and "center_y" in existing:
+                ex = int(round(existing["center_x"]))
+                ey = int(round(existing["center_y"]))
+                cv2.drawMarker(vis, (ex, ey), (255, 180, 0),
+                               markerType=cv2.MARKER_CROSS, markerSize=22, thickness=2)
         # 当前标注点（黄色）
         for p in edge_pts:
             cv2.circle(vis, (p[0], p[1]), 6, (0, 220, 255), -1)
             cv2.circle(vis, (p[0], p[1]), 7, (0, 0, 0), 1)
+        if center_pt is not None:
+            cv2.drawMarker(vis, (center_pt[0], center_pt[1]), (255, 120, 0),
+                           markerType=cv2.MARKER_CROSS, markerSize=24, thickness=2)
+            cv2.putText(vis, f"Center anchor: ({center_pt[0]}, {center_pt[1]})",
+                        (10, H - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 180, 0), 1)
         # 若 >= 5 点，实时显示拟合椭圆（青色虚线效果）
         if len(edge_pts) >= 5:
             try:
@@ -218,22 +231,33 @@ def run_wok_rgb_label(cap, total_frames, fps, W, H, data, output_json, start_idx
         cv2.addWeighted(overlay, 0.5, vis, 0.5, 0, vis)
         ts = current_idx / fps
         m, s2 = divmod(int(ts), 60)
-        cv2.putText(vis, f"[WOK-RGB] Frame {current_idx}  {m:02d}:{s2:02d}  点数: {len(edge_pts)}",
+        cv2.putText(vis, f"[WOK-RGB] Frame {current_idx}  {m:02d}:{s2:02d}  "
+                         f"边缘点: {len(edge_pts)}  中心点: {'Y' if center_pt else 'N'}",
                     (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-        cv2.putText(vis, "[LMB]=点锅边缘  [Z]=撤销  [S]=保存(>=5点)  [Q]=退出  [←→]=跳帧",
+        cv2.putText(vis, "[LMB]=点锅边缘  [RMB]=点锅中心  [Z]=撤销  [S]=保存  [Q]=退出  [←→]=跳帧",
                     (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 220, 255), 1)
-        cv2.putText(vis, "黄点=边缘点  青色椭圆=实时拟合预览  橙色=已有椭圆",
+        cv2.putText(vis, "黄点=边缘点  橙色十字=当前中心  青色椭圆=预览  橙色=已有椭圆",
                     (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 200, 255), 1)
+        cv2.putText(vis, status_msg,
+                    (10, H - 75), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 0), 1)
         return vis
 
-    param = {"frame": None}
+    param = {"frame": None, "save_requested": False}
 
     def _mouse(event, x, y, flags, param):
+        nonlocal center_pt
         if event == cv2.EVENT_LBUTTONDOWN:
             edge_pts.append([x, y])
+            status_msg = f"已点边缘点 {len(edge_pts)} 个"
             print(f"  边缘点 ({x},{y})  共 {len(edge_pts)} 个")
-            if param["frame"] is not None:
-                cv2.imshow(win, _draw(param["frame"]))
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            center_pt = [x, y]
+            status_msg = f"已设置锅中心 ({x}, {y})"
+            print(f"  锅中心锚点 ({x},{y})")
+        elif event == cv2.EVENT_MBUTTONDOWN:
+            param["save_requested"] = True
+        if param["frame"] is not None:
+            cv2.imshow(win, _draw(param["frame"]))
 
     cv2.setMouseCallback(win, _mouse, param)
 
@@ -244,11 +268,15 @@ def run_wok_rgb_label(cap, total_frames, fps, W, H, data, output_json, start_idx
             continue
         param["frame"] = frame
         cv2.imshow(win, _draw(frame))
-        key = cv2.waitKey(0) & 0xFF
+        key = cv2.waitKeyEx(50)
+        key_low = key & 0xFF
 
-        if key in (ord('s'), ord('S')):
+        if param["save_requested"] or key in (13, 10) or key_low in (ord('s'), ord('S'), 32):
+            param["save_requested"] = False
             if len(edge_pts) < 5:
+                status_msg = f"至少需要 5 个边缘点，当前只有 {len(edge_pts)} 个"
                 print(f"[警告] 需要至少 5 个边缘点才能拟合椭圆，当前 {len(edge_pts)} 个")
+                cv2.imshow(win, _draw(frame))
                 continue
             try:
                 pts_arr = np.array(edge_pts, dtype=np.float32)
@@ -257,9 +285,13 @@ def run_wok_rgb_label(cap, total_frames, fps, W, H, data, output_json, start_idx
                 # OpenCV fitEllipse 返回的 axes 是长轴/短轴全长，除以2得半轴
                 rx = float(max(ea, eb) / 2)
                 ry = float(min(ea, eb) / 2)
+                center_x = float(center_pt[0]) if center_pt is not None else float(ex)
+                center_y = float(center_pt[1]) if center_pt is not None else float(ey)
                 wok_region = {
                     "cx":     round(float(ex), 1),
                     "cy":     round(float(ey), 1),
+                    "center_x": round(center_x, 1),
+                    "center_y": round(center_y, 1),
                     "rx":     round(rx, 1),
                     "ry":     round(ry, 1),
                     "frame":  current_idx,
@@ -270,38 +302,52 @@ def run_wok_rgb_label(cap, total_frames, fps, W, H, data, output_json, start_idx
                 data["wok_rgb_region"] = wok_region
                 with open(output_json, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
-                print(f"\n✅ wok_rgb_region 已保存到: {output_json}")
+                status_msg = "保存成功"
+                print(f"\n[wok-rgb] 已保存到: {output_json}")
                 print(f"   cx={wok_region['cx']} cy={wok_region['cy']} "
                       f"rx={wok_region['rx']} ry={wok_region['ry']}")
+                print(f"   center_x={wok_region['center_x']} center_y={wok_region['center_y']}")
                 break
             except Exception as e:
+                status_msg = f"拟合失败: {e}"
                 print(f"[错误] 椭圆拟合失败: {e}")
+                cv2.imshow(win, _draw(frame))
 
-        elif key in (ord('q'), ord('Q')):
+        elif key_low in (ord('q'), ord('Q'), 27):
             print("[退出] 未保存锅区域。")
             break
 
-        elif key in (ord('z'), ord('Z')):
+        elif key_low in (ord('z'), ord('Z')):
             if edge_pts:
                 p = edge_pts.pop()
+                status_msg = f"撤销边缘点，剩余 {len(edge_pts)} 个"
                 print(f"  撤销边缘点 ({p[0]},{p[1]})，剩余 {len(edge_pts)} 个")
                 if param["frame"] is not None:
                     cv2.imshow(win, _draw(param["frame"]))
+            elif center_pt is not None:
+                status_msg = "已撤销锅中心锚点"
+                print(f"  撤销锅中心锚点 ({center_pt[0]},{center_pt[1]})")
+                center_pt = None
+                if param["frame"] is not None:
+                    cv2.imshow(win, _draw(param["frame"]))
 
-        elif key in (ord('a'), ord('A'), 81, 2):
+        elif key_low in (ord('a'), ord('A')) or key in (2424832, 81, 2):
             current_idx = max(0, current_idx - SKIP_FRAMES)
-        elif key in (ord('d'), ord('D'), 83, 3):
+        elif key_low in (ord('d'), ord('D')) or key in (2555904, 83, 3):
             current_idx = min(total_frames - 1, current_idx + SKIP_FRAMES)
-        elif key in (ord('['), ord(',')):
+        elif key_low in (ord('['), ord(',')):
             current_idx = max(0, current_idx - 1)
-        elif key in (ord(']'), ord('.')):
+        elif key_low in (ord(']'), ord('.')):
             current_idx = min(total_frames - 1, current_idx + 1)
-        elif key in (85, 54):
+        elif key in (2162688, 85, 54):
             current_idx = min(total_frames - 1, current_idx + 300)
-        elif key in (86, 56):
+        elif key in (2228224, 86, 56):
             current_idx = max(0, current_idx - 300)
-        elif ord('0') <= key <= ord('9'):
-            current_idx = int(total_frames * (key - ord('0')) / 10.0)
+        elif ord('0') <= key_low <= ord('9'):
+            current_idx = int(total_frames * (key_low - ord('0')) / 10.0)
+        else:
+            status_msg = f"未识别按键 key={key} low={key_low}"
+            print(f"[按键] 未识别 key={key} low={key_low}")
 
     cv2.destroyWindow(win)
 
@@ -316,8 +362,8 @@ def main():
                         help="锅底标注模式：标注锅底区域（保存到 bottom_keyframes），"
                              "TrackFood 会用 inverse mask（锅区域-锅底）追踪食材")
     parser.add_argument("--wok-rgb", action="store_true", dest="wok_rgb",
-                        help="RGB 锅区域标注：点锅边缘 5+ 个点，自动拟合椭圆，"
-                             "保存到 food_labels.json 的 wok_rgb_region 字段")
+                        help="RGB 锅区域标注：左键点锅边缘 5+ 个点、右键点锅中心，"
+                             "自动拟合椭圆并保存到 food_labels.json 的 wok_rgb_region 字段")
     parser.add_argument("--frame",   type=int, default=None,
                         help="追加/锅底/wok-rgb 模式下，直接跳到指定帧号开始标注")
     parser.add_argument("--label",   type=str, default=None,
@@ -491,7 +537,7 @@ def main():
                     bkfs.sort(key=lambda k: k["frame"])
                 with open(output_json, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
-                print(f"\n✅ 锅底标注已保存到: {output_json}")
+                print(f"\n[锅底] 已保存到: {output_json}")
                 print(f"   bottom_keyframes 共 {len(bkfs)} 条：")
                 for kf in bkfs:
                     print(f"     帧 {kf['frame']:6d} ({kf['time_s']:.1f}s)  "

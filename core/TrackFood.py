@@ -483,19 +483,76 @@ def _kmeans_food_temp(wok_temps, min_cluster_gap=30.0):
     return float(np.mean(vals[food_mask])) if food_mask.any() else float("nan")
 
 
-def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
-                    roi_history=None, ir_mask_history=None):
+def refine_wok_ellipse_from_rgb(frame_bgr, cx, cy, rx, ry, shrink_px=8):
     """
-    用纯 numpy/cv2 绘制温度折线图，支持三条曲线：
-      SAM2 mask（橙色）、ROI 固定圆圈（蓝色）、IR mask 自动分割（绿色）
+    从 RGB 帧的锅沿亮环中精化内圆边界椭圆。
+
+    原理：
+      1. 在手动标注椭圆的环状区域（外边±20%宽度）内做掩码
+      2. 转灰度后 Canny 边缘检测
+      3. 对边缘点做 fitEllipse，得到精确锅沿椭圆
+      4. 向内收缩 shrink_px 作为实际锅内区域边界
+
+    返回：
+      (cx_new, cy_new, rx_new, ry_new) 精化后的椭圆参数
+      失败时 fallback 返回原始参数
+    """
+    try:
+        h, w = frame_bgr.shape[:2]
+        # 环状搜索区域：外圆 = 标注椭圆 * 1.15，内圆 = 标注椭圆 * 0.80
+        outer_mask = np.zeros((h, w), dtype=np.uint8)
+        inner_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.ellipse(outer_mask, (int(cx), int(cy)),
+                    (int(rx * 1.15), int(ry * 1.15)), 0, 0, 360, 255, -1)
+        cv2.ellipse(inner_mask, (int(cx), int(cy)),
+                    (int(rx * 0.80), int(ry * 0.80)), 0, 0, 360, 255, -1)
+        ring_mask = (outer_mask > 0) & (inner_mask == 0)
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        # 在环状区域内做自适应亮度归一化后 Canny
+        gray_ring = cv2.bitwise_and(gray, gray, mask=ring_mask.astype(np.uint8))
+        blurred   = cv2.GaussianBlur(gray_ring, (5, 5), 1.2)
+        edges     = cv2.Canny(blurred, 30, 90)
+        edges     = cv2.bitwise_and(edges, edges, mask=ring_mask.astype(np.uint8))
+
+        ys, xs = np.where(edges > 0)
+        if len(xs) < 20:
+            return cx, cy, rx, ry   # 边缘点不足，fallback
+
+        pts = np.column_stack([xs, ys]).astype(np.float32)
+        ellipse = cv2.fitEllipse(pts)
+        (ecx, ecy), (ew, eh), angle = ellipse
+        # 拟合结果合理性检查：圆心偏移不超过标注值 15%，半径比例合理
+        if (abs(ecx - cx) > rx * 0.3 or abs(ecy - cy) > ry * 0.3):
+            return cx, cy, rx, ry
+        new_rx = max(ew, eh) / 2.0 - shrink_px
+        new_ry = min(ew, eh) / 2.0 - shrink_px
+        if new_rx < rx * 0.5 or new_ry < ry * 0.5:
+            return cx, cy, rx, ry   # 收缩过度，fallback
+        print(f"[锅沿精化] RGB椭圆检测成功: "
+              f"cx={ecx:.0f}({cx:.0f}) cy={ecy:.0f}({cy:.0f}) "
+              f"rx={new_rx:.0f}({rx:.0f}) ry={new_ry:.0f}({ry:.0f})")
+        return float(ecx), float(ecy), float(new_rx), float(new_ry)
+    except Exception as _re:
+        print(f"[锅沿精化] 失败({_re})，保留原始标注椭圆")
+        return cx, cy, rx, ry
+
+
+def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
+                    roi_history=None, ir_mask_history=None, inverse_history=None):
+    """
+    用纯 numpy/cv2 绘制温度折线图，支持四条曲线：
+      SAM2 mask（橙色）、ROI 固定圆圈（蓝色）、IR mask 自动分割（绿色）、
+      反向语义（紫色实线）
 
     参数：
-      temp_history    : list of (time_s, temp_mean)，SAM2 mask 温度历史
-      cur_time_s      : 当前帧时间（秒）
-      w, h            : 图像宽高（像素）
-      curve_win_s     : 滑动窗口长度（秒），只显示最近 N 秒
-      roi_history     : list of (time_s, temp_mean)，ROI 区域温度历史（可选）
-      ir_mask_history : list of (time_s, temp_mean)，IR mask 温度历史（可选）
+      temp_history     : list of (time_s, temp_mean)，SAM2 mask 温度历史
+      cur_time_s       : 当前帧时间（秒）
+      w, h             : 图像宽高（像素）
+      curve_win_s      : 滑动窗口长度（秒），只显示最近 N 秒
+      roi_history      : list of (time_s, temp_mean)，ROI 区域温度历史（可选）
+      ir_mask_history  : list of (time_s, temp_mean)，IR mask 温度历史（可选）
+      inverse_history  : list of (time_s, temp_mean)，反向语义温度历史（可选）
     """
     bar = np.zeros((h, w, 3), dtype=np.uint8)
     if len(temp_history) < 2:
@@ -596,6 +653,22 @@ def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
         cv2.putText(bar, f"Mask:{vals[-1]:.1f}C", (cx + 6, cy + 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 255), 1)
 
+    # 反向语义折线（紫色实线）
+    inv_pts = []
+    if inverse_history:
+        inv_pts = [(t, v) for t, v in inverse_history if t >= t0 and not np.isnan(v)]
+    if len(inv_pts) >= 2:
+        inv_screen = [(tx(t), ty(v)) for t, v in inv_pts]
+        for i in range(1, len(inv_screen)):
+            p1, p2 = inv_screen[i - 1], inv_screen[i]
+            if all(0 <= c < dim for c, dim in [(p1[0], w), (p1[1], h), (p2[0], w), (p2[1], h)]):
+                cv2.line(bar, p1, p2, (200, 80, 255), 2)
+        ivx, ivy = inv_screen[-1]
+        if 0 <= ivx < w and 0 <= ivy < h:
+            cv2.circle(bar, (ivx, ivy), 4, (200, 80, 255), -1)
+            cv2.putText(bar, f"Inv:{inv_pts[-1][1]:.1f}C", (ivx + 6, ivy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 80, 255), 1)
+
     # 图例（全英文，cv2 不支持中文/特殊符号）
     cv2.putText(bar, "[SAM2]", (pad_l + 4, pad_t + 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (50, 165, 255), 1)
@@ -605,11 +678,96 @@ def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
     if ir_pts:
         cv2.putText(bar, "[IR-Auto]", (pad_l + 120, pad_t + 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 220, 80), 1)
+    if inv_pts:
+        cv2.putText(bar, "[Inv]", (pad_l + 200, pad_t + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 80, 255), 1)
 
     return bar
 
 
 # ── 主程序 ───────────────────────────────────────────────────────────────────
+
+def generate_inverse_bottom_points_from_ir(rgb_frame, ir_frame, wok_mask_ir,
+                                           homography_inv, wok_rgb_constraint,
+                                           n_fg=18, n_bg=18, rng=None,
+                                           preview_path=None):
+    """Generate inverse-SAM2 points from current IR: hot wok/body=FG, cool food=BG."""
+    if (rgb_frame is None or ir_frame is None or wok_mask_ir is None
+            or homography_inv is None or wok_rgb_constraint is None):
+        return [], [], False
+
+    rng = rng or np.random.default_rng(0)
+    wok_t = ir_frame[wok_mask_ir]
+    if len(wok_t) < 10:
+        return [], [], False
+
+    c_low = float(np.percentile(wok_t, 10))
+    c_high = float(np.percentile(wok_t, 90))
+    for _ in range(20):
+        d_low = np.abs(wok_t - c_low)
+        d_high = np.abs(wok_t - c_high)
+        low_sel = d_low <= d_high
+        n_low = float(np.mean(wok_t[low_sel])) if low_sel.any() else c_low
+        n_high = float(np.mean(wok_t[~low_sel])) if (~low_sel).any() else c_high
+        if abs(n_low - c_low) < 0.1 and abs(n_high - c_high) < 0.1:
+            break
+        c_low, c_high = n_low, n_high
+    if (c_high - c_low) < 25.0:
+        return [], [], False
+
+    ys_w, xs_w = np.where(wok_mask_ir)
+    vals = ir_frame[wok_mask_ir]
+    d_low = np.abs(vals - c_low)
+    d_high = np.abs(vals - c_high)
+    food_ir = np.zeros_like(wok_mask_ir, dtype=np.uint8)
+    hot_ir = np.zeros_like(wok_mask_ir, dtype=np.uint8)
+    food_ir[ys_w[d_low <= d_high], xs_w[d_low <= d_high]] = 255
+    hot_ir[ys_w[d_high < d_low], xs_w[d_high < d_low]] = 255
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    food_ir = cv2.morphologyEx(food_ir, cv2.MORPH_OPEN, kernel) > 0
+    hot_ir = cv2.morphologyEx(hot_ir, cv2.MORPH_OPEN, kernel) > 0
+
+    def _sample_points(mask_ir, n):
+        ys, xs = np.where(mask_ir)
+        if len(xs) == 0:
+            return []
+        idx = rng.choice(len(xs), size=min(len(xs), n * 8), replace=False)
+        pts_ir = np.array([[[float(xs[i]), float(ys[i])]] for i in idx], dtype=np.float32)
+        pts_rgb = cv2.perspectiveTransform(pts_ir, homography_inv).reshape(-1, 2)
+        h, w = wok_rgb_constraint.shape
+        pts = []
+        for x, y in pts_rgb:
+            xi, yi = int(round(float(x))), int(round(float(y)))
+            if 0 <= xi < w and 0 <= yi < h and wok_rgb_constraint[yi, xi]:
+                pts.append([float(xi), float(yi)])
+                if len(pts) >= n:
+                    break
+        return pts
+
+    fg_pts = _sample_points(hot_ir, n_fg)
+    bg_pts = _sample_points(food_ir, n_bg)
+    ok = len(fg_pts) >= 4 and len(bg_pts) >= 4
+
+    if ok and preview_path:
+        vis = rgb_frame.copy()
+        shade = np.zeros_like(vis)
+        shade[wok_rgb_constraint] = (70, 70, 70)
+        vis = cv2.addWeighted(vis, 1.0, shade, 0.25, 0)
+        for x, y in fg_pts:
+            cv2.circle(vis, (int(x), int(y)), 8, (0, 255, 80), -1)
+            cv2.circle(vis, (int(x), int(y)), 9, (0, 0, 0), 1)
+        for x, y in bg_pts:
+            cv2.circle(vis, (int(x), int(y)), 8, (0, 0, 255), -1)
+            cv2.circle(vis, (int(x), int(y)), 9, (0, 0, 0), 1)
+        cv2.putText(vis, f"Inverse auto points FG-hot={len(fg_pts)} BG-food={len(bg_pts)}",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        cv2.putText(vis, f"K-low/high=({c_low:.1f},{c_high:.1f})C",
+                    (20, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+        cv2.imwrite(preview_path, vis)
+
+    return fg_pts, bg_pts, ok
+
 
 def main():
     # ── 创建时间戳输出子目录 ──────────────────────────────────────────────────
@@ -617,8 +775,8 @@ def main():
     out_dir  = os.path.join(_HERE, "..", "output", run_ts)
     os.makedirs(out_dir, exist_ok=True)
     out_video_viz = os.path.join(out_dir, "track_result_viz.mp4")
-    out_csv       = os.path.join(out_dir, "food_temp_log.csv")
-    out_xlsx      = os.path.join(out_dir, "food_temp_log.xlsx")
+    out_csv       = os.path.join(out_dir, "food_temp_log.csv")      # noqa (reserved)
+    out_xlsx      = os.path.join(out_dir, "food_temp_log.xlsx")     # noqa (reserved)
     out_curve     = os.path.join(out_dir, "food_temp_curve.png")
     print(f"[输出] 本次结果目录: {out_dir}")
 
@@ -678,29 +836,40 @@ def main():
 
     # ── 加载 wok_rgb_region（在 VH/VW 已知后构建静态 mask）───────────────────
     wok_rgb_cx = wok_rgb_cy = wok_rgb_rx = wok_rgb_ry = None
+    wok_rgb_rim_rx = wok_rgb_rim_ry = None
+    wok_rgb_anchor_cx = wok_rgb_anchor_cy = None
     wok_rgb_mask_static = None
     _wok_rgb_cx_dyn = _wok_rgb_cy_dyn = None
     _WOK_RGB_MAX_DRIFT = 40
     _bottom_carry = None
+    _bottom_fail_streak = 0
+    _bottom_auto_reset = None
     _bottom_inject_map = {kf["frame"]: kf for kf in bottom_keyframes[1:]}
     if "wok_rgb_region" in _wok_rgb_json:
         _wr = _wok_rgb_json["wok_rgb_region"]
         wok_rgb_cx = float(_wr["cx"])
         wok_rgb_cy = float(_wr["cy"])
-        wok_rgb_rx = float(_wr["rx"])
-        wok_rgb_ry = float(_wr["ry"])
+        wok_rgb_anchor_cx = float(_wr.get("center_x", _wr.get("initial_cx", wok_rgb_cx)))
+        wok_rgb_anchor_cy = float(_wr.get("center_y", _wr.get("initial_cy", wok_rgb_cy)))
+        wok_rgb_rim_rx = float(_wr["rx"])
+        wok_rgb_rim_ry = float(_wr["ry"])
+        wok_rgb_rx = wok_rgb_rim_rx * 0.79   # 反向语义检测区域：锅沿内缩
+        wok_rgb_ry = wok_rgb_rim_ry * 0.79
         print(f"[wok_rgb] 已加载 RGB 锅椭圆: "
               f"cx={wok_rgb_cx:.0f} cy={wok_rgb_cy:.0f} "
-              f"rx={wok_rgb_rx:.0f} ry={wok_rgb_ry:.0f}")
+              f"rim_rx={wok_rgb_rim_rx:.0f} rim_ry={wok_rgb_rim_ry:.0f} "
+              f"detect_rx={wok_rgb_rx:.0f} detect_ry={wok_rgb_ry:.0f}")
+        print(f"[wok_rgb] 手工锅中心锚点: "
+              f"cx={wok_rgb_anchor_cx:.0f} cy={wok_rgb_anchor_cy:.0f}")
         _wm_static = np.zeros((VH, VW), dtype=np.uint8)
         cv2.ellipse(_wm_static,
                     (int(round(wok_rgb_cx)), int(round(wok_rgb_cy))),
                     (int(round(wok_rgb_rx)), int(round(wok_rgb_ry))),
                     0, 0, 360, 255, -1)
         wok_rgb_mask_static = _wm_static > 0
-        # 初始动态中心先用手动标注值，等 homography 加载后再用 IR 反投影覆盖
-        _wok_rgb_cx_dyn = wok_rgb_cx
-        _wok_rgb_cy_dyn = wok_rgb_cy
+        # 反向语义动态中心由 IR 锅中心反投影驱动；这里仅保存初始人工中心用于偏移校正。
+        _wok_rgb_cx_dyn = wok_rgb_anchor_cx
+        _wok_rgb_cy_dyn = wok_rgb_anchor_cy
     else:
         print(f"[wok_rgb] 未找到 wok_rgb_region，inverse_mask 将 fallback 到 IR 反投影约束")
 
@@ -713,29 +882,10 @@ def main():
     if os.path.exists(HOMOGRAPHY_PATH):
         homography = np.load(HOMOGRAPHY_PATH)
         print(f"[单应矩阵] 已加载: {HOMOGRAPHY_PATH}  shape: {homography.shape}")
-        # 用 homography 逆矩阵把 IR 锅中心反投影到 RGB，初始化动态中心
-        # 避免首批用手动标注坐标和 IR 反投影之间的系统性偏差（~200px 跳变）
+        # wok_rgb 动态圆心由 refine_wok_ellipse_from_rgb（首帧RGB精化）或手动标注值初始化
+        # 不再用 IR 反投影覆盖（IR→RGB 换算有系统误差，导致圆心偏移）
         if wok_rgb_cx is not None:
-            try:
-                _H_inv_init = np.linalg.inv(homography)
-                # wok_cfg 在此处尚未加载，直接读 wok_region.json 获取 IR 锅中心
-                _wok_json_path = os.path.join(_HERE, "..", "data", "wok_region.json")
-                _ir_cx0, _ir_cy0 = 0.0, 0.0
-                if os.path.exists(_wok_json_path):
-                    with open(_wok_json_path) as _wf:
-                        _wj = json.load(_wf)
-                    _ir_cx0 = float(_wj.get("cx", 0.0))
-                    _ir_cy0 = float(_wj.get("cy", 0.0))
-                if _ir_cx0 == 0.0 and _ir_cy0 == 0.0:
-                    raise ValueError("wok_region.json cx/cy 为零，跳过初始化")
-                _ir_init = np.array([[[_ir_cx0, _ir_cy0]]], dtype=np.float32)
-                _rgb_init = cv2.perspectiveTransform(_ir_init, _H_inv_init)[0][0]
-                _wok_rgb_cx_dyn = float(_rgb_init[0])
-                _wok_rgb_cy_dyn = float(_rgb_init[1])
-                print(f"[wok_rgb初始化] IR({_ir_cx0:.0f},{_ir_cy0:.0f})"
-                      f" → RGB({_wok_rgb_cx_dyn:.0f},{_wok_rgb_cy_dyn:.0f}) (反投影)")
-            except Exception as _init_e:
-                print(f"[wok_rgb初始化] 反投影失败({_init_e})，保留手动标注坐标")
+            print(f"[wok_rgb初始化] 初始反向语义中心: ({_wok_rgb_cx_dyn:.0f}, {_wok_rgb_cy_dyn:.0f})")
     else:
         print(f"[单应矩阵] 未找到 {HOMOGRAPHY_PATH}，跳过温度融合")
 
@@ -871,6 +1021,10 @@ def main():
     _wok_cx_history = [(start_frame, _wok_cx, _wok_cy)]
     _wok_recent_drifts = []   # 最近几批的 drift 值，用于倾斜检测
     _wok_tilting = False      # 当前是否处于锅倾斜/快速移动状态
+    _USE_IR_FOR_INV_WOK = True
+    _wok_rgb_ir_offset_x = 0.0
+    _wok_rgb_ir_offset_y = 0.0
+    _wok_rgb_ir_offset_ready = False
 
     # ── 分批追踪主循环（SAM2 + 光流混合）────────────────────────────────────
     # 真正的混合模式：
@@ -936,6 +1090,15 @@ def main():
                 _rng_al      = np.random.default_rng(42)
                 _auto_label_func = _al_ir_mask
                 print(f"[自动重标点] 已加载，每 {RELABEL_INTERVAL_S}s 重新标点并重置SAM2")
+                # 用 IR 动态锅中心驱动 RGB 反向语义圈，并用首帧人工中心补偿 IR->RGB 系统偏差。
+                if _USE_IR_FOR_INV_WOK and _wok_rgb_cx_dyn is not None:
+                    _ir_wok0 = np.array([[[_wok_cx, _wok_cy]]], dtype=np.float32)
+                    _rgb_wok0 = cv2.perspectiveTransform(_ir_wok0, _H_inv_al)[0][0]
+                    _wok_rgb_ir_offset_x = float(_wok_rgb_cx_dyn - _rgb_wok0[0])
+                    _wok_rgb_ir_offset_y = float(_wok_rgb_cy_dyn - _rgb_wok0[1])
+                    _wok_rgb_ir_offset_ready = True
+                    print(f"[wok_rgb-IR] 初始校正偏移: "
+                          f"dx={_wok_rgb_ir_offset_x:.1f} dy={_wok_rgb_ir_offset_y:.1f}")
                 # ── 旋转轴在 RGB 坐标系中的位置（永久背景点，不得标注为前景）──
                 # wok_cfg cx/cy 是 IR 坐标，反投影到 RGB
                 try:
@@ -976,6 +1139,9 @@ def main():
             _wok_u8_pre = wok_mask_ir.astype(np.uint8) * 255
             _wok_proj   = cv2.warpPerspective(_wok_u8_pre, _H_inv_wok, (VW, VH))
             _wok_rgb_constraint = _wok_proj > 64
+            # Inverse mode uses this IR->RGB projected wok mask directly.
+            # Disable the RGB ellipse path to avoid extra center/radius correction.
+            wok_rgb_mask_static = None
             print(f"[wok约束] 预计算 RGB锅区域 mask  覆盖像素: {_wok_rgb_constraint.sum()}")
         except Exception as _we:
 
@@ -1099,6 +1265,7 @@ def main():
                                     _wok_u8_2   = wok_mask_ir.astype(np.uint8) * 255
                                     _wok_proj2  = cv2.warpPerspective(_wok_u8_2, _H_inv_wok2, (VW, VH))
                                     _wok_rgb_constraint = _wok_proj2 > 64
+                                    wok_rgb_mask_static = None
                                     _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
                                     print(f"[wok更新] t={chunk_start_s:.1f}s  "
                                           f"cx: {_cx_old:.1f}->{_wok_cx:.1f}  "
@@ -1136,6 +1303,18 @@ def main():
                     _rgb_axis_dyn = cv2.perspectiveTransform(_ir_axis_dyn, _H_inv_al)[0][0]
                     _axis_cx_rgb_dyn = float(_rgb_axis_dyn[0])
                     _axis_cy_rgb_dyn = float(_rgb_axis_dyn[1])
+                    if (_USE_IR_FOR_INV_WOK and _wok_rgb_ir_offset_ready
+                            and wok_rgb_cx is not None):
+                        _old_inv_cx, _old_inv_cy = _wok_rgb_cx_dyn, _wok_rgb_cy_dyn
+                        _wok_rgb_cx_dyn = float(_rgb_axis_dyn[0] + _wok_rgb_ir_offset_x)
+                        _wok_rgb_cy_dyn = float(_rgb_axis_dyn[1] + _wok_rgb_ir_offset_y)
+                        _inv_drift = ((_wok_rgb_cx_dyn - _old_inv_cx) ** 2
+                                      + (_wok_rgb_cy_dyn - _old_inv_cy) ** 2) ** 0.5
+                        if _inv_drift > 0.5:
+                            print(f"[wok_rgb-IR] t={chunk_start_s:.1f}s  "
+                                  f"center: ({_old_inv_cx:.0f},{_old_inv_cy:.0f})->"
+                                  f"({_wok_rgb_cx_dyn:.0f},{_wok_rgb_cy_dyn:.0f})  "
+                                  f"drift={_inv_drift:.1f}px")
                 except Exception:
                     pass   # 失败时保留静态值
 
@@ -1730,15 +1909,47 @@ def main():
                                     "bg_points":   _bkf.get("bg_points", []),
                                     "label":       _bkf.get("label", ""),
                                 })
-                        # 锅底 carry_mask 缩放到推理分辨率
-                        _bc_infer = None
-                        if _bottom_carry is not None and do_resize:
+                        _bottom_fg_run = bottom_fg_points
+                        _bottom_bg_run = bottom_bg_points
+                        if (False and temp_data is not None and homography is not None
+                                and wok_mask_ir is not None
+                                and _wok_rgb_constraint is not None):
+                            try:
+                                _rgb_b0 = cv2.imread(os.path.join(tmp_dir, frame_names[0]))
+                                _ir_b0 = temp_data[_get_ir_idx(chunk_start_abs)]
+                                _H_inv_bottom = (_H_inv_al if _H_inv_al is not None
+                                                 else np.linalg.inv(homography))
+                                _prev_btm = os.path.join(
+                                    out_dir,
+                                    f"inverse_autopoints_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
+                                )
+                                _auto_fg_b, _auto_bg_b, _auto_ok_b = generate_inverse_bottom_points_from_ir(
+                                    _rgb_b0, _ir_b0, wok_mask_ir, _H_inv_bottom,
+                                    _wok_rgb_constraint, rng=_rng_al, preview_path=_prev_btm
+                                )
+                                if _auto_ok_b:
+                                    _bottom_fg_run = _auto_fg_b
+                                    _bottom_bg_run = _auto_bg_b
+                                    print(f"[Inv自动补点] 批次{chunk_i+1} "
+                                          f"FG-hot={len(_auto_fg_b)} BG-food={len(_auto_bg_b)} "
+                                          f"preview={os.path.basename(_prev_btm)}")
+                            except Exception as _bae:
+                                print(f"[Inv自动补点] 批次{chunk_i+1} 失败: {_bae}")
+                        if _bottom_auto_reset is not None:
+                            _bottom_fg_run = _bottom_auto_reset["fg_points"]
+                            _bottom_bg_run = _bottom_auto_reset["bg_points"]
+                            _bc_infer = None
+                            print(f"[Inv自动重启] 批次{chunk_i+1} 使用跟丢时IR自动点 "
+                                  f"FG={len(_bottom_fg_run)} BG={len(_bottom_bg_run)} "
+                                  f"src_frame={_bottom_auto_reset.get('frame')}")
+                            _bottom_auto_reset = None
+                        elif _bottom_carry is not None and do_resize:
                             _bc_infer = upscale_mask(_bottom_carry, infer_wh)
                         else:
                             _bc_infer = _bottom_carry
                         bottom_chunk_masks, _bottom_carry_raw = track_chunk(
                             predictor, tmp_dir, frame_names,
-                            bottom_fg_points, bottom_bg_points,
+                            _bottom_fg_run, _bottom_bg_run,
                             carry_mask=_bc_infer,
                             inject_keyframes=_bottom_inject,
                         )
@@ -1747,26 +1958,6 @@ def main():
                             else _bottom_carry_raw
                         print(f"[锅底SAM2] 批次 {chunk_i+1} 锅底追踪完成，"
                               f"{len(bottom_chunk_masks)} 帧")
-                        # 动态更新 wok_rgb 中心：用 IR 旋转轴法已算好的 _wok_cx/_wok_cy
-                        # 直接用 homography 逆矩阵反投影，精度与 IR 一致，不受锅底mask质心偏移影响
-                        if wok_rgb_cx is not None and _H_inv_al is not None:
-                            try:
-                                _ir_pt_rgb = np.array([[[_wok_cx, _wok_cy]]], dtype=np.float32)
-                                _rgb_pt = cv2.perspectiveTransform(_ir_pt_rgb, _H_inv_al)[0][0]
-                                _bcx_new = float(_rgb_pt[0])
-                                _bcy_new = float(_rgb_pt[1])
-                                if (0 <= _bcx_new < VW and 0 <= _bcy_new < VH):
-                                    _bd = ((_bcx_new - _wok_rgb_cx_dyn)**2
-                                           + (_bcy_new - _wok_rgb_cy_dyn)**2)**0.5
-                                    if _bd > 1.0:
-                                        print(f"[wok_rgb动态] t={chunk_start_s:.1f}s  "
-                                              f"cx: {_wok_rgb_cx_dyn:.0f}->{_bcx_new:.0f}  "
-                                              f"cy: {_wok_rgb_cy_dyn:.0f}->{_bcy_new:.0f}  "
-                                              f"drift={_bd:.1f}px (IR反投影)")
-                                    _wok_rgb_cx_dyn = _bcx_new
-                                    _wok_rgb_cy_dyn = _bcy_new
-                            except Exception as _bdyn_e:
-                                pass  # 动态更新失败不影响主流程
                     except Exception as _be:
                         print(f"[锅底SAM2] 批次 {chunk_i+1} 追踪失败: {_be}")
 
@@ -1965,22 +2156,7 @@ def main():
                     parts.append("SAM2:N/A")
                 if not np.isnan(roi_temp_mean):
                     parts.append(f"ROI:{roi_temp_mean:.1f}C")
-                if not np.isnan(ir_mask_temp):
-                    parts.append(f"IR:{ir_mask_temp:.1f}C")
-                cv2.putText(info_bar, "  ".join(parts),
-                            (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (100, 255, 200), 1)
-
-                chart_bar = draw_temp_chart(temp_history, time_s, VW, CHART_H, CURVE_WIN_S,
-                                            roi_history=roi_history,
-                                            ir_mask_history=ir_mask_history)
-                writer.write(np.vstack([vis, info_bar, chart_bar]))
-                # 三策略数据分别记录
-                sam2_rows.append([abs_idx, local_idx, time_s,
-                                  int(mask.sum()), round(mask_ratio, 2),
-                                  temp_mean, temp_min, temp_max])
-                roi_rows.append([abs_idx, local_idx, time_s, roi_temp_mean])
-                ir_rows.append([abs_idx, local_idx, time_s, ir_mask_temp])
-
+                # ── 锅底反向语义温度统计（先算，后写入 info_bar）─────────────
                 # ── 锅底反向语义温度统计 ──────────────────────────────────────
                 # inverse_mask = wok_rgb_ellipse(动态) & ~bottom_sam2_mask
                 # 即：锅内除锅底以外的区域 = 食材区域（另一种语义）
@@ -2007,7 +2183,94 @@ def main():
                                                  if _wok_rgb_constraint is not None
                                                  else np.ones((VH, VW), dtype=bool))
                             # inverse_mask = 锅内区域 AND NOT 锅底
-                            _inv_mask = _dyn_wok_bool & ~_bm_full
+                            _raw_inv_mask = _dyn_wok_bool & ~_bm_full
+                            _wok_px_inv = int(_dyn_wok_bool.sum())
+                            _raw_inv_ratio = int(_raw_inv_mask.sum()) / max(_wok_px_inv, 1) * 100
+                            _inv_mask_override = None
+                            if _raw_inv_ratio > 95.0:
+                                _bottom_fail_streak += 1
+                                if (_bottom_auto_reset is None and temp_data is not None
+                                        and homography is not None and wok_mask_ir is not None
+                                        and _wok_rgb_constraint is not None):
+                                    try:
+                                        _H_inv_bottom = (_H_inv_al if _H_inv_al is not None
+                                                         else np.linalg.inv(homography))
+                                        _prev_btm = os.path.join(
+                                            out_dir,
+                                            f"inverse_autopoints_t{time_s:.1f}s_f{abs_idx}.jpg"
+                                        )
+                                        _auto_fg_b, _auto_bg_b, _auto_ok_b = generate_inverse_bottom_points_from_ir(
+                                            frame, temp_data[_get_ir_idx(abs_idx)],
+                                            wok_mask_ir, _H_inv_bottom, _wok_rgb_constraint,
+                                            rng=_rng_al, preview_path=_prev_btm
+                                        )
+                                        if _auto_ok_b:
+                                            _bottom_auto_reset = {
+                                                "frame": abs_idx,
+                                                "fg_points": _auto_fg_b,
+                                                "bg_points": _auto_bg_b,
+                                            }
+                                            _bottom_carry = None
+                                            print(f"[Inv跟丢补点] frame={abs_idx} "
+                                                  f"FG-hot={len(_auto_fg_b)} BG-food={len(_auto_bg_b)} "
+                                                  f"preview={os.path.basename(_prev_btm)}")
+                                    except Exception as _bae:
+                                        print(f"[Inv跟丢补点] frame={abs_idx} 失败: {_bae}")
+                                if (False and temp_data is not None and homography is not None
+                                        and wok_mask_ir is not None):
+                                    try:
+                                        _ir_idx_fb = _get_ir_idx(abs_idx)
+                                        _ir_frm_fb = temp_data[_ir_idx_fb]
+                                        _wok_t_fb = _ir_frm_fb[wok_mask_ir]
+                                        if len(_wok_t_fb) >= 10:
+                                            _c_low = float(np.percentile(_wok_t_fb, 10))
+                                            _c_high = float(np.percentile(_wok_t_fb, 90))
+                                            for _ in range(20):
+                                                _dl = np.abs(_wok_t_fb - _c_low)
+                                                _dh = np.abs(_wok_t_fb - _c_high)
+                                                _low_sel = _dl <= _dh
+                                                _nl = float(np.mean(_wok_t_fb[_low_sel])) if _low_sel.any() else _c_low
+                                                _nh = float(np.mean(_wok_t_fb[~_low_sel])) if (~_low_sel).any() else _c_high
+                                                if abs(_nl - _c_low) < 0.1 and abs(_nh - _c_high) < 0.1:
+                                                    break
+                                                _c_low, _c_high = _nl, _nh
+                                            if (_c_high - _c_low) >= 25.0:
+                                                _food_ir = np.zeros_like(wok_mask_ir, dtype=np.uint8)
+                                                _ys_w, _xs_w = np.where(wok_mask_ir)
+                                                _dl2 = np.abs(_ir_frm_fb[wok_mask_ir] - _c_low)
+                                                _dh2 = np.abs(_ir_frm_fb[wok_mask_ir] - _c_high)
+                                                _food_ir[_ys_w[_dl2 <= _dh2], _xs_w[_dl2 <= _dh2]] = 255
+                                                _k_fb = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                                                _food_ir = cv2.morphologyEx(_food_ir, cv2.MORPH_OPEN, _k_fb)
+                                                _food_ir = cv2.morphologyEx(_food_ir, cv2.MORPH_CLOSE, _k_fb)
+                                                _food_rgb = cv2.warpPerspective(
+                                                    _food_ir,
+                                                    np.linalg.inv(homography),
+                                                    (VW, VH)
+                                                ) > 64
+                                                _food_rgb = _food_rgb & _dyn_wok_bool
+                                                _fb_ratio = int(_food_rgb.sum()) / max(_wok_px_inv, 1) * 100
+                                                if 1.0 <= _fb_ratio <= 60.0:
+                                                    _inv_mask_override = _food_rgb
+                                                    _bm_full = _dyn_wok_bool & ~_food_rgb
+                                                    if not do_resize:
+                                                        bottom_chunk_masks[local_in_chunk] = _bm_full
+                                                    print(f"[Inv-IR兜底] frame={abs_idx} "
+                                                          f"IR食材={_fb_ratio:.1f}% "
+                                                          f"K=({_c_low:.1f},{_c_high:.1f})")
+                                    except Exception:
+                                        pass
+                                if not do_resize:
+                                    pass
+                                if _bottom_fail_streak in (1, 10) or _bottom_fail_streak % 25 == 0:
+                                    print(f"[Inv兜底] frame={abs_idx}  bottom_mask疑似丢失 "
+                                          f"inv_ratio={_raw_inv_ratio:.1f}%  "
+                                          f"使用上一帧有效bottom_mask  streak={_bottom_fail_streak}")
+                            elif _raw_inv_ratio <= 60.0:
+                                _bottom_fail_streak = 0
+                            _inv_mask = (_inv_mask_override
+                                         if _inv_mask_override is not None
+                                         else (_dyn_wok_bool & ~_bm_full))
                             if _inv_mask.any() and temp_data is not None and homography is not None:
                                 ir_h_inv, ir_w_inv = temp_data.shape[1], temp_data.shape[2]
                                 ir_mask_inv = map_mask_to_ir(_inv_mask, homography,
@@ -2020,17 +2283,61 @@ def main():
                                         inverse_temp_mean = float(np.mean(inv_temps))
                     except Exception as _inv_e:
                         pass  # 计算失败不影响主流程
-                if not np.isnan(inverse_temp_mean):
+                # ── 反向语义面积门控：inv_mask > 60% wok椭圆时视为锅直立/异常，清空 ──
+                _inv_area_ok = True
+                if has_bottom and bottom_chunk_masks:
+                    _bm_raw_chk = bottom_chunk_masks.get(local_in_chunk)
+                    if _bm_raw_chk is not None:
+                        _bm_full_chk = upscale_mask(_bm_raw_chk, orig_wh) if do_resize else _bm_raw_chk
+                        if _wok_rgb_constraint is not None:
+                            _dyn_wok_bool_chk = _wok_rgb_constraint
+                        else:
+                            _dyn_wok_chk = np.zeros((VH, VW), dtype=np.uint8)
+                            cv2.ellipse(_dyn_wok_chk,
+                                        (int(round(wok_rgb_cx)), int(round(wok_rgb_cy))),
+                                        (int(round(wok_rgb_rx)), int(round(wok_rgb_ry))),
+                                        0, 0, 360, 255, -1)
+                            _dyn_wok_bool_chk = _dyn_wok_chk > 0
+                        _inv_mask_chk = _dyn_wok_bool_chk & ~_bm_full_chk
+                        _wok_px_chk2  = int(_dyn_wok_bool_chk.sum())
+                        _inv_px_chk   = int(_inv_mask_chk.sum())
+                        _inv_ratio    = _inv_px_chk / max(_wok_px_chk2, 1) * 100
+                        if _inv_ratio > 60.0:
+                            _inv_area_ok = False
+                            inverse_temp_mean = float("nan")
+                            print(f"[Inv门控] frame={abs_idx}  inv_ratio={_inv_ratio:.1f}%>60%，"
+                                  f"跳过该帧反向语义温度")
+
+                if _inv_area_ok and not np.isnan(inverse_temp_mean):
                     inverse_history.append((time_s, inverse_temp_mean))
                 inverse_rows.append([abs_idx, local_idx, time_s, inverse_temp_mean])
 
+                # ── info_bar 第二行：IR + Inv 温度追加（已算完后写入）────────
+                if not np.isnan(ir_mask_temp):
+                    parts.append(f"IR:{ir_mask_temp:.1f}C")
+                if not np.isnan(inverse_temp_mean):
+                    parts.append(f"Inv:{inverse_temp_mean:.1f}C")
+                cv2.putText(info_bar, "  ".join(parts),
+                            (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (100, 255, 200), 1)
+
+                chart_bar = draw_temp_chart(temp_history, time_s, VW, CHART_H, CURVE_WIN_S,
+                                            roi_history=roi_history,
+                                            ir_mask_history=ir_mask_history,
+                                            inverse_history=inverse_history if has_bottom else None)
+                writer.write(np.vstack([vis, info_bar, chart_bar]))
+                # 三策略数据分别记录
+                sam2_rows.append([abs_idx, local_idx, time_s,
+                                  int(mask.sum()), round(mask_ratio, 2),
+                                  temp_mean, temp_min, temp_max])
+                roi_rows.append([abs_idx, local_idx, time_s, roi_temp_mean])
+                ir_rows.append([abs_idx, local_idx, time_s, ir_mask_temp])
+
                 # ── 写 inverse 叠加帧（锅底反向 RGB 视频）────────────────────
                 if writer_inv is not None:
-                    if has_bottom and bottom_chunk_masks:
+                    if _inv_area_ok and has_bottom and bottom_chunk_masks:
                         _bm_r2 = bottom_chunk_masks.get(local_in_chunk)
                         if _bm_r2 is not None:
                             _bm_f2 = upscale_mask(_bm_r2, orig_wh) if do_resize else _bm_r2
-                            # inverse_mask = 动态锅椭圆 AND NOT 锅底
                             if wok_rgb_mask_static is not None:
                                 _dyn2 = np.zeros((VH, VW), dtype=np.uint8)
                                 cv2.ellipse(_dyn2,
@@ -2047,11 +2354,11 @@ def main():
                                 _inv_vis_mask = _fb & ~_bm_f2
                             vis_inv = render_overlay(frame, _inv_vis_mask,
                                                      (200, 80, 255), MASK_ALPHA)
-                            # 标题
                             cv2.putText(vis_inv,
-                                        f"Inverse(Wok-Bottom)  t={time_s:.1f}s"
-                                        f"  Inv={inverse_temp_mean:.1f}C" if not np.isnan(inverse_temp_mean)
-                                        else f"Inverse(Wok-Bottom)  t={time_s:.1f}s",
+                                        (f"Inverse(Wok-Bottom)  t={time_s:.1f}s"
+                                         f"  Inv={inverse_temp_mean:.1f}C"
+                                         if not np.isnan(inverse_temp_mean)
+                                         else f"Inverse(Wok-Bottom)  t={time_s:.1f}s"),
                                         (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                                         (200, 80, 255), 2)
                         else:
@@ -2064,8 +2371,8 @@ def main():
                                 (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                                 (200, 80, 255), 1)
                     cv2.putText(inv_info,
-                                (f"Inv:{inverse_temp_mean:.1f}C" if not np.isnan(inverse_temp_mean)
-                                 else "Inv:N/A"),
+                                (f"Inv:{inverse_temp_mean:.1f}C"
+                                 if not np.isnan(inverse_temp_mean) else "Inv:N/A"),
                                 (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
                                 (200, 100, 255), 1)
                     writer_inv.write(np.vstack([vis_inv, inv_info, chart_bar]))
@@ -2226,6 +2533,8 @@ def main():
         global_local = total_frames - start_frame
 
     writer.release()
+    if writer_inv is not None:
+        writer_inv.release()
 
     print(f"\n\n[DONE] 追踪完成！")
     print(f"   结果目录:   {out_dir}")
@@ -2241,9 +2550,6 @@ def main():
                        inverse_rows=inverse_rows if has_bottom else None)
 
     # ── 拼合 RGB + IR 视频 ────────────────────────────────────────────────────
-    if writer_inv is not None:
-        writer_inv.release()
-
     if temp_data is not None and wok_cfg is not None:
         out_combined = os.path.join(out_dir, "track_result_combined.mp4")
         ir_fps_val   = fps * ir_fps_ratio   # 估算 IR 帧率
@@ -2267,6 +2573,12 @@ def main():
             print(f"   已删除中间文件: track_result_viz.mp4")
         except Exception:
             pass
+        if has_bottom and os.path.exists(out_inv_viz):
+            try:
+                os.remove(out_inv_viz)
+                print(f"   已删除中间文件: track_result_inv_viz.mp4")
+            except Exception:
+                pass
     else:
         print("[拼合] 缺少温度数据或锅区域配置，跳过 IR 拼合")
 
@@ -2520,7 +2832,7 @@ def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path, inverse_rows=None
         t_inv, v_inv = _extract(inverse_rows, 3)
         if t_inv:
             ax.plot(t_inv, v_inv, color="#9B59B6", lw=1.5,
-                    linestyle="--", label="Inverse (Wok−Bottom)")
+                    label="Inverse (Wok−Bottom)")
 
     title = ("Food Temperature — Four Strategies Comparison"
              if inverse_rows else "Food Temperature — Three Strategies Comparison")
