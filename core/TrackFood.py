@@ -17,6 +17,7 @@ TrackFood.py — SAM2 视频追踪食材 + 温度融合（分批处理版）
 import os
 import sys
 import json
+import argparse
 import shutil
 import glob
 import re
@@ -38,6 +39,7 @@ except ImportError:
 
 # ── 路径基准（本文件所在目录）────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 
 # ── 配置 ─────────────────────────────────────────────────────────────────────
 LABELS_JSON     = os.path.join(_HERE, "food_labels.json")
@@ -91,6 +93,137 @@ RELABEL_INTERVAL_S = 4
 
 # 临时帧目录（放在 core/ 下）
 TMP_BASE        = os.path.join(_HERE, "tmp_sam2_frames")
+
+
+def _resolve_project_path(path, base_dir=None):
+    if path is None:
+        return None
+    path = os.path.expanduser(str(path))
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    if base_dir:
+        by_config = os.path.normpath(os.path.join(base_dir, path))
+        if os.path.exists(by_config):
+            return by_config
+    return os.path.normpath(os.path.join(_PROJECT_ROOT, path))
+
+
+def _load_run_config(path):
+    if not path:
+        return {}, None
+    config_path = _resolve_project_path(path)
+    if not os.path.exists(config_path):
+        print(f"[error] run config not found: {config_path}")
+        sys.exit(1)
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f), os.path.dirname(config_path)
+
+
+def _cfg_first(config, *keys):
+    for key in keys:
+        value = config.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _build_ir_wok_mask(wok_cfg, ir_shape):
+    ir_h, ir_w = ir_shape
+    mask = np.zeros((ir_h, ir_w), dtype=np.uint8)
+    cv2.ellipse(
+        mask,
+        (int(wok_cfg["cx"]), int(wok_cfg["cy"])),
+        (int(wok_cfg["rx"]), int(wok_cfg["ry"])),
+        0,
+        0,
+        360,
+        255,
+        -1,
+    )
+    return mask > 0
+
+
+def _load_ir_wok_region(wok_cfg_path, temp_data):
+    if temp_data is None:
+        print("[IR Mask] skipped: no temperature data")
+        return None, None
+    if not os.path.exists(wok_cfg_path):
+        print(f"[IR Mask] skipped: wok config not found: {wok_cfg_path}")
+        return None, None
+
+    with open(wok_cfg_path, "r", encoding="utf-8") as f:
+        wok_cfg = json.load(f)
+    wok_mask_ir = _build_ir_wok_mask(wok_cfg, temp_data.shape[1:3])
+    print(f"[IR Mask] loaded: {wok_cfg_path}")
+    print(
+        f"  cx={wok_cfg['cx']} cy={wok_cfg['cy']} "
+        f"rx={wok_cfg['rx']} ry={wok_cfg['ry']}  "
+        f"pixels={int(wok_mask_ir.sum())}"
+    )
+    return wok_cfg, wok_mask_ir
+
+
+def _estimate_ir_frame_translation(prev_ir, curr_ir, max_shift=20.0, min_response=0.08):
+    if prev_ir is None or curr_ir is None or prev_ir.shape != curr_ir.shape:
+        return 0.0, 0.0, 0.0, False
+
+    def _prep(frame):
+        img = np.asarray(frame, dtype=np.float32)
+        finite = np.isfinite(img)
+        if not finite.any():
+            return None
+        lo, hi = np.percentile(img[finite], [2, 98])
+        if hi <= lo:
+            return None
+        img = np.clip(img, lo, hi)
+        img = (img - lo) / max(hi - lo, 1e-6)
+        img = cv2.GaussianBlur(img, (3, 3), 0)
+        img = img - cv2.GaussianBlur(img, (0, 0), 5)
+        return img.astype(np.float32)
+
+    prev = _prep(prev_ir)
+    curr = _prep(curr_ir)
+    if prev is None or curr is None:
+        return 0.0, 0.0, 0.0, False
+
+    try:
+        win = cv2.createHanningWindow((prev.shape[1], prev.shape[0]), cv2.CV_32F)
+        (dx, dy), response = cv2.phaseCorrelate(prev, curr, win)
+    except Exception:
+        return 0.0, 0.0, 0.0, False
+
+    if (not np.isfinite(dx) or not np.isfinite(dy)
+            or not np.isfinite(response)
+            or abs(dx) > max_shift or abs(dy) > max_shift
+            or response < min_response):
+        return float(dx), float(dy), float(response), False
+    return float(dx), float(dy), float(response), True
+
+
+def _translate_binary_mask(mask, dx, dy):
+    if mask is None:
+        return None
+    h, w = mask.shape[:2]
+    mat = np.array([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]], dtype=np.float32)
+    moved = cv2.warpAffine(
+        mask.astype(np.uint8),
+        mat,
+        (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return moved > 0
+
+
+def _project_ir_wok_to_rgb_constraint(wok_mask_ir, homography, rgb_shape):
+    if wok_mask_ir is None or homography is None:
+        return None
+    rgb_h, rgb_w = rgb_shape
+    h_inv = np.linalg.inv(homography)
+    wok_u8 = wok_mask_ir.astype(np.uint8) * 255
+    projected = cv2.warpPerspective(wok_u8, h_inv, (rgb_w, rgb_h))
+    return projected > 64
 
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -372,6 +505,26 @@ def map_mask_to_ir(rgb_mask, homography, ir_shape):
     return ir_mask
 
 
+def _measure_rgb_mask_temperature(rgb_mask, temp_data, homography, ir_idx):
+    """Map an RGB mask to IR and return mean/min/max temperature."""
+    nan_stats = (float("nan"), float("nan"), float("nan"))
+    if rgb_mask is None or temp_data is None or homography is None:
+        return nan_stats
+    if ir_idx < 0 or ir_idx >= temp_data.shape[0]:
+        return nan_stats
+
+    ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
+    ir_mask = map_mask_to_ir(rgb_mask, homography, (ir_h, ir_w))
+    food_temps = temp_data[ir_idx][ir_mask]
+    if len(food_temps) == 0:
+        return nan_stats
+    return (
+        float(np.mean(food_temps)),
+        float(np.min(food_temps)),
+        float(np.max(food_temps)),
+    )
+
+
 def flow_propagate_mask(prev_gray, cur_gray, prev_mask):
     """
     用 Farneback 稠密光流将上一帧 mask 传播到当前帧。
@@ -481,6 +634,49 @@ def _kmeans_food_temp(wok_temps, min_cluster_gap=30.0):
     dist_high = np.abs(vals - c_high)
     food_mask = dist_low <= dist_high
     return float(np.mean(vals[food_mask])) if food_mask.any() else float("nan")
+
+
+def _build_ir_food_mask_by_temperature(ir_frame, wok_mask_ir, min_cluster_gap=30.0):
+    """Build an IR food mask from the low-temperature cluster inside the wok."""
+    if ir_frame is None or wok_mask_ir is None:
+        return None
+
+    wok_temps = ir_frame[wok_mask_ir]
+    if len(wok_temps) < 10:
+        return None
+
+    c_low = float(np.percentile(wok_temps, 10))
+    c_high = float(np.percentile(wok_temps, 90))
+    for _ in range(20):
+        food_sel = np.abs(wok_temps - c_low) <= np.abs(wok_temps - c_high)
+        new_low = float(np.mean(wok_temps[food_sel])) if food_sel.any() else c_low
+        new_high = float(np.mean(wok_temps[~food_sel])) if (~food_sel).any() else c_high
+        if abs(new_low - c_low) < 0.1 and abs(new_high - c_high) < 0.1:
+            break
+        c_low, c_high = new_low, new_high
+
+    if (c_high - c_low) < min_cluster_gap:
+        return None
+
+    ys_wok, xs_wok = np.where(wok_mask_ir)
+    food_sel = np.abs(ir_frame[wok_mask_ir] - c_low) <= np.abs(ir_frame[wok_mask_ir] - c_high)
+    food_ir = np.zeros(ir_frame.shape, dtype=np.uint8)
+    food_ir[ys_wok[food_sel], xs_wok[food_sel]] = 255
+    return food_ir
+
+
+def _estimate_ir_wok_food_temp(temp_data, ir_idx, wok_mask_ir):
+    """Estimate food temperature inside the current IR wok mask."""
+    if temp_data is None or wok_mask_ir is None:
+        return float("nan")
+    if ir_idx < 0 or ir_idx >= temp_data.shape[0]:
+        return float("nan")
+
+    t_frame = temp_data[ir_idx]
+    wok_temps = t_frame[wok_mask_ir]
+    if len(wok_temps) < 10:
+        return float("nan")
+    return _kmeans_food_temp(wok_temps)
 
 
 def _estimate_wok_center_from_ir_edge(ir_frame, cx, cy, rx, ry,
@@ -1036,9 +1232,67 @@ def generate_inverse_bottom_points_from_ir(rgb_frame, ir_frame, wok_mask_ir,
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Run Chef Vision tracking")
+    parser.add_argument("--run-config", "--config", dest="run_config", default=None,
+                        help="JSON config with video/labels/temp/wok paths")
+    parser.add_argument("--labels", default=None,
+                        help="Path to food_labels.json")
+    parser.add_argument("--video", default=None,
+                        help="Override RGB video path from labels/config")
+    parser.add_argument("--temp", "--npy", dest="temp", default=None,
+                        help="Temperature npy path; omitted means auto-match from video")
+    parser.add_argument("--homography", default=None,
+                        help="Path to homography.npy")
+    parser.add_argument("--wok", "--wok-config", dest="wok_config", default=None,
+                        help="Path to wok_region.json")
+    parser.add_argument("--ir-wok-strategy", default=None,
+                        choices=("legacy", "static", "frame_shift"),
+                        help="IR wok update strategy: legacy uses old cues; static keeps the initial manual region; frame_shift translates the previous mask by IR frame registration")
+    parser.add_argument("--output-root", default=None,
+                        help="Output root directory; default is project output/")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="Optional short-run limit from the start frame; default runs the full video")
+    args = parser.parse_args()
+
+    run_config, run_config_dir = _load_run_config(args.run_config)
+    labels_json = _resolve_project_path(
+        args.labels or _cfg_first(run_config, "labels", "labels_path", "food_labels"),
+        run_config_dir
+    ) or LABELS_JSON
+    video_override = _resolve_project_path(
+        args.video or _cfg_first(run_config, "video", "video_path", "rgb_video"),
+        run_config_dir
+    )
+    homography_path = _resolve_project_path(
+        args.homography or _cfg_first(run_config, "homography", "homography_path"),
+        run_config_dir
+    ) or HOMOGRAPHY_PATH
+    wok_cfg_path = _resolve_project_path(
+        args.wok_config or _cfg_first(run_config, "wok", "wok_config", "wok_region"),
+        run_config_dir
+    ) or os.path.join(_HERE, "..", "data", "wok_region.json")
+    temp_override = _resolve_project_path(
+        args.temp or _cfg_first(run_config, "temp", "temp_path", "npy", "temperature"),
+        run_config_dir
+    )
+    ir_wok_strategy = (
+        args.ir_wok_strategy
+        or _cfg_first(run_config, "ir_wok_strategy", "wok_strategy")
+        or "legacy"
+    )
+    if ir_wok_strategy not in ("legacy", "static", "frame_shift"):
+        print(f"[error] invalid ir_wok_strategy: {ir_wok_strategy}")
+        sys.exit(1)
+    output_root = _resolve_project_path(
+        args.output_root or _cfg_first(run_config, "output_root", "output_dir"),
+        run_config_dir
+    ) or os.path.join(_HERE, "..", "output")
+    if args.run_config:
+        print(f"[config] loaded: {os.path.abspath(args.run_config)}")
+    print(f"[IR Mask] strategy={ir_wok_strategy}")
     # ── 创建时间戳输出子目录 ──────────────────────────────────────────────────
     run_ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir  = os.path.join(_HERE, "..", "output", run_ts)
+    out_dir  = os.path.join(output_root, run_ts)
     os.makedirs(out_dir, exist_ok=True)
     out_video_viz = os.path.join(out_dir, "track_result_viz.mp4")
     out_csv       = os.path.join(out_dir, "food_temp_log.csv")      # noqa (reserved)
@@ -1047,12 +1301,15 @@ def main():
     print(f"[输出] 本次结果目录: {out_dir}")
 
     # ── 检查依赖文件 ──────────────────────────────────────────────────────────
-    if not os.path.exists(LABELS_JSON):
-        print(f"[错误] 找不到标注文件: {LABELS_JSON}")
+    if not os.path.exists(labels_json):
+        print(f"[error] labels file not found: {labels_json}")
         print("请先运行 LabelFirstFrame.py 完成标注")
         sys.exit(1)
 
-    video_path, start_frame, keyframes, bottom_keyframes = load_labels(LABELS_JSON)
+    video_path, start_frame, keyframes, bottom_keyframes = load_labels(labels_json)
+    if video_override:
+        print(f"[config] override video path: {video_override}")
+        video_path = video_override
     # 第一个关键帧用于初始标注
     first_kf  = keyframes[0]
     fg_points = first_kf["fg_points"]
@@ -1078,7 +1335,7 @@ def main():
     # ── wok_rgb_region 的读取参数（先存起来，等 VH/VW 初始化后再构建 mask）──
     _wok_rgb_json = {}
     try:
-        with open(LABELS_JSON, "r", encoding="utf-8") as _f_wok:
+        with open(labels_json, "r", encoding="utf-8") as _f_wok:
             _wok_rgb_json = json.load(_f_wok)
     except Exception:
         pass
@@ -1094,10 +1351,15 @@ def main():
     VW           = int(cap_info.get(cv2.CAP_PROP_FRAME_WIDTH))
     VH           = int(cap_info.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap_info.release()
-    track_frames = total_frames - start_frame
+    track_end_frame = total_frames
+    if args.max_frames is not None:
+        track_end_frame = min(total_frames, start_frame + max(1, int(args.max_frames)))
+        print(f"[config] short run enabled: max_frames={args.max_frames}")
+    track_frames = max(0, track_end_frame - start_frame)
+    print(f"[config] effective track range: {start_frame} ~ {track_end_frame} ({track_frames} frames)")
     print(f"\n[视频] {video_path}")
     print(f"[视频] 分辨率: {VW}x{VH}  总帧数: {total_frames}  FPS: {fps:.1f}")
-    print(f"[视频] 追踪范围: 第 {start_frame} ~ {total_frames} 帧，共 {track_frames} 帧")
+    print(f"[视频] 追踪范围: 第 {start_frame} ~ {track_end_frame} 帧，共 {track_frames} 帧")
     print(f"[分批] 每批 {CHUNK_SIZE} 帧，共需 {(track_frames + CHUNK_SIZE - 1)//CHUNK_SIZE} 批")
 
     # ── 加载 wok_rgb_region（在 VH/VW 已知后构建静态 mask）───────────────────
@@ -1145,18 +1407,20 @@ def main():
 
     # ── 加载单应矩阵（可选）──────────────────────────────────────────────────
     homography = None
-    if os.path.exists(HOMOGRAPHY_PATH):
-        homography = np.load(HOMOGRAPHY_PATH)
-        print(f"[单应矩阵] 已加载: {HOMOGRAPHY_PATH}  shape: {homography.shape}")
+    if os.path.exists(homography_path):
+        homography = np.load(homography_path)
+        print(f"[homography] loaded: {homography_path}  shape: {homography.shape}")
         # wok_rgb 动态圆心由 refine_wok_ellipse_from_rgb（首帧RGB精化）或手动标注值初始化
         # 不再用 IR 反投影覆盖（IR→RGB 换算有系统误差，导致圆心偏移）
         if wok_rgb_cx is not None:
             print(f"[wok_rgb初始化] 初始反向语义中心: ({_wok_rgb_cx_dyn:.0f}, {_wok_rgb_cy_dyn:.0f})")
     else:
-        print(f"[单应矩阵] 未找到 {HOMOGRAPHY_PATH}，跳过温度融合")
+        print(f"[homography] missing: {homography_path}; skip temperature fusion")
 
     # ── 自动匹配温度文件 ──────────────────────────────────────────────────────
     global TEMP_NPY_PATH
+    if temp_override is not None:
+        TEMP_NPY_PATH = temp_override
     if TEMP_NPY_PATH is None:
         TEMP_NPY_PATH = find_temp_npy(video_path)
     temp_data, ir_total_frames = load_temp_data(TEMP_NPY_PATH)
@@ -1251,27 +1515,8 @@ def main():
         print(f"  提示：在 FieldCapture.py 中按 R 键设置 ROI 后会自动生成")
 
     # ── 加载 IR 锅区域配置（用于 IR 自动分割温度曲线）────────────────────────
-    wok_cfg     = None
-    wok_mask_ir = None
     IR_FOOD_PCT = 40   # 锅内低于此百分位的像素 = 菜
-    wok_cfg_path = os.path.join(_HERE, "..", "data", "wok_region.json")
-    if os.path.exists(wok_cfg_path) and temp_data is not None:
-        with open(wok_cfg_path) as f:
-            wok_cfg = json.load(f)
-        ir_h_wok = temp_data.shape[1]
-        ir_w_wok = temp_data.shape[2]
-        wok_mask_ir = np.zeros((ir_h_wok, ir_w_wok), dtype=np.uint8)
-        cv2.ellipse(wok_mask_ir,
-                    (int(wok_cfg["cx"]), int(wok_cfg["cy"])),
-                    (int(wok_cfg["rx"]), int(wok_cfg["ry"])),
-                    0, 0, 360, 255, -1)
-        wok_mask_ir = wok_mask_ir > 0
-        print(f"[IR Mask] 已加载锅区域: {wok_cfg_path}")
-        print(f"  cx={wok_cfg['cx']} cy={wok_cfg['cy']} "
-              f"rx={wok_cfg['rx']} ry={wok_cfg['ry']}  "
-              f"覆盖 {wok_mask_ir.sum()} 像素")
-    else:
-        print(f"[IR Mask] 未找到 wok_region.json 或无温度数据，跳过 IR 自动分割温度")
+    wok_cfg, wok_mask_ir = _load_ir_wok_region(wok_cfg_path, temp_data)
 
     # ── 动态 wok 中心跟踪状态（方案B：用温度梯度跟踪锅中心漂移）───────────────
     # 手持拍摄时相机抖动导致 IR 中锅的位置帧间偏移，用高温区质心动态修正 cx/cy
@@ -1296,6 +1541,15 @@ def main():
     _wok_rgb_ir_offset_x = 0.0
     _wok_rgb_ir_offset_y = 0.0
     _wok_rgb_ir_offset_ready = False
+    _frame_shift_prev_ir = None
+    _frame_shift_prev_ir_idx = None
+    _frame_shift_total_dx = 0.0
+    _frame_shift_total_dy = 0.0
+    if ir_wok_strategy == "frame_shift" and temp_data is not None and wok_mask_ir is not None:
+        _frame_shift_prev_ir_idx = _get_ir_idx(start_frame)
+        if _frame_shift_prev_ir_idx < temp_data.shape[0]:
+            _frame_shift_prev_ir = temp_data[_frame_shift_prev_ir_idx].copy()
+            print(f"[IR Mask] frame_shift reference IR frame={_frame_shift_prev_ir_idx}")
 
     # ── 分批追踪主循环（SAM2 + 光流混合）────────────────────────────────────
     # 真正的混合模式：
@@ -1314,7 +1568,7 @@ def main():
         # 混合模式下：SAM2 每隔 N 帧处理 1 帧，其余帧光流传播
         # 将追踪范围按锚点帧切分
         anchor_frames = list(range(start_frame,
-                                   total_frames,
+                                   track_end_frame,
                                    OPTICAL_FLOW_INTERVAL))
         print(f"[混合] 共 {len(anchor_frames)} 个SAM2锚点帧，"
               f"其余 {track_frames - len(anchor_frames)} 帧用光流")
@@ -1406,10 +1660,8 @@ def main():
     _wok_rgb_constraint = None   # (VH, VW) bool
     if wok_mask_ir is not None and homography is not None:
         try:
-            _H_inv_wok = np.linalg.inv(homography)
-            _wok_u8_pre = wok_mask_ir.astype(np.uint8) * 255
-            _wok_proj   = cv2.warpPerspective(_wok_u8_pre, _H_inv_wok, (VW, VH))
-            _wok_rgb_constraint = _wok_proj > 64
+            _wok_rgb_constraint = _project_ir_wok_to_rgb_constraint(
+                wok_mask_ir, homography, (VH, VW))
             # Inverse mode uses this IR->RGB projected wok mask directly.
             # Disable the RGB ellipse path to avoid extra center/radius correction.
             wok_rgb_mask_static = None
@@ -1449,9 +1701,45 @@ def main():
         n_chunks = (track_frames + CHUNK_SIZE - 1) // CHUNK_SIZE
         for chunk_i in range(n_chunks):
             chunk_start_abs = start_frame + chunk_i * CHUNK_SIZE
-            chunk_end_abs   = min(chunk_start_abs + CHUNK_SIZE, total_frames)
+            chunk_end_abs   = min(chunk_start_abs + CHUNK_SIZE, track_end_frame)
             chunk_len       = chunk_end_abs - chunk_start_abs
             chunk_start_s   = chunk_start_abs / fps
+
+            if (ir_wok_strategy == "frame_shift"
+                    and temp_data is not None
+                    and wok_mask_ir is not None):
+                try:
+                    _ir_idx_shift = _get_ir_idx(chunk_start_abs)
+                    if _ir_idx_shift < temp_data.shape[0]:
+                        _ir_frame_shift = temp_data[_ir_idx_shift]
+                        if (_frame_shift_prev_ir is not None
+                                and _frame_shift_prev_ir_idx != _ir_idx_shift):
+                            _dx, _dy, _resp, _ok = _estimate_ir_frame_translation(
+                                _frame_shift_prev_ir, _ir_frame_shift)
+                            if _ok:
+                                wok_mask_ir = _translate_binary_mask(wok_mask_ir, _dx, _dy)
+                                _wok_mask_al = wok_mask_ir.copy()
+                                _wok_cx += _dx
+                                _wok_cy += _dy
+                                _frame_shift_total_dx += _dx
+                                _frame_shift_total_dy += _dy
+                                if homography is not None:
+                                    _wok_rgb_constraint = _project_ir_wok_to_rgb_constraint(
+                                        wok_mask_ir, homography, (VH, VW))
+                                    wok_rgb_mask_static = None
+                                _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
+                                print(f"[IR Mask] frame_shift f={chunk_start_abs} "
+                                      f"ir={_frame_shift_prev_ir_idx}->{_ir_idx_shift} "
+                                      f"dx={_dx:.2f} dy={_dy:.2f} resp={_resp:.3f} "
+                                      f"total=({_frame_shift_total_dx:.1f},{_frame_shift_total_dy:.1f})")
+                            else:
+                                print(f"[IR Mask] frame_shift skip f={chunk_start_abs} "
+                                      f"ir={_frame_shift_prev_ir_idx}->{_ir_idx_shift} "
+                                      f"dx={_dx:.2f} dy={_dy:.2f} resp={_resp:.3f}")
+                        _frame_shift_prev_ir = _ir_frame_shift.copy()
+                        _frame_shift_prev_ir_idx = _ir_idx_shift
+                except Exception as _fs_e:
+                    print(f"[IR Mask] frame_shift failed: {_fs_e}")
 
             print(f"\n{'='*55}")
             print(f"[批次 {chunk_i+1}/{n_chunks}] 帧 {chunk_start_abs} ~ {chunk_end_abs-1}"
@@ -1464,7 +1752,8 @@ def main():
             #   2. 形态学闭运算填充热环，得到完整锅圈
             #   3. 在锅圈内部找最大低温连通域（< 50百分位）= 旋转轴
             #   4. 旋转轴质心 = 锅的几何圆心
-            if (wok_cfg is not None and temp_data is not None
+            if (ir_wok_strategy == "legacy"
+                    and wok_cfg is not None and temp_data is not None
                     and _wok_mask_al is not None and homography is not None):
                 try:
                     _ir_idx_wok_upd = _get_ir_idx(chunk_start_abs)
@@ -1530,10 +1819,8 @@ def main():
                                         0, 0, 360, 255, -1)
                             wok_mask_ir = _wm_new > 0
                             _wok_mask_al = wok_mask_ir.copy()
-                            _H_inv_wok2 = np.linalg.inv(homography)
-                            _wok_u8_2 = wok_mask_ir.astype(np.uint8) * 255
-                            _wok_proj2 = cv2.warpPerspective(_wok_u8_2, _H_inv_wok2, (VW, VH))
-                            _wok_rgb_constraint = _wok_proj2 > 64
+                            _wok_rgb_constraint = _project_ir_wok_to_rgb_constraint(
+                                wok_mask_ir, homography, (VH, VW))
                             wok_rgb_mask_static = None
                             _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
                             print(f"[wok-hot] t={chunk_start_s:.1f}s  "
@@ -1621,10 +1908,8 @@ def main():
                                                 0, 0, 360, 255, -1)
                                     wok_mask_ir = _wm_new > 0
                                     _wok_mask_al = wok_mask_ir.copy()
-                                    _H_inv_wok2 = np.linalg.inv(homography)
-                                    _wok_u8_2   = wok_mask_ir.astype(np.uint8) * 255
-                                    _wok_proj2  = cv2.warpPerspective(_wok_u8_2, _H_inv_wok2, (VW, VH))
-                                    _wok_rgb_constraint = _wok_proj2 > 64
+                                    _wok_rgb_constraint = _project_ir_wok_to_rgb_constraint(
+                                        wok_mask_ir, homography, (VH, VW))
                                     wok_rgb_mask_static = None
                                     _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
                                     print(f"[wok更新] t={chunk_start_s:.1f}s  "
@@ -2380,22 +2665,9 @@ def main():
                         try:
                             _ir_idx_fr = _get_ir_idx(abs_idx)
                             _ir_frm_fr = temp_data[_ir_idx_fr]
-                            _wok_t_fr  = _ir_frm_fr[_wok_mask_al]
-                            if len(_wok_t_fr) >= 10:
-                                _kl = float(np.percentile(_wok_t_fr, 10))
-                                _kh = float(np.percentile(_wok_t_fr, 90))
-                                for _ in range(20):
-                                    _fl = np.abs(_wok_t_fr-_kl) <= np.abs(_wok_t_fr-_kh)
-                                    _nl = float(np.mean(_wok_t_fr[_fl]))  if _fl.any()  else _kl
-                                    _nh = float(np.mean(_wok_t_fr[~_fl])) if (~_fl).any() else _kh
-                                    if abs(_nl-_kl)<0.1 and abs(_nh-_kh)<0.1: break
-                                    _kl, _kh = _nl, _nh
-                                if (_kh - _kl) >= 30.0:
-                                    _ys_w, _xs_w = np.where(_wok_mask_al)
-                                    _food_fl = (np.abs(_ir_frm_fr[_wok_mask_al]-_kl)
-                                                <= np.abs(_ir_frm_fr[_wok_mask_al]-_kh))
-                                    _food_ir = np.zeros(_ir_frm_fr.shape, dtype=np.uint8)
-                                    _food_ir[_ys_w[_food_fl], _xs_w[_food_fl]] = 255
+                            _food_ir = _build_ir_food_mask_by_temperature(
+                                _ir_frm_fr, _wok_mask_al, min_cluster_gap=30.0)
+                            if _food_ir is not None:
                                     _ys_f, _xs_f = np.where(_food_ir > 0)
                                     if len(_xs_f) >= 6:
                                         _pts_h = np.stack([_xs_f.astype(float),
@@ -2435,18 +2707,8 @@ def main():
                             print(f"[IR-fix异常] {_irfix_e}")
 
                 vis       = render_overlay(frame, mask, MASK_COLOR, MASK_ALPHA)
-                temp_mean = temp_min = temp_max = float("nan")
-                if temp_data is not None and homography is not None:
-                    ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
-                    ir_mask    = map_mask_to_ir(mask, homography, (ir_h, ir_w))
-                    ir_idx     = _get_ir_idx(abs_idx)
-                    if ir_idx < temp_data.shape[0]:
-                        t_frame    = temp_data[ir_idx]
-                        food_temps = t_frame[ir_mask]
-                        if len(food_temps) > 0:
-                            temp_mean = float(np.mean(food_temps))
-                            temp_min  = float(np.min(food_temps))
-                            temp_max  = float(np.max(food_temps))
+                temp_mean, temp_min, temp_max = _measure_rgb_mask_temperature(
+                    mask, temp_data, homography, _get_ir_idx(abs_idx))
 
                 time_s     = abs_idx / fps
                 mask_ratio = mask.sum() / mask.size * 100
@@ -2500,11 +2762,8 @@ def main():
                 ir_mask_temp = float("nan")
                 if wok_mask_ir is not None and temp_data is not None:
                     ir_idx_wok = _get_ir_idx(abs_idx)
-                    if ir_idx_wok < temp_data.shape[0]:
-                        t_frame_wok = temp_data[ir_idx_wok]
-                        wok_temps   = t_frame_wok[wok_mask_ir]
-                        if len(wok_temps) >= 10:
-                            ir_mask_temp = _kmeans_food_temp(wok_temps)
+                    ir_mask_temp = _estimate_ir_wok_food_temp(
+                        temp_data, ir_idx_wok, wok_mask_ir)
                 if not np.isnan(ir_mask_temp):
                     ir_mask_history.append((time_s, ir_mask_temp))
 
@@ -2527,7 +2786,9 @@ def main():
                         if _bm_raw is not None:
                             _bm_full = upscale_mask(_bm_raw, orig_wh) if do_resize else _bm_raw
                             # 构建动态锅椭圆 mask（用更新后的中心）
-                            if wok_rgb_mask_static is not None:
+                            if _wok_rgb_constraint is not None:
+                                _dyn_wok_bool = _wok_rgb_constraint
+                            elif wok_rgb_mask_static is not None:
                                 # 用动态中心重建椭圆
                                 _dyn_wok_mask = np.zeros((VH, VW), dtype=np.uint8)
                                 cv2.ellipse(_dyn_wok_mask,
@@ -2539,9 +2800,7 @@ def main():
                                 _dyn_wok_bool = _dyn_wok_mask > 0
                             else:
                                 # fallback：用 IR 反投影的锅约束
-                                _dyn_wok_bool = (_wok_rgb_constraint
-                                                 if _wok_rgb_constraint is not None
-                                                 else np.ones((VH, VW), dtype=bool))
+                                _dyn_wok_bool = np.ones((VH, VW), dtype=bool)
                             # inverse_mask = 锅内区域 AND NOT 锅底
                             _raw_inv_mask = _dyn_wok_bool & ~_bm_full
                             _wok_px_inv = int(_dyn_wok_bool.sum())
@@ -2711,7 +2970,9 @@ def main():
                         _bm_r2 = bottom_chunk_masks.get(local_in_chunk)
                         if _bm_r2 is not None:
                             _bm_f2 = upscale_mask(_bm_r2, orig_wh) if do_resize else _bm_r2
-                            if wok_rgb_mask_static is not None:
+                            if _wok_rgb_constraint is not None:
+                                _inv_vis_mask = _wok_rgb_constraint & ~_bm_f2
+                            elif wok_rgb_mask_static is not None:
                                 _dyn2 = np.zeros((VH, VW), dtype=np.uint8)
                                 cv2.ellipse(_dyn2,
                                             (int(round(_wok_rgb_cx_dyn)),
@@ -2721,9 +2982,7 @@ def main():
                                             0, 0, 360, 255, -1)
                                 _inv_vis_mask = (_dyn2 > 0) & ~_bm_f2
                             else:
-                                _fb = (_wok_rgb_constraint
-                                       if _wok_rgb_constraint is not None
-                                       else np.ones((VH, VW), dtype=bool))
+                                _fb = np.ones((VH, VW), dtype=bool)
                                 _inv_vis_mask = _fb & ~_bm_f2
                             vis_inv = render_overlay(frame, _inv_vis_mask,
                                                      (200, 80, 255), MASK_ALPHA)
@@ -2809,7 +3068,7 @@ def main():
         n_total    = len(anchor_frames)
         anchor_cnt = 0
 
-        for abs_idx in range(start_frame, total_frames):
+        for abs_idx in range(start_frame, track_end_frame):
             ret, frame = cap.read()
             if not ret:
                 break
@@ -2863,18 +3122,8 @@ def main():
             flow_prev_mask = mask
 
             # 温度统计
-            temp_mean = temp_min = temp_max = float("nan")
-            if temp_data is not None and homography is not None:
-                ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
-                ir_mask    = map_mask_to_ir(mask, homography, (ir_h, ir_w))
-                ir_idx     = _get_ir_idx(abs_idx)
-                if ir_idx < temp_data.shape[0]:
-                    t_frame    = temp_data[ir_idx]
-                    food_temps = t_frame[ir_mask]
-                    if len(food_temps) > 0:
-                        temp_mean = float(np.mean(food_temps))
-                        temp_min  = float(np.min(food_temps))
-                        temp_max  = float(np.max(food_temps))
+            temp_mean, temp_min, temp_max = _measure_rgb_mask_temperature(
+                mask, temp_data, homography, _get_ir_idx(abs_idx))
 
             time_s     = abs_idx / fps
             mask_ratio = mask.sum() / mask.size * 100
@@ -2903,7 +3152,7 @@ def main():
 
         cap.release()
         print()
-        global_local = total_frames - start_frame
+        global_local = track_end_frame - start_frame
 
     writer.release()
     if writer_inv is not None:

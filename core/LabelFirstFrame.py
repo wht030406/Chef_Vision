@@ -66,10 +66,54 @@ import argparse
 
 # ── 路径基准（本文件所在目录）────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 
 # ── 配置 ─────────────────────────────────────────────────────────────────────
 VIDEO_PATH   = os.path.join(_HERE, "..", "test_data", "test4", "rgb_20260616_151415.mp4")
 OUTPUT_JSON  = os.path.join(_HERE, "food_labels.json")
+
+
+def _resolve_project_path(path, base_dir=None):
+    if path is None:
+        return None
+    path = os.path.expanduser(str(path))
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    if base_dir:
+        by_config = os.path.normpath(os.path.join(base_dir, path))
+        if os.path.exists(by_config):
+            return by_config
+    return os.path.normpath(os.path.join(_PROJECT_ROOT, path))
+
+
+def _load_run_config(path):
+    if not path:
+        return {}, None
+    config_path = _resolve_project_path(path)
+    if not os.path.exists(config_path):
+        print(f"[error] run config not found: {config_path}")
+        sys.exit(1)
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f), os.path.dirname(config_path)
+
+
+def _cfg_first(config, *keys):
+    for key in keys:
+        value = config.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _video_from_labels(labels_path):
+    if not labels_path or not os.path.exists(labels_path):
+        return None
+    try:
+        with open(labels_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("video_path")
+    except Exception:
+        return None
 SKIP_FRAMES  = 30      # ← → 键每次跳多少帧
 
 
@@ -120,18 +164,18 @@ def load_or_init_labels(json_path, video_path, fps):
 def save_labels(data, json_path):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    print(f"\n✅ 已保存到: {json_path}")
-    print(f"   共 {len(data['keyframes'])} 个关键帧标注：")
+    print(f"\n[saved] {json_path}")
+    print(f"   food keyframes: {len(data['keyframes'])}")
     for kf in data["keyframes"]:
-        print(f"     帧 {kf['frame']:6d} ({kf['time_s']:.1f}s)  "
-              f"标签={kf['label']}  "
+        print(f"     frame {kf['frame']:6d} ({kf['time_s']:.1f}s)  "
+              f"label={kf['label']}  "
               f"FG={len(kf['fg_points'])}  BG={len(kf['bg_points'])}")
 
 
 # ── 绘制 ──────────────────────────────────────────────────────────────────────
 
 def draw_frame(frame, fg_points, bg_points, frame_idx, total_frames, fps,
-               mode_label="初始标注", existing_kf_count=0):
+               mode_label="initial_food", existing_kf_count=0):
     """在帧上绘制已标注的点和信息"""
     vis = frame.copy()
     H, W = vis.shape[:2]
@@ -156,15 +200,15 @@ def draw_frame(frame, fg_points, bg_points, frame_idx, total_frames, fps,
 
     cv2.putText(vis, f"Frame: {frame_idx}/{total_frames}  Time: {m:02d}:{s:02d}",
                 (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-    cv2.putText(vis, f"模式: {mode_label}  已有关键帧: {existing_kf_count} 个",
+    cv2.putText(vis, f"Mode: {mode_label}  existing food keyframes: {existing_kf_count}",
                 (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.50, mode_color, 1)
     cv2.putText(vis, f"FG points: {len(fg_points)}  BG points: {len(bg_points)}",
                 (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (100, 255, 100), 1)
     cv2.putText(vis,
-                "[LMB]=前景  [RMB]=背景  [Z]=撤销  [S]=保存  [Q]=退出  [</>]=跳帧",
+                "[LMB]=FG  [RMB]=BG  [Z]=Undo  [S]=Save  [Q]=Quit  [</>]=Frame",
                 (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1)
     cv2.putText(vis,
-                "左键点食材(绿)，右键点锅底/锅外(红)，不需要排除搅拌爪",
+                "Food mode: LMB on food, RMB on background/wok. Bottom mode: LMB on bottom, RMB on food.",
                 (10, 97), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 220, 255), 1)
 
     return vis
@@ -355,36 +399,56 @@ def run_wok_rgb_label(cap, total_frames, fps, W, H, data, output_json, start_idx
 # ── 主程序 ────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="食材关键帧标注工具")
+    run_parser = argparse.ArgumentParser(add_help=False)
+    run_parser.add_argument("--run-config", "--config", dest="run_config", default=None)
+    run_args, _ = run_parser.parse_known_args()
+    run_config, run_config_dir = _load_run_config(run_args.run_config)
+    parser = argparse.ArgumentParser(description="Food keyframe labeling tool")
+    parser.add_argument("--run-config", "--config", dest="run_config", default=None,
+                        help="JSON config with video/labels paths")
+    parser.add_argument("--food", action="store_true",
+                        help="Label/replace the single main food reference keyframe")
     parser.add_argument("--append",  action="store_true",
-                        help="追加模式：在已有 JSON 中追加新关键帧（不覆盖旧标注）")
+                        help="Append a new food keyframe to the existing labels JSON")
     parser.add_argument("--bottom",  action="store_true",
-                        help="锅底标注模式：标注锅底区域（保存到 bottom_keyframes），"
-                             "TrackFood 会用 inverse mask（锅区域-锅底）追踪食材")
+                        help="Label wok-bottom points for inverse semantic tracking")
     parser.add_argument("--wok-rgb", action="store_true", dest="wok_rgb",
-                        help="RGB 锅区域标注：左键点锅边缘 5+ 个点、右键点锅中心，"
-                             "自动拟合椭圆并保存到 food_labels.json 的 wok_rgb_region 字段")
+                        help="Label RGB wok ellipse points and save wok_rgb_region")
     parser.add_argument("--frame",   type=int, default=None,
-                        help="追加/锅底/wok-rgb 模式下，直接跳到指定帧号开始标注")
+                        help="Start labeling from this frame")
     parser.add_argument("--label",   type=str, default=None,
-                        help="本次标注的说明标签，如 '青椒入锅'")
-    parser.add_argument("--video",   type=str, default=VIDEO_PATH,
-                        help="视频路径（默认使用脚本顶部 VIDEO_PATH）")
-    parser.add_argument("--output",  type=str, default=OUTPUT_JSON,
-                        help="输出 JSON 路径")
+                        help="Label text for this annotation")
+    parser.add_argument("--video",   type=str, default=None,
+                        help="RGB video path; defaults to config, labels JSON, then VIDEO_PATH")
+    parser.add_argument("--output", "--labels", dest="output", type=str, default=None,
+                        help="Output labels JSON path")
     args = parser.parse_args()
+    selected_modes = [args.food, args.append, args.bottom, args.wok_rgb]
+    if sum(1 for enabled in selected_modes if enabled) > 1:
+        print("[error] choose only one mode: --food, --append, --bottom, or --wok-rgb")
+        sys.exit(1)
 
-    video_path  = args.video
-    output_json = args.output
+    output_json = _resolve_project_path(
+        args.output or _cfg_first(run_config, "labels", "labels_path", "food_labels"),
+        run_config_dir
+    ) or OUTPUT_JSON
+    video_path = _resolve_project_path(
+        args.video
+        or _cfg_first(run_config, "video", "video_path", "rgb_video")
+        or _video_from_labels(output_json),
+        run_config_dir
+    ) or VIDEO_PATH
+    if args.run_config:
+        print(f"[config] loaded: {os.path.abspath(args.run_config)}")
 
     # ── 检查视频 ──────────────────────────────────────────────────────────────
     if not os.path.exists(video_path):
-        print(f"[错误] 找不到视频: {video_path}")
+        print(f"[error] video not found: {video_path}")
         sys.exit(1)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"[错误] 无法打开视频: {video_path}")
+        print(f"[error] failed to open video: {video_path}")
         sys.exit(1)
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -392,9 +456,9 @@ def main():
     W            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    print(f"[视频] {video_path}")
-    print(f"[视频] 分辨率: {W}x{H}  帧数: {total_frames}  FPS: {fps:.1f}")
-    print(f"[视频] 时长: {total_frames/fps:.1f}s")
+    print(f"[video] {video_path}")
+    print(f"[video] size={W}x{H}  frames={total_frames}  fps={fps:.1f}")
+    print(f"[video] duration={total_frames/fps:.1f}s")
     print()
 
     # ── 加载已有 JSON（或初始化）──────────────────────────────────────────────
@@ -416,51 +480,57 @@ def main():
         return
 
     # ── 确定模式和起始帧 ──────────────────────────────────────────────────────
-    is_bottom = args.bottom   # 锅底标注模式
+    is_bottom = args.bottom
     if is_bottom:
         existing_bottom_count = len(data.get("bottom_keyframes", []))
-        mode_label  = args.label or "锅底初始标注"
+        mode_label  = args.label or "initial_bottom"
         current_idx = args.frame if args.frame is not None else 0
         current_idx = max(0, min(current_idx, total_frames - 1))
-        print(f"[锅底模式] 标注锅底区域，结果存入 bottom_keyframes")
-        print(f"[锅底模式] 标签: {mode_label}  起始帧: {current_idx}")
-        print("[锅底模式] 左键点锅底暗纹/烧焦区（绿），右键点食材/锅壁（红）")
+        print("[mode] RGB inverse semantic / wok-bottom reference")
+        print(f"[mode] save target: bottom_keyframes  label={mode_label}  frame={current_idx}")
+        print("[how] Left click = wok bottom/body. Right click = food or non-bottom background.")
         print()
     elif args.append:
         if existing_kf_count == 0:
-            print("[提示] JSON 中暂无关键帧，追加模式等同于初始标注")
-        mode_label = args.label or f"关键帧 #{existing_kf_count + 1}"
+            print("[note] No food keyframes exist yet; append acts like the first food label.")
+        mode_label = args.label or f"food_keyframe_{existing_kf_count + 1}"
         current_idx = args.frame if args.frame is not None else 0
         current_idx = max(0, min(current_idx, total_frames - 1))
-        print(f"[追加模式] 将在第 {current_idx} 帧追加关键帧标注")
-        print(f"[追加模式] 标签: {mode_label}")
+        print("[mode] RGB forward tracking / append extra food keyframe")
+        print(f"[mode] save target: keyframes append/replace  label={mode_label}  frame={current_idx}")
     else:
-        # 初始模式：第一次标注，若 JSON 已有数据给出提示
+        # Main food reference mode: one manual reference, later updates stay automatic.
         if existing_kf_count > 0:
-            print(f"[警告] food_labels.json 中已有 {existing_kf_count} 个关键帧标注！")
-            print("  若继续初始标注，将【覆盖】第一个关键帧（其余关键帧保留）")
-            print("  如需追加，请用：python LabelFirstFrame.py --append --frame N")
+            print(f"[note] Existing food keyframes: {existing_kf_count}")
+            if args.food:
+                print("[note] --food will replace all food keyframes with this single reference.")
+            else:
+                print("[note] Default food mode replaces the first food keyframe and keeps later ones.")
+            print("[note] Use --append only when you intentionally want an extra food keyframe.")
             print()
-        mode_label  = args.label or "初始标注"
-        current_idx = 0
+        mode_label  = args.label or "initial_food"
+        current_idx = args.frame if args.frame is not None else 0
+        current_idx = max(0, min(current_idx, total_frames - 1))
+        print("[mode] RGB forward tracking / main food reference")
+        print(f"[mode] save target: keyframes[0]  label={mode_label}  frame={current_idx}")
 
     print()
     print("=" * 60)
-    print("操作说明：")
-    print("  → / D               : 前进 30 帧")
-    print("  ← / A               : 后退 30 帧")
-    print("  ] / .               : 前进 1 帧（精细调整）")
-    print("  [ / ,               : 后退 1 帧（精细调整）")
-    print("  Page Down / Up      : 前进/后退 300 帧（快速跳转）")
-    print("  数字键 0-9          : 跳到视频 0%~90% 位置")
-    print("  左键点击             : 添加前景点（绿色，点在食材上）")
-    print("  右键点击             : 添加背景点（红色，点在锅底/锅外）")
-    print("  Z                   : 撤销上一个点")
-    print("  S                   : 保存标注并退出")
-    print("  Q                   : 退出不保存")
+    print("Controls:")
+    print("  D / Right Arrow      : forward 30 frames")
+    print("  A / Left Arrow       : back 30 frames")
+    print("  ] / .                : forward 1 frame")
+    print("  [ / ,                : back 1 frame")
+    print("  Page Down / Page Up  : forward/back 300 frames")
+    print("  Number 0-9           : jump to 0%-90% of the video")
+    print("  Left click           : add FG point")
+    print("  Right click          : add BG point")
+    print("  Z                    : undo last point")
+    print("  S                    : save and exit")
+    print("  Q                    : quit without saving")
     print()
     if args.append:
-        print("【追加模式】：搅拌爪不需要作为背景排除，只标食材前景点即可")
+        print("[append mode] Use this only for intentional extra food keyframes.")
     print("=" * 60)
     print()
 
@@ -468,7 +538,7 @@ def main():
     bg_points  = []
     all_points = []   # (x, y, label) 用于撤销
 
-    win_name = "LabelFirstFrame — 标注食材（先跳帧，再点击）"
+    win_name = "LabelFirstFrame - food/bottom labeling"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, min(W, 1280), min(H + 10, 740))
 
@@ -477,11 +547,11 @@ def main():
         if event == cv2.EVENT_LBUTTONDOWN:
             fg_points.append([x, y])
             all_points.append((x, y, 1))
-            print(f"  + 前景点: ({x}, {y})  共 {len(fg_points)} 个")
+            print(f"  + FG point ({x}, {y})  total={len(fg_points)}")
         elif event == cv2.EVENT_RBUTTONDOWN:
             bg_points.append([x, y])
             all_points.append((x, y, 0))
-            print(f"  - 背景点: ({x}, {y})  共 {len(bg_points)} 个")
+            print(f"  - BG point ({x}, {y})  total={len(bg_points)}")
         # 重绘
         frame_now = param["frame"]
         if frame_now is not None:
@@ -496,7 +566,7 @@ def main():
     while True:
         frame = _get_frame(cap, current_idx)
         if frame is None:
-            print(f"[警告] 无法读取第 {current_idx} 帧")
+            print(f"[warning] failed to read frame {current_idx}")
             current_idx = max(0, current_idx - 1)
             continue
 
@@ -511,7 +581,7 @@ def main():
         # ── 保存 ──────────────────────────────────────────────────────────────
         if key in (ord('s'), ord('S')):
             if len(fg_points) == 0:
-                print("[警告] 至少需要一个前景点！请先左键点击食材位置。")
+                print("[warning] At least one FG point is required.")
                 continue
 
             new_kf = {
@@ -530,24 +600,24 @@ def main():
                 existing_bframes = [kf["frame"] for kf in bkfs]
                 if current_idx in existing_bframes:
                     bidx = existing_bframes.index(current_idx)
-                    print(f"[锅底] 帧 {current_idx} 已存在，覆盖该条目")
+                    print(f"[bottom] frame {current_idx} exists; replacing it")
                     bkfs[bidx] = new_kf
                 else:
                     bkfs.append(new_kf)
                     bkfs.sort(key=lambda k: k["frame"])
                 with open(output_json, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
-                print(f"\n[锅底] 已保存到: {output_json}")
-                print(f"   bottom_keyframes 共 {len(bkfs)} 条：")
+                print(f"\n[bottom] saved: {output_json}")
+                print(f"   bottom_keyframes: {len(bkfs)} entries")
                 for kf in bkfs:
-                    print(f"     帧 {kf['frame']:6d} ({kf['time_s']:.1f}s)  "
-                          f"标签={kf['label']}  FG={len(kf['fg_points'])}  BG={len(kf['bg_points'])}")
+                    print(f"     frame {kf['frame']:6d} ({kf['time_s']:.1f}s)  "
+                          f"label={kf['label']}  FG={len(kf['fg_points'])}  BG={len(kf['bg_points'])}")
             elif args.append:
                 # 追加：检查是否已有同帧号，有则覆盖，否则追加
                 existing_frames = [kf["frame"] for kf in data["keyframes"]]
                 if current_idx in existing_frames:
                     idx = existing_frames.index(current_idx)
-                    print(f"[追加] 帧 {current_idx} 已存在，覆盖该条目")
+                    print(f"[append] frame {current_idx} exists; replacing it")
                     data["keyframes"][idx] = new_kf
                 else:
                     data["keyframes"].append(new_kf)
@@ -555,8 +625,10 @@ def main():
                     data["keyframes"].sort(key=lambda k: k["frame"])
                 save_labels(data, output_json)
             else:
-                # 初始模式：替换或新建第一个关键帧
-                if data["keyframes"]:
+                # Food mode: --food keeps a single main reference; default keeps later keyframes.
+                if args.food:
+                    data["keyframes"] = [new_kf]
+                elif data["keyframes"]:
                     data["keyframes"][0] = new_kf
                 else:
                     data["keyframes"].append(new_kf)
@@ -619,8 +691,8 @@ def main():
     cv2.destroyAllWindows()
 
     if os.path.exists(output_json):
-        print(f"\n下一步：运行 TrackFood.py 开始追踪")
-        print(f"  python TrackFood.py")
+        print("\nNext step: run tracking")
+        print("  python core\\TrackFood.py")
 
 
 def _get_frame(cap, idx):
