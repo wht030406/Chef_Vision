@@ -483,6 +483,272 @@ def _kmeans_food_temp(wok_temps, min_cluster_gap=30.0):
     return float(np.mean(vals[food_mask])) if food_mask.any() else float("nan")
 
 
+def _estimate_wok_center_from_ir_edge(ir_frame, cx, cy, rx, ry,
+                                      n_angles=160,
+                                      r_min=0.72, r_max=1.32,
+                                      min_sectors=7,
+                                      min_points=35):
+    """
+    Track the IR wok by the stable temperature cliff at the wok/outside border.
+
+    The search is centered on the previous estimate, not the original label.
+    Low-temperature food inside the wok is rejected by only looking near the
+    expected rim and requiring the samples outside the candidate edge to stay
+    cooler than the samples inside it.
+    """
+    if ir_frame is None or rx <= 1 or ry <= 1:
+        return None
+
+    h, w = ir_frame.shape[:2]
+    vals = ir_frame[np.isfinite(ir_frame)]
+    if vals.size < 100:
+        return None
+
+    temp_span = float(np.percentile(vals, 95) - np.percentile(vals, 5))
+    min_drop = max(2.5, temp_span * 0.06)
+    rs = np.linspace(r_min, r_max, 64)
+    angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
+
+    points = []
+    sectors = set()
+    kernel = np.ones(5, dtype=np.float32) / 5.0
+
+    for ai, th in enumerate(angles):
+        cos_t = np.cos(th)
+        sin_t = np.sin(th)
+        xs = np.rint(cx + rs * rx * cos_t).astype(np.int32)
+        ys = np.rint(cy + rs * ry * sin_t).astype(np.int32)
+        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        if valid.sum() < 12:
+            continue
+
+        xs_v = xs[valid]
+        ys_v = ys[valid]
+        rs_v = rs[valid]
+        ts = ir_frame[ys_v, xs_v].astype(np.float32)
+        if ts.size < 12 or not np.isfinite(ts).all():
+            continue
+
+        ts_s = np.convolve(ts, kernel, mode="same")
+        # Positive value means temperature drops when moving outward.
+        drop = ts_s[:-1] - ts_s[1:]
+        if drop.size == 0:
+            continue
+
+        bi = int(np.argmax(drop))
+        best_drop = float(drop[bi])
+        r_edge = float(rs_v[bi])
+        if best_drop < min_drop or r_edge < 0.82 or r_edge > 1.22:
+            continue
+
+        inner0 = max(0, bi - 6)
+        inner1 = max(inner0 + 1, bi - 1)
+        outer0 = min(ts_s.size - 1, bi + 2)
+        outer1 = min(ts_s.size, bi + 9)
+        if outer1 <= outer0 or inner1 <= inner0:
+            continue
+
+        inner_med = float(np.median(ts_s[inner0:inner1]))
+        outer_med = float(np.median(ts_s[outer0:outer1]))
+        if (inner_med - outer_med) < min_drop:
+            continue
+
+        _sector = ai * 16 // n_angles
+        points.append((
+            float(xs_v[bi]), float(ys_v[bi]), r_edge, th,
+            best_drop, inner_med, outer_med, _sector
+        ))
+        sectors.add(_sector)
+
+    if len(points) < min_points or len(sectors) < min_sectors:
+        return {
+            "ok": False,
+            "reason": f"edge points {len(points)}, sectors {len(sectors)}",
+        }
+
+    pts_arr = np.array([[p[0], p[1]] for p in points], dtype=np.float32)
+    r_arr = np.array([p[2] for p in points], dtype=np.float32)
+    drop_arr = np.array([p[4] for p in points], dtype=np.float32)
+    inner_arr = np.array([p[5] for p in points], dtype=np.float32)
+    sector_arr = np.array([p[7] for p in points], dtype=np.int32)
+    med_r = float(np.median(r_arr))
+    keep_radius = np.abs(r_arr - med_r) <= 0.16
+    if keep_radius.sum() < min_points:
+        return {
+            "ok": False,
+            "reason": f"rim radius unstable ({int(keep_radius.sum())}/{len(points)})",
+        }
+
+    # Prefer the clearest visible rim arc instead of trusting every weak edge.
+    _drop_thr = float(np.percentile(drop_arr[keep_radius], 65))
+    _inner_thr = float(np.percentile(inner_arr[keep_radius], 55))
+    keep_strong = keep_radius & (drop_arr >= _drop_thr) & (inner_arr >= _inner_thr)
+    strong_points_min = max(18, min_points // 2)
+    strong_sectors = set(sector_arr[keep_strong].tolist())
+    if keep_strong.sum() >= strong_points_min and len(strong_sectors) >= max(5, min_sectors - 1):
+        keep = keep_strong
+        fit_mode = "strong-rim"
+    else:
+        keep = keep_radius
+        fit_mode = "radius-rim"
+
+    pts_keep = pts_arr[keep]
+    if len(pts_keep) < 5:
+        return {"ok": False, "reason": "not enough fit points"}
+
+    try:
+        ellipse = cv2.fitEllipse(pts_keep)
+        (fit_cx, fit_cy), (ew, eh), _ = ellipse
+    except Exception as exc:
+        return {"ok": False, "reason": f"fit failed: {exc}"}
+
+    fit_rx = max(float(ew), float(eh)) / 2.0
+    fit_ry = min(float(ew), float(eh)) / 2.0
+    rx_ratio = fit_rx / max(float(rx), 1.0)
+    ry_ratio = fit_ry / max(float(ry), 1.0)
+    radius_ratio = max(fit_rx, fit_ry) / max(max(float(rx), float(ry)), 1.0)
+    if radius_ratio < 0.65 or radius_ratio > 1.45 or rx_ratio < 0.70 or rx_ratio > 1.30 or ry_ratio < 0.70 or ry_ratio > 1.30:
+        return {
+            "ok": False,
+            "reason": f"bad fit radius ratio {radius_ratio:.2f}",
+        }
+
+    return {
+        "ok": True,
+        "cx": float(fit_cx),
+        "cy": float(fit_cy),
+        "rx": float(fit_rx),
+        "ry": float(fit_ry),
+        "points": int(len(pts_keep)),
+        "sectors": int(len(set(sector_arr[keep].tolist()))),
+        "drop": float(np.median(drop_arr[keep])),
+        "fit_mode": fit_mode,
+        "radius_ratio": float(radius_ratio),
+        "rx_ratio": float(rx_ratio),
+        "ry_ratio": float(ry_ratio),
+    }
+
+
+def _estimate_wok_from_ir_hot_ring(ir_frame, cx, cy, rx, ry,
+                                   n_angles=160,
+                                   r_min=0.58, r_max=1.08,
+                                   min_sectors=7,
+                                   min_points=28):
+    """
+    Track the visible hot wok rim directly, then let the caller map it back to
+    the larger business ROI.
+    """
+    if ir_frame is None or rx <= 1 or ry <= 1:
+        return None
+
+    h, w = ir_frame.shape[:2]
+    vals = ir_frame[np.isfinite(ir_frame)]
+    if vals.size < 100:
+        return None
+
+    rs = np.linspace(r_min, r_max, 72)
+    angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
+    band_tops = []
+    points = []
+    sectors = set()
+
+    for ai, th in enumerate(angles):
+        cos_t = np.cos(th)
+        sin_t = np.sin(th)
+        xs = np.rint(cx + rs * rx * cos_t).astype(np.int32)
+        ys = np.rint(cy + rs * ry * sin_t).astype(np.int32)
+        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        if valid.sum() < 15:
+            continue
+
+        xs_v = xs[valid]
+        ys_v = ys[valid]
+        rs_v = rs[valid]
+        ts = ir_frame[ys_v, xs_v].astype(np.float32)
+        if ts.size < 15 or not np.isfinite(ts).all():
+            continue
+
+        peak_i = int(np.argmax(ts))
+        peak_t = float(ts[peak_i])
+        peak_r = float(rs_v[peak_i])
+        if peak_r < 0.64 or peak_r > 1.02:
+            continue
+
+        inner0 = max(0, peak_i - 7)
+        inner1 = max(inner0 + 1, peak_i - 2)
+        outer0 = min(ts.size - 1, peak_i + 2)
+        outer1 = min(ts.size, peak_i + 8)
+        if outer1 <= outer0 or inner1 <= inner0:
+            continue
+
+        inner_med = float(np.median(ts[inner0:inner1]))
+        outer_med = float(np.median(ts[outer0:outer1]))
+        if peak_t < inner_med or peak_t < outer_med + 1.0:
+            continue
+
+        band_tops.append(peak_t)
+        points.append((
+            float(xs_v[peak_i]), float(ys_v[peak_i]), peak_r, th,
+            peak_t, inner_med, outer_med, ai * 16 // n_angles
+        ))
+        sectors.add(ai * 16 // n_angles)
+
+    if len(points) < min_points or len(sectors) < min_sectors:
+        return {
+            "ok": False,
+            "reason": f"hot-ring points {len(points)}, sectors {len(sectors)}",
+        }
+
+    top_thr = float(np.percentile(np.array(band_tops, dtype=np.float32), 60))
+    pts_arr = np.array([[p[0], p[1]] for p in points], dtype=np.float32)
+    r_arr = np.array([p[2] for p in points], dtype=np.float32)
+    t_arr = np.array([p[4] for p in points], dtype=np.float32)
+    sector_arr = np.array([p[7] for p in points], dtype=np.int32)
+
+    med_r = float(np.median(r_arr))
+    keep_radius = np.abs(r_arr - med_r) <= 0.14
+    keep_hot = keep_radius & (t_arr >= top_thr)
+    hot_sectors = set(sector_arr[keep_hot].tolist())
+    if keep_hot.sum() >= max(18, min_points // 2) and len(hot_sectors) >= max(5, min_sectors - 1):
+        keep = keep_hot
+        fit_mode = "hot-ring"
+    else:
+        keep = keep_radius
+        fit_mode = "hot-radius"
+
+    pts_keep = pts_arr[keep]
+    if len(pts_keep) < 5:
+        return {"ok": False, "reason": "not enough hot rim points"}
+
+    try:
+        ellipse = cv2.fitEllipse(pts_keep)
+        (fit_cx, fit_cy), (ew, eh), _ = ellipse
+    except Exception as exc:
+        return {"ok": False, "reason": f"hot fit failed: {exc}"}
+
+    fit_rx = max(float(ew), float(eh)) / 2.0
+    fit_ry = min(float(ew), float(eh)) / 2.0
+    rx_ratio = fit_rx / max(float(rx), 1.0)
+    ry_ratio = fit_ry / max(float(ry), 1.0)
+    if rx_ratio < 0.45 or rx_ratio > 1.10 or ry_ratio < 0.45 or ry_ratio > 1.10:
+        return {
+            "ok": False,
+            "reason": f"hot fit radius rx={rx_ratio:.2f} ry={ry_ratio:.2f}",
+        }
+
+    return {
+        "ok": True,
+        "cx": float(fit_cx),
+        "cy": float(fit_cy),
+        "rx": float(fit_rx),
+        "ry": float(fit_ry),
+        "points": int(len(pts_keep)),
+        "sectors": int(len(set(sector_arr[keep].tolist()))),
+        "peak": float(np.median(t_arr[keep])),
+        "fit_mode": fit_mode,
+    }
+
+
 def refine_wok_ellipse_from_rgb(frame_bgr, cx, cy, rx, ry, shrink_px=8):
     """
     从 RGB 帧的锅沿亮环中精化内圆边界椭圆。
@@ -1014,6 +1280,11 @@ def main():
     _wok_cy = float(wok_cfg["cy"]) if wok_cfg is not None else 0.0
     _wok_rx = float(wok_cfg["rx"]) if wok_cfg is not None else 0.0
     _wok_ry = float(wok_cfg["ry"]) if wok_cfg is not None else 0.0
+    _wok_hot_dx = 0.0
+    _wok_hot_dy = 0.0
+    _wok_hot_sx = 1.0
+    _wok_hot_sy = 1.0
+    _wok_hot_ref_ready = False
     _WOK_MAX_DRIFT = 25   # 单批允许的最大质心漂移（IR px），防止极端帧跳变
                           # 旋转轴法精度高，可适当放宽（原15→25）
     # 动态 wok 中心历史记录：list of (abs_frame, cx, cy)
@@ -1200,6 +1471,95 @@ def main():
                     _ir_frm_wok_upd = temp_data[_ir_idx_wok_upd]
                     _ir_h_ud = _ir_frm_wok_upd.shape[0]
                     _ir_w_ud = _ir_frm_wok_upd.shape[1]
+                    _hot_fit = _estimate_wok_from_ir_hot_ring(
+                        _ir_frm_wok_upd, _wok_cx, _wok_cy, _wok_rx, _wok_ry)
+                    if _hot_fit and _hot_fit.get("ok"):
+                        _ring_cx = float(_hot_fit["cx"])
+                        _ring_cy = float(_hot_fit["cy"])
+                        _ring_rx = float(_hot_fit["rx"])
+                        _ring_ry = float(_hot_fit["ry"])
+                        if not _wok_hot_ref_ready:
+                            _wok_hot_dx = 0.0
+                            _wok_hot_dy = 0.0
+                            _wok_hot_sx = float(np.clip(
+                                _wok_rx / max(_ring_rx, 1.0), 1.02, 1.40))
+                            _wok_hot_sy = float(np.clip(
+                                _wok_ry / max(_ring_ry, 1.0), 1.02, 1.40))
+                            _wok_hot_ref_ready = True
+                            print(f"[wok-hot] expand locked  "
+                                  f"sx={_wok_hot_sx:.3f} sy={_wok_hot_sy:.3f}")
+
+                        _cx_candidate = _ring_cx
+                        _cy_candidate = _ring_cy
+                        _rx_candidate = _ring_rx * _wok_hot_sx
+                        _ry_candidate = _ring_ry * _wok_hot_sy
+                        _raw_drift = (((_cx_candidate - _wok_cx) ** 2
+                                       + (_cy_candidate - _wok_cy) ** 2) ** 0.5)
+                        _init_drift = (((_cx_candidate - float(wok_cfg["cx"])) ** 2
+                                        + (_cy_candidate - float(wok_cfg["cy"])) ** 2) ** 0.5)
+                        _WOK_MAX_INIT_DRIFT = max(12.0, max(_wok_rx, _wok_ry) * 0.28)
+                        _rx_init_ratio = _rx_candidate / max(float(wok_cfg["rx"]), 1.0)
+                        _ry_init_ratio = _ry_candidate / max(float(wok_cfg["ry"]), 1.0)
+
+                        if _raw_drift > _WOK_MAX_DRIFT:
+                            print(f"[wok-edge] t={chunk_start_s:.1f}s  "
+                                  f"reject drift={_raw_drift:.1f}px>{_WOK_MAX_DRIFT}px")
+                        elif _init_drift > _WOK_MAX_INIT_DRIFT:
+                            print(f"[wok-edge] t={chunk_start_s:.1f}s  "
+                                  f"reject cumulative={_init_drift:.1f}px>{_WOK_MAX_INIT_DRIFT:.1f}px")
+                        elif (_rx_init_ratio < 0.78 or _rx_init_ratio > 1.22
+                              or _ry_init_ratio < 0.78 or _ry_init_ratio > 1.22):
+                            print(f"[wok-edge] t={chunk_start_s:.1f}s  "
+                                  f"reject radius rx={_rx_init_ratio:.2f} ry={_ry_init_ratio:.2f}")
+                        elif _raw_drift > 0.5:
+                            _cx_old, _cy_old = _wok_cx, _wok_cy
+                            _rx_old, _ry_old = _wok_rx, _wok_ry
+                            _smooth = 0.35
+                            _r_smooth = 0.18
+                            _wok_cx = _wok_cx * (1.0 - _smooth) + _cx_candidate * _smooth
+                            _wok_cy = _wok_cy * (1.0 - _smooth) + _cy_candidate * _smooth
+                            _wok_rx = _wok_rx * (1.0 - _r_smooth) + _rx_candidate * _r_smooth
+                            _wok_ry = _wok_ry * (1.0 - _r_smooth) + _ry_candidate * _r_smooth
+                            _drift = (((_wok_cx - _cx_old) ** 2
+                                       + (_wok_cy - _cy_old) ** 2) ** 0.5)
+
+                            _wm_new = np.zeros((_ir_h_ud, _ir_w_ud), dtype=np.uint8)
+                            cv2.ellipse(_wm_new,
+                                        (int(round(_wok_cx)), int(round(_wok_cy))),
+                                        (int(round(_wok_rx)), int(round(_wok_ry))),
+                                        0, 0, 360, 255, -1)
+                            wok_mask_ir = _wm_new > 0
+                            _wok_mask_al = wok_mask_ir.copy()
+                            _H_inv_wok2 = np.linalg.inv(homography)
+                            _wok_u8_2 = wok_mask_ir.astype(np.uint8) * 255
+                            _wok_proj2 = cv2.warpPerspective(_wok_u8_2, _H_inv_wok2, (VW, VH))
+                            _wok_rgb_constraint = _wok_proj2 > 64
+                            wok_rgb_mask_static = None
+                            _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
+                            print(f"[wok-hot] t={chunk_start_s:.1f}s  "
+                                  f"cx: {_cx_old:.1f}->{_wok_cx:.1f}  "
+                                  f"cy: {_cy_old:.1f}->{_wok_cy:.1f}  "
+                                  f"rx: {_rx_old:.1f}->{_wok_rx:.1f}  "
+                                  f"ry: {_ry_old:.1f}->{_wok_ry:.1f}  "
+                                  f"raw={_raw_drift:.1f}px step={_drift:.1f}px  "
+                                  f"pts={_hot_fit['points']} sectors={_hot_fit['sectors']} "
+                                  f"peak={_hot_fit['peak']:.1f} mode={_hot_fit['fit_mode']}")
+
+                            _wok_recent_drifts.append(_drift)
+                            if len(_wok_recent_drifts) > 3:
+                                _wok_recent_drifts.pop(0)
+                            _cum_drift = sum(_wok_recent_drifts)
+                            _was_tilting = _wok_tilting
+                            _wok_tilting = (len(_wok_recent_drifts) >= 2
+                                            and _cum_drift > 30.0)
+                            if _wok_tilting and not _was_tilting:
+                                print(f"[tilt] t={chunk_start_s:.1f}s  "
+                                      f"detected quick wok motion (cum drift={_cum_drift:.1f}px)")
+                            elif _was_tilting and not _wok_tilting:
+                                print(f"[tilt] t={chunk_start_s:.1f}s  "
+                                      f"wok motion stabilized (cum drift={_cum_drift:.1f}px)")
+                    elif _hot_fit:
+                        print(f"[wok-hot] t={chunk_start_s:.1f}s  skip: {_hot_fit.get('reason')}")
                     # 宽松椭圆（1.5×）搜索范围
                     _loose_mask = np.zeros((_ir_h_ud, _ir_w_ud), dtype=np.uint8)
                     cv2.ellipse(_loose_mask,
@@ -1208,7 +1568,7 @@ def main():
                                 0, 0, 360, 255, -1)
                     _loose_mask = _loose_mask > 0
                     _all_temps_ud = _ir_frm_wok_upd[_loose_mask]
-                    if len(_all_temps_ud) >= 100:
+                    if False and len(_all_temps_ud) >= 100:
                         # Step1: 高温热环（> 85百分位）
                         _t85 = float(np.percentile(_all_temps_ud, 85))
                         _hot_ring = (_ir_frm_wok_upd >= _t85) & _loose_mask
@@ -2187,7 +2547,9 @@ def main():
                             _wok_px_inv = int(_dyn_wok_bool.sum())
                             _raw_inv_ratio = int(_raw_inv_mask.sum()) / max(_wok_px_inv, 1) * 100
                             _inv_mask_override = None
-                            if _raw_inv_ratio > 95.0:
+                            _inv_too_large = (_raw_inv_ratio > 50.0)
+                            _inv_too_small = (_raw_inv_ratio < 10.0)
+                            if _inv_too_large or _inv_too_small:
                                 _bottom_fail_streak += 1
                                 if (_bottom_auto_reset is None and temp_data is not None
                                         and homography is not None and wok_mask_ir is not None
@@ -2211,7 +2573,13 @@ def main():
                                                 "bg_points": _auto_bg_b,
                                             }
                                             _bottom_carry = None
+                                            _inv_fail_reason = (
+                                                f"inv_ratio<{10.0:.0f}%"
+                                                if _inv_too_small else
+                                                f"inv_ratio>{50.0:.0f}%"
+                                            )
                                             print(f"[Inv跟丢补点] frame={abs_idx} "
+                                                  f"{_inv_fail_reason}  "
                                                   f"FG-hot={len(_auto_fg_b)} BG-food={len(_auto_bg_b)} "
                                                   f"preview={os.path.basename(_prev_btm)}")
                                     except Exception as _bae:
@@ -2263,10 +2631,15 @@ def main():
                                 if not do_resize:
                                     pass
                                 if _bottom_fail_streak in (1, 10) or _bottom_fail_streak % 25 == 0:
-                                    print(f"[Inv兜底] frame={abs_idx}  bottom_mask疑似丢失 "
+                                    _inv_fail_desc = (
+                                        "bottom_mask过大/紫色过小"
+                                        if _inv_too_small else
+                                        "bottom_mask疑似丢失"
+                                    )
+                                    print(f"[Inv兜底] frame={abs_idx}  {_inv_fail_desc} "
                                           f"inv_ratio={_raw_inv_ratio:.1f}%  "
                                           f"使用上一帧有效bottom_mask  streak={_bottom_fail_streak}")
-                            elif _raw_inv_ratio <= 60.0:
+                            elif 10.0 <= _raw_inv_ratio <= 60.0:
                                 _bottom_fail_streak = 0
                             _inv_mask = (_inv_mask_override
                                          if _inv_mask_override is not None
