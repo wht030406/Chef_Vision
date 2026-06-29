@@ -2070,11 +2070,14 @@ def main():
                                     _rgb_b0, _ir_b0, wok_mask_ir, _H_inv_bottom,
                                     _wok_rgb_constraint, rng=_rng_al, preview_path=_prev_btm
                                 )
-                                if _auto_ok_b:
-                                    _bottom_fg_run = _auto_fg_b
-                                    _bottom_bg_run = _auto_bg_b
+                                _auto_pts_b = _rgb_inverse.build_inverse_point_result(
+                                    _auto_fg_b, _auto_bg_b, _auto_ok_b
+                                )
+                                if _auto_pts_b["ok"]:
+                                    _bottom_fg_run = _auto_pts_b["fg_points"]
+                                    _bottom_bg_run = _auto_pts_b["bg_points"]
                                     print(f"[Inv自动补点] 批次{chunk_i+1} "
-                                          f"FG-hot={len(_auto_fg_b)} BG-food={len(_auto_bg_b)} "
+                                          f"FG-hot={len(_auto_pts_b['fg_points'])} BG-food={len(_auto_pts_b['bg_points'])} "
                                           f"preview={os.path.basename(_prev_btm)}")
                             except Exception as _bae:
                                 print(f"[Inv自动补点] 批次{chunk_i+1} 失败: {_bae}")
@@ -2324,11 +2327,14 @@ def main():
                                             wok_mask_ir, _H_inv_bottom, _wok_rgb_constraint,
                                             rng=_rng_al, preview_path=_prev_btm
                                         )
-                                        if _auto_ok_b:
+                                        _auto_pts_b = _rgb_inverse.build_inverse_point_result(
+                                            _auto_fg_b, _auto_bg_b, _auto_ok_b
+                                        )
+                                        if _auto_pts_b["ok"]:
                                             _bottom_auto_reset = _rgb_inverse.build_inverse_auto_reset(
                                                 abs_idx,
-                                                _auto_fg_b,
-                                                _auto_bg_b,
+                                                _auto_pts_b["fg_points"],
+                                                _auto_pts_b["bg_points"],
                                             )
                                             _bottom_carry = None
                                             _inv_fail_reason = (

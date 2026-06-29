@@ -32,6 +32,15 @@ def build_inverse_auto_reset(frame_idx, fg_points, bg_points):
     }
 
 
+def build_inverse_point_result(fg_points, bg_points, ok):
+    """Standardize IR-derived inverse point generation results."""
+    return {
+        "fg_points": fg_points,
+        "bg_points": bg_points,
+        "ok": bool(ok),
+    }
+
+
 def generate_inverse_bottom_points_from_ir(
     rgb_frame,
     ir_frame,
