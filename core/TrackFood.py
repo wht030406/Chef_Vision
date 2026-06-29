@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt
 import ir_wok as _ir_wok
 import label_io as _label_io
 import output_utils as _output_utils
+import rgb_forward as _rgb_forward
 import rgb_inverse as _rgb_inverse
 import track_config as _track_config
 
@@ -1678,12 +1679,11 @@ def main():
                             _axis_bg = []
                             if _AXIS_CX_RGB is not None:
                                 _axis_bg = [[_AXIS_CX_RGB, _AXIS_CY_RGB]]
-                            _reinforce_inject = {
-                                "local_frame": 0,
-                                "fg_points":   _ir_fg_pts,
-                                "bg_points":   _axis_bg,
-                                "label":       "IR-reset",
-                            }
+                            _reinforce_inject = _rgb_forward.build_forward_inject_keyframe(
+                                _ir_fg_pts,
+                                _axis_bg,
+                                label="IR-reset",
+                            )
 
                         # ── 保存重置预览图（在 IR 采点完成后，能看到新前景点）──
                         try:
@@ -1839,7 +1839,11 @@ def main():
                                     pass
                             if _ir_fg_pts_iou:
                                 _axis_bg_iou = [[_AXIS_CX_RGB, _AXIS_CY_RGB]] if _AXIS_CX_RGB is not None else []
-                                _reinforce_inject = {"local_frame": 0, "fg_points": _ir_fg_pts_iou, "bg_points": _axis_bg_iou, "label": "IR-IoU-reset"}
+                                _reinforce_inject = _rgb_forward.build_forward_inject_keyframe(
+                                    _ir_fg_pts_iou,
+                                    _axis_bg_iou,
+                                    label="IR-IoU-reset",
+                                )
                             # 保存预览图
                             try:
                                 if _rst_rgb_frame is not None:
@@ -2540,12 +2544,11 @@ def main():
                                 _fg_ni.append([_xi_ni, _yi_ni])
                             if _fg_ni:
                                 _axis_bg_ni = [[_AXIS_CX_RGB, _AXIS_CY_RGB]] if _AXIS_CX_RGB is not None else []
-                                _next_inject = {
-                                    "local_frame": 0,
-                                    "fg_points":   _fg_ni,
-                                    "bg_points":   _axis_bg_ni,
-                                    "label":       "IR-fix-next",
-                                }
+                                _next_inject = _rgb_forward.build_forward_inject_keyframe(
+                                    _fg_ni,
+                                    _axis_bg_ni,
+                                    label="IR-fix-next",
+                                )
                                 print(f"[IR-fix接管] 已生成下批注入前景点 {len(_fg_ni)} 个"
                                       f"，下批SAM2将精细化IR粗mask")
                     except Exception as _ni_e:
