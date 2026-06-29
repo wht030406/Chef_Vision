@@ -33,6 +33,7 @@ import label_io as _label_io
 import output_utils as _output_utils
 import rgb_forward as _rgb_forward
 import rgb_inverse as _rgb_inverse
+import temp_fusion as _temp_fusion
 import track_config as _track_config
 
 # ── 路径基准（本文件所在目录）────────────────────────────────────────────────
@@ -2218,8 +2219,9 @@ def main():
                     temp_history.append((time_s, temp_mean))
 
                 # ── ROI 温度统计 ──────────────────────────────────────────────
-                roi_temp_mean = float("nan")
-                if roi_cfg is not None and temp_data is not None and homography is not None:
+                roi_temp_mean = _temp_fusion.measure_roi_temperature(
+                    temp_data, homography, _get_ir_idx(abs_idx), roi_cfg)
+                if False:
                     try:
                         ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
                         ir_idx_roi = _get_ir_idx(abs_idx)
