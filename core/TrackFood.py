@@ -1310,15 +1310,13 @@ def main():
     _wok_rgb_ir_offset_x = 0.0
     _wok_rgb_ir_offset_y = 0.0
     _wok_rgb_ir_offset_ready = False
-    _frame_shift_prev_ir = None
-    _frame_shift_prev_ir_idx = None
-    _frame_shift_total_dx = 0.0
-    _frame_shift_total_dy = 0.0
-    if ir_wok_strategy == "frame_shift" and temp_data is not None and wok_mask_ir is not None:
-        _frame_shift_prev_ir_idx = _get_ir_idx(start_frame)
-        if _frame_shift_prev_ir_idx < temp_data.shape[0]:
-            _frame_shift_prev_ir = temp_data[_frame_shift_prev_ir_idx].copy()
-            print(f"[IR Mask] frame_shift reference IR frame={_frame_shift_prev_ir_idx}")
+    _frame_shift_state = _ir_wok.init_frame_shift_state(
+        ir_wok_strategy,
+        temp_data,
+        wok_mask_ir,
+        start_frame,
+        _get_ir_idx,
+    )
 
     # ── 分批追踪主循环（SAM2 + 光流混合）────────────────────────────────────
     # 真正的混合模式：
@@ -1474,41 +1472,29 @@ def main():
             chunk_len       = chunk_end_abs - chunk_start_abs
             chunk_start_s   = chunk_start_abs / fps
 
-            if (ir_wok_strategy == "frame_shift"
-                    and temp_data is not None
-                    and wok_mask_ir is not None):
-                try:
-                    _ir_idx_shift = _get_ir_idx(chunk_start_abs)
-                    if _ir_idx_shift < temp_data.shape[0]:
-                        _ir_frame_shift = temp_data[_ir_idx_shift]
-                        if (_frame_shift_prev_ir is not None
-                                and _frame_shift_prev_ir_idx != _ir_idx_shift):
-                            _dx, _dy, _resp, _ok = _ir_wok.estimate_ir_frame_translation(
-                                _frame_shift_prev_ir, _ir_frame_shift)
-                            if _ok:
-                                wok_mask_ir = _ir_wok.translate_binary_mask(wok_mask_ir, _dx, _dy)
-                                _wok_mask_al = wok_mask_ir.copy()
-                                _wok_cx += _dx
-                                _wok_cy += _dy
-                                _frame_shift_total_dx += _dx
-                                _frame_shift_total_dy += _dy
-                                if homography is not None:
-                                    _wok_rgb_constraint = _ir_wok.project_ir_wok_to_rgb_constraint(
-                                        wok_mask_ir, homography, (VH, VW))
-                                    wok_rgb_mask_static = None
-                                _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
-                                print(f"[IR Mask] frame_shift f={chunk_start_abs} "
-                                      f"ir={_frame_shift_prev_ir_idx}->{_ir_idx_shift} "
-                                      f"dx={_dx:.2f} dy={_dy:.2f} resp={_resp:.3f} "
-                                      f"total=({_frame_shift_total_dx:.1f},{_frame_shift_total_dy:.1f})")
-                            else:
-                                print(f"[IR Mask] frame_shift skip f={chunk_start_abs} "
-                                      f"ir={_frame_shift_prev_ir_idx}->{_ir_idx_shift} "
-                                      f"dx={_dx:.2f} dy={_dy:.2f} resp={_resp:.3f}")
-                        _frame_shift_prev_ir = _ir_frame_shift.copy()
-                        _frame_shift_prev_ir_idx = _ir_idx_shift
-                except Exception as _fs_e:
-                    print(f"[IR Mask] frame_shift failed: {_fs_e}")
+            _frame_shift_update = _ir_wok.apply_frame_shift_update(
+                ir_wok_strategy,
+                temp_data,
+                wok_mask_ir,
+                chunk_start_abs,
+                _get_ir_idx,
+                _frame_shift_state,
+                _wok_cx,
+                _wok_cy,
+                homography,
+                (VH, VW),
+            )
+            wok_mask_ir = _frame_shift_update.wok_mask_ir
+            _wok_cx = _frame_shift_update.wok_cx
+            _wok_cy = _frame_shift_update.wok_cy
+            if wok_mask_ir is not None:
+                _wok_mask_al = wok_mask_ir.copy()
+            if _frame_shift_update.wok_rgb_constraint is not None:
+                _wok_rgb_constraint = _frame_shift_update.wok_rgb_constraint
+            if _frame_shift_update.disable_static_rgb_mask:
+                wok_rgb_mask_static = None
+            if _frame_shift_update.history_entry is not None:
+                _wok_cx_history.append(_frame_shift_update.history_entry)
 
             print(f"\n{'='*55}")
             print(f"[批次 {chunk_i+1}/{n_chunks}] 帧 {chunk_start_abs} ~ {chunk_end_abs-1}"

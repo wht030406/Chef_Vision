@@ -1,8 +1,27 @@
 import json
 import os
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+
+@dataclass
+class FrameShiftState:
+    prev_ir: object = None
+    prev_ir_idx: int | None = None
+    total_dx: float = 0.0
+    total_dy: float = 0.0
+
+
+@dataclass
+class FrameShiftUpdate:
+    wok_mask_ir: object
+    wok_cx: float
+    wok_cy: float
+    wok_rgb_constraint: object
+    disable_static_rgb_mask: bool
+    history_entry: tuple[int, float, float] | None
 
 
 def build_ir_wok_mask(wok_cfg, ir_shape):
@@ -102,3 +121,83 @@ def project_ir_wok_to_rgb_constraint(wok_mask_ir, homography, rgb_shape):
     wok_u8 = wok_mask_ir.astype(np.uint8) * 255
     projected = cv2.warpPerspective(wok_u8, h_inv, (rgb_w, rgb_h))
     return projected > 64
+
+
+def init_frame_shift_state(ir_wok_strategy, temp_data, wok_mask_ir, start_frame, get_ir_idx):
+    state = FrameShiftState()
+    if ir_wok_strategy == "frame_shift" and temp_data is not None and wok_mask_ir is not None:
+        state.prev_ir_idx = get_ir_idx(start_frame)
+        if state.prev_ir_idx < temp_data.shape[0]:
+            state.prev_ir = temp_data[state.prev_ir_idx].copy()
+            print(f"[IR Mask] frame_shift reference IR frame={state.prev_ir_idx}")
+    return state
+
+
+def apply_frame_shift_update(
+    ir_wok_strategy,
+    temp_data,
+    wok_mask_ir,
+    chunk_start_abs,
+    get_ir_idx,
+    frame_shift_state,
+    wok_cx,
+    wok_cy,
+    homography,
+    rgb_shape,
+):
+    wok_rgb_constraint = None
+    disable_static_rgb_mask = False
+    history_entry = None
+
+    if (ir_wok_strategy != "frame_shift"
+            or temp_data is None
+            or wok_mask_ir is None):
+        return FrameShiftUpdate(
+            wok_mask_ir=wok_mask_ir,
+            wok_cx=wok_cx,
+            wok_cy=wok_cy,
+            wok_rgb_constraint=wok_rgb_constraint,
+            disable_static_rgb_mask=disable_static_rgb_mask,
+            history_entry=history_entry,
+        )
+
+    try:
+        ir_idx_shift = get_ir_idx(chunk_start_abs)
+        if ir_idx_shift < temp_data.shape[0]:
+            ir_frame_shift = temp_data[ir_idx_shift]
+            if (frame_shift_state.prev_ir is not None
+                    and frame_shift_state.prev_ir_idx != ir_idx_shift):
+                dx, dy, response, ok = estimate_ir_frame_translation(
+                    frame_shift_state.prev_ir, ir_frame_shift)
+                if ok:
+                    wok_mask_ir = translate_binary_mask(wok_mask_ir, dx, dy)
+                    wok_cx += dx
+                    wok_cy += dy
+                    frame_shift_state.total_dx += dx
+                    frame_shift_state.total_dy += dy
+                    if homography is not None:
+                        wok_rgb_constraint = project_ir_wok_to_rgb_constraint(
+                            wok_mask_ir, homography, rgb_shape)
+                        disable_static_rgb_mask = True
+                    history_entry = (chunk_start_abs, wok_cx, wok_cy)
+                    print(f"[IR Mask] frame_shift f={chunk_start_abs} "
+                          f"ir={frame_shift_state.prev_ir_idx}->{ir_idx_shift} "
+                          f"dx={dx:.2f} dy={dy:.2f} resp={response:.3f} "
+                          f"total=({frame_shift_state.total_dx:.1f},{frame_shift_state.total_dy:.1f})")
+                else:
+                    print(f"[IR Mask] frame_shift skip f={chunk_start_abs} "
+                          f"ir={frame_shift_state.prev_ir_idx}->{ir_idx_shift} "
+                          f"dx={dx:.2f} dy={dy:.2f} resp={response:.3f}")
+            frame_shift_state.prev_ir = ir_frame_shift.copy()
+            frame_shift_state.prev_ir_idx = ir_idx_shift
+    except Exception as exc:
+        print(f"[IR Mask] frame_shift failed: {exc}")
+
+    return FrameShiftUpdate(
+        wok_mask_ir=wok_mask_ir,
+        wok_cx=wok_cx,
+        wok_cy=wok_cy,
+        wok_rgb_constraint=wok_rgb_constraint,
+        disable_static_rgb_mask=disable_static_rgb_mask,
+        history_entry=history_entry,
+    )
