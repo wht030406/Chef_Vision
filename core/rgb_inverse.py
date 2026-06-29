@@ -2,6 +2,20 @@ import cv2
 import numpy as np
 
 
+def build_inverse_inject_keyframes(bottom_inject_map, chunk_start_abs, chunk_end_abs):
+    """Collect inverse-tracking keyframes that fall inside the current chunk."""
+    inject_keyframes = []
+    for abs_frame, keyframe in bottom_inject_map.items():
+        if chunk_start_abs <= abs_frame < chunk_end_abs:
+            inject_keyframes.append({
+                "local_frame": abs_frame - chunk_start_abs,
+                "fg_points": keyframe["fg_points"],
+                "bg_points": keyframe.get("bg_points", []),
+                "label": keyframe.get("label", ""),
+            })
+    return inject_keyframes
+
+
 def generate_inverse_bottom_points_from_ir(
     rgb_frame,
     ir_frame,

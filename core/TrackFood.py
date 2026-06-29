@@ -2043,15 +2043,11 @@ def main():
                 if has_bottom and chunk_start_abs >= bottom_start_frame:
                     try:
                         # 锅底注入关键帧（_bottom_inject_map）
-                        _bottom_inject = []
-                        for _abs_bf, _bkf in _bottom_inject_map.items():
-                            if chunk_start_abs <= _abs_bf < chunk_end_abs:
-                                _bottom_inject.append({
-                                    "local_frame": _abs_bf - chunk_start_abs,
-                                    "fg_points":   _bkf["fg_points"],
-                                    "bg_points":   _bkf.get("bg_points", []),
-                                    "label":       _bkf.get("label", ""),
-                                })
+                        _bottom_inject = _rgb_inverse.build_inverse_inject_keyframes(
+                            _bottom_inject_map,
+                            chunk_start_abs,
+                            chunk_end_abs,
+                        )
                         _bottom_fg_run = bottom_fg_points
                         _bottom_bg_run = bottom_bg_points
                         if (False and temp_data is not None and homography is not None
