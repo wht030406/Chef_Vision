@@ -41,6 +41,23 @@ class LegacyHotRingUpdate:
     tilting: bool
 
 
+@dataclass
+class IrWokStrategyUpdate:
+    wok_mask_ir: object
+    wok_cx: float
+    wok_cy: float
+    wok_rx: float
+    wok_ry: float
+    wok_rgb_constraint: object
+    disable_static_rgb_mask: bool
+    history_entry: tuple[int, float, float] | None
+    hot_ref_ready: bool
+    hot_sx: float
+    hot_sy: float
+    recent_drifts: list[float]
+    tilting: bool
+
+
 def build_ir_wok_mask(wok_cfg, ir_shape):
     ir_h, ir_w = ir_shape
     mask = np.zeros((ir_h, ir_w), dtype=np.uint8)
@@ -377,4 +394,116 @@ def apply_legacy_hot_ring_update(
         hot_sy=hot_sy,
         recent_drifts=updated_recent_drifts,
         tilting=updated_tilting,
+    )
+
+
+def apply_ir_wok_strategy_update(
+    ir_wok_strategy,
+    temp_data,
+    wok_cfg,
+    wok_mask_ir,
+    chunk_start_abs,
+    chunk_start_s,
+    get_ir_idx,
+    frame_shift_state,
+    wok_cx,
+    wok_cy,
+    wok_rx,
+    wok_ry,
+    homography,
+    rgb_shape,
+    hot_ref_ready,
+    hot_sx,
+    hot_sy,
+    max_drift,
+    recent_drifts,
+    tilting,
+    allow_legacy_update,
+    estimate_hot_ring,
+):
+    wok_rgb_constraint = None
+    disable_static_rgb_mask = False
+    history_entry = None
+
+    frame_shift_update = apply_frame_shift_update(
+        ir_wok_strategy,
+        temp_data,
+        wok_mask_ir,
+        chunk_start_abs,
+        get_ir_idx,
+        frame_shift_state,
+        wok_cx,
+        wok_cy,
+        homography,
+        rgb_shape,
+    )
+    wok_mask_ir = frame_shift_update.wok_mask_ir
+    wok_cx = frame_shift_update.wok_cx
+    wok_cy = frame_shift_update.wok_cy
+    if frame_shift_update.wok_rgb_constraint is not None:
+        wok_rgb_constraint = frame_shift_update.wok_rgb_constraint
+    if frame_shift_update.disable_static_rgb_mask:
+        disable_static_rgb_mask = True
+    if frame_shift_update.history_entry is not None:
+        history_entry = frame_shift_update.history_entry
+
+    if (ir_wok_strategy == "legacy"
+            and wok_cfg is not None
+            and temp_data is not None
+            and allow_legacy_update
+            and homography is not None):
+        ir_idx = get_ir_idx(chunk_start_abs)
+        ir_frame = temp_data[ir_idx]
+        hot_fit = estimate_hot_ring(ir_frame, wok_cx, wok_cy, wok_rx, wok_ry)
+        legacy_update = apply_legacy_hot_ring_update(
+            hot_fit,
+            wok_cfg,
+            wok_cx,
+            wok_cy,
+            wok_rx,
+            wok_ry,
+            hot_ref_ready,
+            hot_sx,
+            hot_sy,
+            max_drift,
+            chunk_start_abs,
+            chunk_start_s,
+            homography,
+            rgb_shape,
+            recent_drifts,
+            tilting,
+            ir_frame.shape[:2],
+        )
+        wok_cx = legacy_update.wok_cx
+        wok_cy = legacy_update.wok_cy
+        wok_rx = legacy_update.wok_rx
+        wok_ry = legacy_update.wok_ry
+        hot_ref_ready = legacy_update.hot_ref_ready
+        hot_sx = legacy_update.hot_sx
+        hot_sy = legacy_update.hot_sy
+        recent_drifts = legacy_update.recent_drifts
+        tilting = legacy_update.tilting
+        if legacy_update.wok_mask_ir is not None:
+            wok_mask_ir = legacy_update.wok_mask_ir
+        if legacy_update.wok_rgb_constraint is not None:
+            wok_rgb_constraint = legacy_update.wok_rgb_constraint
+        if legacy_update.disable_static_rgb_mask:
+            disable_static_rgb_mask = True
+        if legacy_update.history_entry is not None:
+            history_entry = legacy_update.history_entry
+
+    return IrWokStrategyUpdate(
+        wok_mask_ir=wok_mask_ir,
+        wok_cx=wok_cx,
+        wok_cy=wok_cy,
+        wok_rx=wok_rx,
+        wok_ry=wok_ry,
+        wok_rgb_constraint=wok_rgb_constraint,
+        disable_static_rgb_mask=disable_static_rgb_mask,
+        history_entry=history_entry,
+        hot_ref_ready=hot_ref_ready,
+        hot_sx=hot_sx,
+        hot_sy=hot_sy,
+        recent_drifts=recent_drifts,
+        tilting=tilting,
     )

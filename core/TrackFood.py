@@ -1470,29 +1470,48 @@ def main():
             chunk_len       = chunk_end_abs - chunk_start_abs
             chunk_start_s   = chunk_start_abs / fps
 
-            _frame_shift_update = _ir_wok.apply_frame_shift_update(
+            _ir_wok_update = _ir_wok.apply_ir_wok_strategy_update(
                 ir_wok_strategy,
                 temp_data,
+                wok_cfg,
                 wok_mask_ir,
                 chunk_start_abs,
+                chunk_start_s,
                 _get_ir_idx,
                 _frame_shift_state,
                 _wok_cx,
                 _wok_cy,
+                _wok_rx,
+                _wok_ry,
                 homography,
                 (VH, VW),
+                _wok_hot_ref_ready,
+                _wok_hot_sx,
+                _wok_hot_sy,
+                _WOK_MAX_DRIFT,
+                _wok_recent_drifts,
+                _wok_tilting,
+                _wok_mask_al is not None,
+                _estimate_wok_from_ir_hot_ring,
             )
-            wok_mask_ir = _frame_shift_update.wok_mask_ir
-            _wok_cx = _frame_shift_update.wok_cx
-            _wok_cy = _frame_shift_update.wok_cy
+            wok_mask_ir = _ir_wok_update.wok_mask_ir
+            _wok_cx = _ir_wok_update.wok_cx
+            _wok_cy = _ir_wok_update.wok_cy
+            _wok_rx = _ir_wok_update.wok_rx
+            _wok_ry = _ir_wok_update.wok_ry
+            _wok_hot_ref_ready = _ir_wok_update.hot_ref_ready
+            _wok_hot_sx = _ir_wok_update.hot_sx
+            _wok_hot_sy = _ir_wok_update.hot_sy
+            _wok_recent_drifts = _ir_wok_update.recent_drifts
+            _wok_tilting = _ir_wok_update.tilting
             if wok_mask_ir is not None:
                 _wok_mask_al = wok_mask_ir.copy()
-            if _frame_shift_update.wok_rgb_constraint is not None:
-                _wok_rgb_constraint = _frame_shift_update.wok_rgb_constraint
-            if _frame_shift_update.disable_static_rgb_mask:
+            if _ir_wok_update.wok_rgb_constraint is not None:
+                _wok_rgb_constraint = _ir_wok_update.wok_rgb_constraint
+            if _ir_wok_update.disable_static_rgb_mask:
                 wok_rgb_mask_static = None
-            if _frame_shift_update.history_entry is not None:
-                _wok_cx_history.append(_frame_shift_update.history_entry)
+            if _ir_wok_update.history_entry is not None:
+                _wok_cx_history.append(_ir_wok_update.history_entry)
 
             print(f"\n{'='*55}")
             print(f"[批次 {chunk_i+1}/{n_chunks}] 帧 {chunk_start_abs} ~ {chunk_end_abs-1}"
@@ -1505,7 +1524,7 @@ def main():
             #   2. 形态学闭运算填充热环，得到完整锅圈
             #   3. 在锅圈内部找最大低温连通域（< 50百分位）= 旋转轴
             #   4. 旋转轴质心 = 锅的几何圆心
-            if (ir_wok_strategy == "legacy"
+            if False and (ir_wok_strategy == "legacy"
                     and wok_cfg is not None and temp_data is not None
                     and _wok_mask_al is not None and homography is not None):
                 try:
