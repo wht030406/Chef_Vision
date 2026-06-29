@@ -1294,8 +1294,6 @@ def main():
     _wok_cy = float(wok_cfg["cy"]) if wok_cfg is not None else 0.0
     _wok_rx = float(wok_cfg["rx"]) if wok_cfg is not None else 0.0
     _wok_ry = float(wok_cfg["ry"]) if wok_cfg is not None else 0.0
-    _wok_hot_dx = 0.0
-    _wok_hot_dy = 0.0
     _wok_hot_sx = 1.0
     _wok_hot_sy = 1.0
     _wok_hot_ref_ready = False
