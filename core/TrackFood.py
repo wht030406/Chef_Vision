@@ -1545,11 +1545,15 @@ def main():
                         last_reinforce_wok_pct,
                     )
                     _mask_px = _reset_metrics["mask_px"]
-                    _need_reset = False
+                    _reset_decision = _rgb_forward.evaluate_forward_reset(
+                        _reset_metrics,
+                        last_reinforce_wok_pct,
+                    )
+                    _need_reset = _reset_decision["need_reset"]
+                    _reset_kind = _reset_decision["reason"]
                     _overlap_pct = _reset_metrics["overlap_pct"]
                     if _wok_rgb_constraint is not None and _mask_px > 0:
-                        if _overlap_pct < 60.0:
-                            _need_reset = True
+                        if _reset_kind == "overlap":
                             print(f"[补强] t={chunk_start_s:.1f}s  "
                                   f"mask偏离锅内(overlap={_overlap_pct:.0f}%<60%)，"
                                   f"重置SAM2→初始标注点")
@@ -1557,24 +1561,20 @@ def main():
                     # 食材正常情况下占锅内面积 < 35%，超过说明 SAM2 追踪到了锅底/空白区域
                     _wok_px_chk = _reset_metrics["wok_px"]
                     _mask_vs_wok = _reset_metrics["mask_vs_wok"]
-                    if not _need_reset:
-                        if _mask_vs_wok > 35.0:
-                            _need_reset = True
+                    if _reset_kind == "oversize":
                             print(f"[补强] t={chunk_start_s:.1f}s  "
                                   f"mask过大({_mask_vs_wok:.0f}%>wok35%)，"
                                   f"重置SAM2→IR定位新前景点")
                     # ── 第三级：面积骤降检测（漂移到旋转轴/小碎片）────────────
                     # last_reinforce_wok_pct = 上次补强时 mask 占 wok% （不是批次均值）
                     # 骤降 > 70% 或绝对值 < 2% → 重置
-                    if not _need_reset and _wok_px_chk > 0:
+                    if _wok_px_chk > 0:
                         _drop_pct = _reset_metrics["drop_pct"]
-                        if _mask_vs_wok < 2.0:
-                            _need_reset = True
+                        if _reset_kind == "undersize":
                             print(f"[补强] t={chunk_start_s:.1f}s  "
                                   f"mask过小({_mask_vs_wok:.1f}%<2%，可能是旋转轴碎片)，"
                                   f"重置SAM2→初始标注点")
-                        elif last_reinforce_wok_pct > 5.0 and _drop_pct > 70.0:
-                            _need_reset = True
+                        elif _reset_kind == "drop":
                             print(f"[补强] t={chunk_start_s:.1f}s  "
                                   f"mask面积骤降({last_reinforce_wok_pct:.0f}%→{_mask_vs_wok:.0f}%，"
                                   f"跌幅{_drop_pct:.0f}%>70%)，重置SAM2→初始标注点")

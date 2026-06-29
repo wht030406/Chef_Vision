@@ -35,6 +35,25 @@ def compute_forward_reset_metrics(
     }
 
 
+def evaluate_forward_reset(metrics, last_reinforce_wok_pct):
+    """Evaluate whether forward tracking should reset, using shared metrics."""
+    overlap_pct = metrics["overlap_pct"]
+    mask_vs_wok = metrics["mask_vs_wok"]
+    drop_pct = metrics["drop_pct"]
+    wok_px = metrics["wok_px"]
+
+    if overlap_pct < 60.0:
+        return {"need_reset": True, "reason": "overlap"}
+    if mask_vs_wok > 35.0:
+        return {"need_reset": True, "reason": "oversize"}
+    if wok_px > 0:
+        if mask_vs_wok < 2.0:
+            return {"need_reset": True, "reason": "undersize"}
+        if last_reinforce_wok_pct > 5.0 and drop_pct > 70.0:
+            return {"need_reset": True, "reason": "drop"}
+    return {"need_reset": False, "reason": None}
+
+
 def resolve_forward_reset_reason(
     mask_vs_wok,
     overlap_pct,
