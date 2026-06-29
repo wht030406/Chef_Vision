@@ -223,65 +223,6 @@ def _project_ir_wok_to_rgb_constraint(wok_mask_ir, homography, rgb_shape):
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
 
-def load_labels(path):
-    """
-    加载标注文件，兼容新格式（多关键帧列表）和旧格式（flat 单帧）。
-
-    返回:
-        video_path       : str
-        start_frame      : int           第一个关键帧的帧号（追踪起始点）
-        keyframes        : list[dict]    食材关键帧，按 frame 升序排列
-        bottom_keyframes : list[dict]    锅底关键帧（可为空列表）
-    """
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    print(f"[标注] 视频: {data['video_path']}")
-
-    # 加载锅底关键帧（bottom_keyframes，可选）
-    bottom_kfs = []
-    if "bottom_keyframes" in data:
-        bottom_kfs = sorted(data["bottom_keyframes"], key=lambda k: k["frame"])
-        print(f"[锅底] 共 {len(bottom_kfs)} 个锅底关键帧（反向语义追踪）：")
-        for kf in bottom_kfs:
-            print(f"  帧 {kf['frame']:6d} ({kf['time_s']:.1f}s)  "
-                  f"标签={kf.get('label','')}  "
-                  f"FG={len(kf['fg_points'])}  BG={len(kf['bg_points'])}")
-
-    if "keyframes" in data:
-        # ── 新格式 ────────────────────────────────────────────────────────────
-        kfs = sorted(data["keyframes"], key=lambda k: k["frame"])
-        for kf in kfs:
-            fg = kf.get("fg_points", [])
-            bg = kf.get("bg_points", [])
-            kf["fg_points"] = fg if MAX_FG_POINTS is None else fg[:MAX_FG_POINTS]
-            kf["bg_points"] = bg if MAX_BG_POINTS is None else bg[:MAX_BG_POINTS]
-        print(f"[标注] 共 {len(kfs)} 个关键帧：")
-        for kf in kfs:
-            print(f"  帧 {kf['frame']:6d} ({kf['time_s']:.1f}s)  "
-                  f"标签={kf.get('label','')}  "
-                  f"FG={len(kf['fg_points'])}  BG={len(kf['bg_points'])}")
-        start_frame = kfs[0]["frame"]
-        return data["video_path"], start_frame, kfs, bottom_kfs
-    else:
-        # ── 旧格式兼容 ────────────────────────────────────────────────────────
-        fg_all = data["fg_points"]
-        bg_all = data["bg_points"]
-        fg = fg_all if MAX_FG_POINTS is None else fg_all[:MAX_FG_POINTS]
-        bg = bg_all if MAX_BG_POINTS is None else bg_all[:MAX_BG_POINTS]
-        start_frame = data.get("start_frame", 0)
-        fps_json    = data.get("fps", 25.0)
-        print(f"[标注] 旧格式：起始帧={start_frame}  FG={len(fg)}  BG={len(bg)}")
-        kf = {
-            "frame":     start_frame,
-            "time_s":    round(start_frame / fps_json, 3),
-            "label":     "初始标注",
-            "fg_points": fg,
-            "bg_points": bg,
-        }
-        return data["video_path"], start_frame, [kf], bottom_kfs
-
-
 def find_temp_npy(video_path):
     """
     自动匹配温度 npy 文件。
