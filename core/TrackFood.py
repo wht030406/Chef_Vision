@@ -29,6 +29,7 @@ import torch
 import matplotlib
 matplotlib.use("Agg")   # 无头模式，不弹窗
 import matplotlib.pyplot as plt
+import output_utils as _output_utils
 
 try:
     import openpyxl
@@ -3164,19 +3165,21 @@ def main():
     print(f"   共处理 {global_local} 帧")
 
     # ── 保存三策略独立 Excel（含 inverse）────────────────────────────────────
-    _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir,
-                     inverse_rows=inverse_rows if has_bottom else None)
+    _output_utils._save_three_xlsx(
+        sam2_rows, roi_rows, ir_rows, out_dir,
+        inverse_rows=inverse_rows if has_bottom else None)
 
     # ── 绘制三策略温度曲线 PNG（含 inverse）──────────────────────────────────
-    _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_curve,
-                       inverse_rows=inverse_rows if has_bottom else None)
+    _output_utils._plot_three_curves(
+        sam2_rows, roi_rows, ir_rows, out_curve,
+        inverse_rows=inverse_rows if has_bottom else None)
 
     # ── 拼合 RGB + IR 视频 ────────────────────────────────────────────────────
     if temp_data is not None and wok_cfg is not None:
         out_combined = os.path.join(out_dir, "track_result_combined.mp4")
         ir_fps_val   = fps * ir_fps_ratio   # 估算 IR 帧率
         print(f"\n[拼合] 开始生成 RGB+IR 并排视频...")
-        stitch_rgb_ir(
+        _output_utils.stitch_rgb_ir(
             rgb_viz_path=out_video_viz,
             temp_data=temp_data,
             ir_fps=ir_fps_val,
@@ -3187,6 +3190,8 @@ def main():
             pct=IR_FOOD_PCT,
             wok_cx_history=_wok_cx_history,
             inv_viz_path=out_inv_viz if (has_bottom and os.path.exists(out_inv_viz)) else None,
+            info_h=INFO_H,
+            chart_h=CHART_H,
         )
         print(f"   并排视频: {out_combined}")
         # 删除中间产物（纯 RGB viz 视频），只保留最终并排视频
