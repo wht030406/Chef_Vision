@@ -2058,9 +2058,10 @@ def main():
                                 _ir_b0 = temp_data[_get_ir_idx(chunk_start_abs)]
                                 _H_inv_bottom = (_H_inv_al if _H_inv_al is not None
                                                  else np.linalg.inv(homography))
-                                _prev_btm = os.path.join(
+                                _prev_btm = _rgb_inverse.build_inverse_autopoints_preview_path(
                                     out_dir,
-                                    f"inverse_autopoints_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
+                                    f"{chunk_start_s:.0f}",
+                                    chunk_start_abs,
                                 )
                                 _auto_fg_b, _auto_bg_b, _auto_ok_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
                                     _rgb_b0, _ir_b0, wok_mask_ir, _H_inv_bottom,
@@ -2310,9 +2311,10 @@ def main():
                                     try:
                                         _H_inv_bottom = (_H_inv_al if _H_inv_al is not None
                                                          else np.linalg.inv(homography))
-                                        _prev_btm = os.path.join(
+                                        _prev_btm = _rgb_inverse.build_inverse_autopoints_preview_path(
                                             out_dir,
-                                            f"inverse_autopoints_t{time_s:.1f}s_f{abs_idx}.jpg"
+                                            f"{time_s:.1f}",
+                                            abs_idx,
                                         )
                                         _auto_fg_b, _auto_bg_b, _auto_ok_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
                                             frame, temp_data[_get_ir_idx(abs_idx)],
@@ -2320,11 +2322,11 @@ def main():
                                             rng=_rng_al, preview_path=_prev_btm
                                         )
                                         if _auto_ok_b:
-                                            _bottom_auto_reset = {
-                                                "frame": abs_idx,
-                                                "fg_points": _auto_fg_b,
-                                                "bg_points": _auto_bg_b,
-                                            }
+                                            _bottom_auto_reset = _rgb_inverse.build_inverse_auto_reset(
+                                                abs_idx,
+                                                _auto_fg_b,
+                                                _auto_bg_b,
+                                            )
                                             _bottom_carry = None
                                             _inv_fail_reason = (
                                                 f"inv_ratio<{10.0:.0f}%"

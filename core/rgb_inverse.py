@@ -1,3 +1,5 @@
+import os
+
 import cv2
 import numpy as np
 
@@ -14,6 +16,20 @@ def build_inverse_inject_keyframes(bottom_inject_map, chunk_start_abs, chunk_end
                 "label": keyframe.get("label", ""),
             })
     return inject_keyframes
+
+
+def build_inverse_autopoints_preview_path(out_dir, time_text, frame_idx):
+    """Build the preview image path for inverse auto-point generation."""
+    return os.path.join(out_dir, f"inverse_autopoints_t{time_text}s_f{frame_idx}.jpg")
+
+
+def build_inverse_auto_reset(frame_idx, fg_points, bg_points):
+    """Standardize the payload used to restart inverse tracking after failure."""
+    return {
+        "frame": frame_idx,
+        "fg_points": fg_points,
+        "bg_points": bg_points,
+    }
 
 
 def generate_inverse_bottom_points_from_ir(
