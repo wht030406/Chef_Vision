@@ -1576,15 +1576,12 @@ def main():
                                   f"跌幅{_drop_pct:.0f}%>70%)，重置SAM2→初始标注点")
                     if _need_reset:
                         # ── 记录重置原因（预览图在 IR 采点完成后保存）─────────
-                        _rst_reason = "RESET"
-                        if _mask_vs_wok < 2.0:
-                            _rst_reason = f"RESET: mask过小({_mask_vs_wok:.1f}%<2%)"
-                        elif last_reinforce_wok_pct > 5.0 and _drop_pct > 70.0:
-                            _rst_reason = f"RESET: 骤降({last_reinforce_wok_pct:.0f}%→{_mask_vs_wok:.0f}%)"
-                        elif _mask_vs_wok > 35.0:
-                            _rst_reason = f"RESET: mask过大({_mask_vs_wok:.0f}%>wok35%)"
-                        elif _overlap_pct < 60.0:
-                            _rst_reason = f"RESET: 偏离锅内(overlap={_overlap_pct:.0f}%)"
+                        _rst_reason = _rgb_forward.resolve_forward_reset_reason(
+                            _mask_vs_wok,
+                            _overlap_pct,
+                            last_reinforce_wok_pct,
+                            _drop_pct,
+                        )
                         # 保留跑偏时的帧和 mask，供稍后保存预览图
                         _rst_carry_mask = carry_mask   # 跑偏的旧 mask（可能是 None）
                         _rst_rgb_frame  = None
