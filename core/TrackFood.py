@@ -29,6 +29,7 @@ import torch
 import matplotlib
 matplotlib.use("Agg")   # 无头模式，不弹窗
 import matplotlib.pyplot as plt
+import label_io as _label_io
 import output_utils as _output_utils
 
 # ── 路径基准（本文件所在目录）────────────────────────────────────────────────
@@ -1300,7 +1301,11 @@ def main():
         print("请先运行 LabelFirstFrame.py 完成标注")
         sys.exit(1)
 
-    video_path, start_frame, keyframes, bottom_keyframes = load_labels(labels_json)
+    video_path, start_frame, keyframes, bottom_keyframes = _label_io.load_labels(
+        labels_json,
+        max_fg_points=MAX_FG_POINTS,
+        max_bg_points=MAX_BG_POINTS,
+    )
     if video_override:
         print(f"[config] override video path: {video_override}")
         video_path = video_override
