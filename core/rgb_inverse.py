@@ -32,6 +32,15 @@ def build_inverse_auto_reset(frame_idx, fg_points, bg_points):
     }
 
 
+def apply_inverse_auto_reset(auto_reset_payload):
+    """Normalize how inverse auto-reset payloads are consumed by the caller."""
+    return {
+        "fg_points": auto_reset_payload["fg_points"],
+        "bg_points": auto_reset_payload["bg_points"],
+        "frame": auto_reset_payload.get("frame"),
+    }
+
+
 def build_inverse_point_result(fg_points, bg_points, ok):
     """Standardize IR-derived inverse point generation results."""
     return {

@@ -2082,12 +2082,13 @@ def main():
                             except Exception as _bae:
                                 print(f"[Inv自动补点] 批次{chunk_i+1} 失败: {_bae}")
                         if _bottom_auto_reset is not None:
-                            _bottom_fg_run = _bottom_auto_reset["fg_points"]
-                            _bottom_bg_run = _bottom_auto_reset["bg_points"]
+                            _bottom_reset_run = _rgb_inverse.apply_inverse_auto_reset(_bottom_auto_reset)
+                            _bottom_fg_run = _bottom_reset_run["fg_points"]
+                            _bottom_bg_run = _bottom_reset_run["bg_points"]
                             _bc_infer = None
                             print(f"[Inv自动重启] 批次{chunk_i+1} 使用跟丢时IR自动点 "
                                   f"FG={len(_bottom_fg_run)} BG={len(_bottom_bg_run)} "
-                                  f"src_frame={_bottom_auto_reset.get('frame')}")
+                                  f"src_frame={_bottom_reset_run.get('frame')}")
                             _bottom_auto_reset = None
                         elif _bottom_carry is not None and do_resize:
                             _bc_infer = upscale_mask(_bottom_carry, infer_wh)
