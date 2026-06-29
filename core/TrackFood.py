@@ -28,6 +28,7 @@ import torch
 import matplotlib
 matplotlib.use("Agg")   # 无头模式，不弹窗
 import matplotlib.pyplot as plt
+import ir_wok as _ir_wok
 import label_io as _label_io
 import output_utils as _output_utils
 import track_config as _track_config
@@ -88,105 +89,6 @@ RELABEL_INTERVAL_S = 4
 
 # 临时帧目录（放在 core/ 下）
 TMP_BASE        = os.path.join(_HERE, "tmp_sam2_frames")
-def _build_ir_wok_mask(wok_cfg, ir_shape):
-    ir_h, ir_w = ir_shape
-    mask = np.zeros((ir_h, ir_w), dtype=np.uint8)
-    cv2.ellipse(
-        mask,
-        (int(wok_cfg["cx"]), int(wok_cfg["cy"])),
-        (int(wok_cfg["rx"]), int(wok_cfg["ry"])),
-        0,
-        0,
-        360,
-        255,
-        -1,
-    )
-    return mask > 0
-
-
-def _load_ir_wok_region(wok_cfg_path, temp_data):
-    if temp_data is None:
-        print("[IR Mask] skipped: no temperature data")
-        return None, None
-    if not os.path.exists(wok_cfg_path):
-        print(f"[IR Mask] skipped: wok config not found: {wok_cfg_path}")
-        return None, None
-
-    with open(wok_cfg_path, "r", encoding="utf-8") as f:
-        wok_cfg = json.load(f)
-    wok_mask_ir = _build_ir_wok_mask(wok_cfg, temp_data.shape[1:3])
-    print(f"[IR Mask] loaded: {wok_cfg_path}")
-    print(
-        f"  cx={wok_cfg['cx']} cy={wok_cfg['cy']} "
-        f"rx={wok_cfg['rx']} ry={wok_cfg['ry']}  "
-        f"pixels={int(wok_mask_ir.sum())}"
-    )
-    return wok_cfg, wok_mask_ir
-
-
-def _estimate_ir_frame_translation(prev_ir, curr_ir, max_shift=20.0, min_response=0.08):
-    if prev_ir is None or curr_ir is None or prev_ir.shape != curr_ir.shape:
-        return 0.0, 0.0, 0.0, False
-
-    def _prep(frame):
-        img = np.asarray(frame, dtype=np.float32)
-        finite = np.isfinite(img)
-        if not finite.any():
-            return None
-        lo, hi = np.percentile(img[finite], [2, 98])
-        if hi <= lo:
-            return None
-        img = np.clip(img, lo, hi)
-        img = (img - lo) / max(hi - lo, 1e-6)
-        img = cv2.GaussianBlur(img, (3, 3), 0)
-        img = img - cv2.GaussianBlur(img, (0, 0), 5)
-        return img.astype(np.float32)
-
-    prev = _prep(prev_ir)
-    curr = _prep(curr_ir)
-    if prev is None or curr is None:
-        return 0.0, 0.0, 0.0, False
-
-    try:
-        win = cv2.createHanningWindow((prev.shape[1], prev.shape[0]), cv2.CV_32F)
-        (dx, dy), response = cv2.phaseCorrelate(prev, curr, win)
-    except Exception:
-        return 0.0, 0.0, 0.0, False
-
-    if (not np.isfinite(dx) or not np.isfinite(dy)
-            or not np.isfinite(response)
-            or abs(dx) > max_shift or abs(dy) > max_shift
-            or response < min_response):
-        return float(dx), float(dy), float(response), False
-    return float(dx), float(dy), float(response), True
-
-
-def _translate_binary_mask(mask, dx, dy):
-    if mask is None:
-        return None
-    h, w = mask.shape[:2]
-    mat = np.array([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]], dtype=np.float32)
-    moved = cv2.warpAffine(
-        mask.astype(np.uint8),
-        mat,
-        (w, h),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-    return moved > 0
-
-
-def _project_ir_wok_to_rgb_constraint(wok_mask_ir, homography, rgb_shape):
-    if wok_mask_ir is None or homography is None:
-        return None
-    rgb_h, rgb_w = rgb_shape
-    h_inv = np.linalg.inv(homography)
-    wok_u8 = wok_mask_ir.astype(np.uint8) * 255
-    projected = cv2.warpPerspective(wok_u8, h_inv, (rgb_w, rgb_h))
-    return projected > 64
-
-
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
 
 def find_temp_npy(video_path):
@@ -1383,7 +1285,7 @@ def main():
 
     # ── 加载 IR 锅区域配置（用于 IR 自动分割温度曲线）────────────────────────
     IR_FOOD_PCT = 40   # 锅内低于此百分位的像素 = 菜
-    wok_cfg, wok_mask_ir = _load_ir_wok_region(wok_cfg_path, temp_data)
+    wok_cfg, wok_mask_ir = _ir_wok.load_ir_wok_region(wok_cfg_path, temp_data)
 
     # ── 动态 wok 中心跟踪状态（方案B：用温度梯度跟踪锅中心漂移）───────────────
     # 手持拍摄时相机抖动导致 IR 中锅的位置帧间偏移，用高温区质心动态修正 cx/cy
@@ -1527,7 +1429,7 @@ def main():
     _wok_rgb_constraint = None   # (VH, VW) bool
     if wok_mask_ir is not None and homography is not None:
         try:
-            _wok_rgb_constraint = _project_ir_wok_to_rgb_constraint(
+            _wok_rgb_constraint = _ir_wok.project_ir_wok_to_rgb_constraint(
                 wok_mask_ir, homography, (VH, VW))
             # Inverse mode uses this IR->RGB projected wok mask directly.
             # Disable the RGB ellipse path to avoid extra center/radius correction.
@@ -1581,17 +1483,17 @@ def main():
                         _ir_frame_shift = temp_data[_ir_idx_shift]
                         if (_frame_shift_prev_ir is not None
                                 and _frame_shift_prev_ir_idx != _ir_idx_shift):
-                            _dx, _dy, _resp, _ok = _estimate_ir_frame_translation(
+                            _dx, _dy, _resp, _ok = _ir_wok.estimate_ir_frame_translation(
                                 _frame_shift_prev_ir, _ir_frame_shift)
                             if _ok:
-                                wok_mask_ir = _translate_binary_mask(wok_mask_ir, _dx, _dy)
+                                wok_mask_ir = _ir_wok.translate_binary_mask(wok_mask_ir, _dx, _dy)
                                 _wok_mask_al = wok_mask_ir.copy()
                                 _wok_cx += _dx
                                 _wok_cy += _dy
                                 _frame_shift_total_dx += _dx
                                 _frame_shift_total_dy += _dy
                                 if homography is not None:
-                                    _wok_rgb_constraint = _project_ir_wok_to_rgb_constraint(
+                                    _wok_rgb_constraint = _ir_wok.project_ir_wok_to_rgb_constraint(
                                         wok_mask_ir, homography, (VH, VW))
                                     wok_rgb_mask_static = None
                                 _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
@@ -1686,7 +1588,7 @@ def main():
                                         0, 0, 360, 255, -1)
                             wok_mask_ir = _wm_new > 0
                             _wok_mask_al = wok_mask_ir.copy()
-                            _wok_rgb_constraint = _project_ir_wok_to_rgb_constraint(
+                            _wok_rgb_constraint = _ir_wok.project_ir_wok_to_rgb_constraint(
                                 wok_mask_ir, homography, (VH, VW))
                             wok_rgb_mask_static = None
                             _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
@@ -1775,7 +1677,7 @@ def main():
                                                 0, 0, 360, 255, -1)
                                     wok_mask_ir = _wm_new > 0
                                     _wok_mask_al = wok_mask_ir.copy()
-                                    _wok_rgb_constraint = _project_ir_wok_to_rgb_constraint(
+                                    _wok_rgb_constraint = _ir_wok.project_ir_wok_to_rgb_constraint(
                                         wok_mask_ir, homography, (VH, VW))
                                     wok_rgb_mask_static = None
                                     _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
