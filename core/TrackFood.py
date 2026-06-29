@@ -1538,12 +1538,16 @@ def main():
                     # ── 检查 carry_mask 是否还在锅内（位置检查，比面积检查更可靠）────
                     # 指标：mask 与锅内区域(wok_rgb_constraint)的交集 / mask 自身面积
                     # < 60% 说明 mask 大部分跑到锅外/搅拌爪/金属部件上 → 强制重置
-                    _mask_px = int(carry_mask.sum())
+                    _reset_metrics = _rgb_forward.compute_forward_reset_metrics(
+                        carry_mask,
+                        _wok_rgb_constraint,
+                        VW * VH,
+                        last_reinforce_wok_pct,
+                    )
+                    _mask_px = _reset_metrics["mask_px"]
                     _need_reset = False
-                    _overlap_pct = 100.0   # 默认100%（无wok约束时不重置）
+                    _overlap_pct = _reset_metrics["overlap_pct"]
                     if _wok_rgb_constraint is not None and _mask_px > 0:
-                        _overlap_px = int((carry_mask & _wok_rgb_constraint).sum())
-                        _overlap_pct = _overlap_px / _mask_px * 100
                         if _overlap_pct < 60.0:
                             _need_reset = True
                             print(f"[补强] t={chunk_start_s:.1f}s  "
@@ -1551,8 +1555,8 @@ def main():
                                   f"重置SAM2→初始标注点")
                     # 也保留面积检查：mask 超过 wok 区域 35% 同样重置（整锅漂移/锅底漂移）
                     # 食材正常情况下占锅内面积 < 35%，超过说明 SAM2 追踪到了锅底/空白区域
-                    _wok_px_chk = int(_wok_rgb_constraint.sum()) if _wok_rgb_constraint is not None else (VW * VH)
-                    _mask_vs_wok = _mask_px / max(_wok_px_chk, 1) * 100
+                    _wok_px_chk = _reset_metrics["wok_px"]
+                    _mask_vs_wok = _reset_metrics["mask_vs_wok"]
                     if not _need_reset:
                         if _mask_vs_wok > 35.0:
                             _need_reset = True
@@ -1563,7 +1567,7 @@ def main():
                     # last_reinforce_wok_pct = 上次补强时 mask 占 wok% （不是批次均值）
                     # 骤降 > 70% 或绝对值 < 2% → 重置
                     if not _need_reset and _wok_px_chk > 0:
-                        _drop_pct = (last_reinforce_wok_pct - _mask_vs_wok) / max(last_reinforce_wok_pct, 0.1) * 100
+                        _drop_pct = _reset_metrics["drop_pct"]
                         if _mask_vs_wok < 2.0:
                             _need_reset = True
                             print(f"[补强] t={chunk_start_s:.1f}s  "
