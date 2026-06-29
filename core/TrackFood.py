@@ -17,7 +17,6 @@ TrackFood.py — SAM2 视频追踪食材 + 温度融合（分批处理版）
 import os
 import sys
 import json
-import argparse
 import shutil
 import glob
 import re
@@ -31,6 +30,7 @@ matplotlib.use("Agg")   # 无头模式，不弹窗
 import matplotlib.pyplot as plt
 import label_io as _label_io
 import output_utils as _output_utils
+import track_config as _track_config
 
 # ── 路径基准（本文件所在目录）────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -88,40 +88,6 @@ RELABEL_INTERVAL_S = 4
 
 # 临时帧目录（放在 core/ 下）
 TMP_BASE        = os.path.join(_HERE, "tmp_sam2_frames")
-
-
-def _resolve_project_path(path, base_dir=None):
-    if path is None:
-        return None
-    path = os.path.expanduser(str(path))
-    if os.path.isabs(path):
-        return os.path.normpath(path)
-    if base_dir:
-        by_config = os.path.normpath(os.path.join(base_dir, path))
-        if os.path.exists(by_config):
-            return by_config
-    return os.path.normpath(os.path.join(_PROJECT_ROOT, path))
-
-
-def _load_run_config(path):
-    if not path:
-        return {}, None
-    config_path = _resolve_project_path(path)
-    if not os.path.exists(config_path):
-        print(f"[error] run config not found: {config_path}")
-        sys.exit(1)
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f), os.path.dirname(config_path)
-
-
-def _cfg_first(config, *keys):
-    for key in keys:
-        value = config.get(key)
-        if value not in (None, ""):
-            return value
-    return None
-
-
 def _build_ir_wok_mask(wok_cfg, ir_shape):
     ir_h, ir_w = ir_shape
     mask = np.zeros((ir_h, ir_w), dtype=np.uint8)
@@ -1168,63 +1134,24 @@ def generate_inverse_bottom_points_from_ir(rgb_frame, ir_frame, wok_mask_ir,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run Chef Vision tracking")
-    parser.add_argument("--run-config", "--config", dest="run_config", default=None,
-                        help="JSON config with video/labels/temp/wok paths")
-    parser.add_argument("--labels", default=None,
-                        help="Path to food_labels.json")
-    parser.add_argument("--video", default=None,
-                        help="Override RGB video path from labels/config")
-    parser.add_argument("--temp", "--npy", dest="temp", default=None,
-                        help="Temperature npy path; omitted means auto-match from video")
-    parser.add_argument("--homography", default=None,
-                        help="Path to homography.npy")
-    parser.add_argument("--wok", "--wok-config", dest="wok_config", default=None,
-                        help="Path to wok_region.json")
-    parser.add_argument("--ir-wok-strategy", default=None,
-                        choices=("legacy", "static", "frame_shift"),
-                        help="IR wok update strategy: legacy uses old cues; static keeps the initial manual region; frame_shift translates the previous mask by IR frame registration")
-    parser.add_argument("--output-root", default=None,
-                        help="Output root directory; default is project output/")
-    parser.add_argument("--max-frames", type=int, default=None,
-                        help="Optional short-run limit from the start frame; default runs the full video")
-    args = parser.parse_args()
-
-    run_config, run_config_dir = _load_run_config(args.run_config)
-    labels_json = _resolve_project_path(
-        args.labels or _cfg_first(run_config, "labels", "labels_path", "food_labels"),
-        run_config_dir
-    ) or LABELS_JSON
-    video_override = _resolve_project_path(
-        args.video or _cfg_first(run_config, "video", "video_path", "rgb_video"),
-        run_config_dir
+    runtime_cfg = _track_config.resolve_runtime_config(
+        sys.argv[1:],
+        project_root=_PROJECT_ROOT,
+        default_labels_json=LABELS_JSON,
+        default_homography_path=HOMOGRAPHY_PATH,
+        default_wok_cfg_path=os.path.join(_HERE, "..", "data", "wok_region.json"),
+        default_output_root=os.path.join(_HERE, "..", "output"),
     )
-    homography_path = _resolve_project_path(
-        args.homography or _cfg_first(run_config, "homography", "homography_path"),
-        run_config_dir
-    ) or HOMOGRAPHY_PATH
-    wok_cfg_path = _resolve_project_path(
-        args.wok_config or _cfg_first(run_config, "wok", "wok_config", "wok_region"),
-        run_config_dir
-    ) or os.path.join(_HERE, "..", "data", "wok_region.json")
-    temp_override = _resolve_project_path(
-        args.temp or _cfg_first(run_config, "temp", "temp_path", "npy", "temperature"),
-        run_config_dir
-    )
-    ir_wok_strategy = (
-        args.ir_wok_strategy
-        or _cfg_first(run_config, "ir_wok_strategy", "wok_strategy")
-        or "legacy"
-    )
-    if ir_wok_strategy not in ("legacy", "static", "frame_shift"):
-        print(f"[error] invalid ir_wok_strategy: {ir_wok_strategy}")
-        sys.exit(1)
-    output_root = _resolve_project_path(
-        args.output_root or _cfg_first(run_config, "output_root", "output_dir"),
-        run_config_dir
-    ) or os.path.join(_HERE, "..", "output")
-    if args.run_config:
-        print(f"[config] loaded: {os.path.abspath(args.run_config)}")
+    labels_json = runtime_cfg.labels_json
+    video_override = runtime_cfg.video_override
+    homography_path = runtime_cfg.homography_path
+    wok_cfg_path = runtime_cfg.wok_cfg_path
+    temp_override = runtime_cfg.temp_override
+    ir_wok_strategy = runtime_cfg.ir_wok_strategy
+    output_root = runtime_cfg.output_root
+    max_frames = runtime_cfg.max_frames
+    if runtime_cfg.run_config_path:
+        print(f"[config] loaded: {os.path.abspath(runtime_cfg.run_config_path)}")
     print(f"[IR Mask] strategy={ir_wok_strategy}")
     # ── 创建时间戳输出子目录 ──────────────────────────────────────────────────
     run_ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1292,9 +1219,9 @@ def main():
     VH           = int(cap_info.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap_info.release()
     track_end_frame = total_frames
-    if args.max_frames is not None:
-        track_end_frame = min(total_frames, start_frame + max(1, int(args.max_frames)))
-        print(f"[config] short run enabled: max_frames={args.max_frames}")
+    if max_frames is not None:
+        track_end_frame = min(total_frames, start_frame + max(1, int(max_frames)))
+        print(f"[config] short run enabled: max_frames={max_frames}")
     track_frames = max(0, track_end_frame - start_frame)
     print(f"[config] effective track range: {start_frame} ~ {track_end_frame} ({track_frames} frames)")
     print(f"\n[视频] {video_path}")
