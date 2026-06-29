@@ -24,6 +24,23 @@ class FrameShiftUpdate:
     history_entry: tuple[int, float, float] | None
 
 
+@dataclass
+class LegacyHotRingUpdate:
+    wok_cx: float
+    wok_cy: float
+    wok_rx: float
+    wok_ry: float
+    wok_mask_ir: object
+    wok_rgb_constraint: object
+    disable_static_rgb_mask: bool
+    history_entry: tuple[int, float, float] | None
+    hot_ref_ready: bool
+    hot_sx: float
+    hot_sy: float
+    recent_drifts: list[float]
+    tilting: bool
+
+
 def build_ir_wok_mask(wok_cfg, ir_shape):
     ir_h, ir_w = ir_shape
     mask = np.zeros((ir_h, ir_w), dtype=np.uint8)
@@ -200,4 +217,164 @@ def apply_frame_shift_update(
         wok_rgb_constraint=wok_rgb_constraint,
         disable_static_rgb_mask=disable_static_rgb_mask,
         history_entry=history_entry,
+    )
+
+
+def apply_legacy_hot_ring_update(
+    hot_fit,
+    wok_cfg,
+    wok_cx,
+    wok_cy,
+    wok_rx,
+    wok_ry,
+    hot_ref_ready,
+    hot_sx,
+    hot_sy,
+    max_drift,
+    chunk_start_abs,
+    chunk_start_s,
+    homography,
+    rgb_shape,
+    recent_drifts,
+    tilting,
+    ir_shape,
+):
+    wok_mask_ir = None
+    wok_rgb_constraint = None
+    disable_static_rgb_mask = False
+    history_entry = None
+    updated_recent_drifts = list(recent_drifts)
+    updated_tilting = tilting
+
+    if not hot_fit:
+        return LegacyHotRingUpdate(
+            wok_cx=wok_cx,
+            wok_cy=wok_cy,
+            wok_rx=wok_rx,
+            wok_ry=wok_ry,
+            wok_mask_ir=wok_mask_ir,
+            wok_rgb_constraint=wok_rgb_constraint,
+            disable_static_rgb_mask=disable_static_rgb_mask,
+            history_entry=history_entry,
+            hot_ref_ready=hot_ref_ready,
+            hot_sx=hot_sx,
+            hot_sy=hot_sy,
+            recent_drifts=updated_recent_drifts,
+            tilting=updated_tilting,
+        )
+
+    if not hot_fit.get("ok"):
+        print(f"[wok-hot] t={chunk_start_s:.1f}s  skip: {hot_fit.get('reason')}")
+        return LegacyHotRingUpdate(
+            wok_cx=wok_cx,
+            wok_cy=wok_cy,
+            wok_rx=wok_rx,
+            wok_ry=wok_ry,
+            wok_mask_ir=wok_mask_ir,
+            wok_rgb_constraint=wok_rgb_constraint,
+            disable_static_rgb_mask=disable_static_rgb_mask,
+            history_entry=history_entry,
+            hot_ref_ready=hot_ref_ready,
+            hot_sx=hot_sx,
+            hot_sy=hot_sy,
+            recent_drifts=updated_recent_drifts,
+            tilting=updated_tilting,
+        )
+
+    ring_cx = float(hot_fit["cx"])
+    ring_cy = float(hot_fit["cy"])
+    ring_rx = float(hot_fit["rx"])
+    ring_ry = float(hot_fit["ry"])
+    if not hot_ref_ready:
+        hot_sx = float(np.clip(wok_rx / max(ring_rx, 1.0), 1.02, 1.40))
+        hot_sy = float(np.clip(wok_ry / max(ring_ry, 1.0), 1.02, 1.40))
+        hot_ref_ready = True
+        print(f"[wok-hot] expand locked  sx={hot_sx:.3f} sy={hot_sy:.3f}")
+
+    cx_candidate = ring_cx
+    cy_candidate = ring_cy
+    rx_candidate = ring_rx * hot_sx
+    ry_candidate = ring_ry * hot_sy
+    raw_drift = (((cx_candidate - wok_cx) ** 2 + (cy_candidate - wok_cy) ** 2) ** 0.5)
+    init_drift = (((cx_candidate - float(wok_cfg["cx"])) ** 2
+                   + (cy_candidate - float(wok_cfg["cy"])) ** 2) ** 0.5)
+    max_init_drift = max(12.0, max(wok_rx, wok_ry) * 0.28)
+    rx_init_ratio = rx_candidate / max(float(wok_cfg["rx"]), 1.0)
+    ry_init_ratio = ry_candidate / max(float(wok_cfg["ry"]), 1.0)
+
+    if raw_drift > max_drift:
+        print(f"[wok-edge] t={chunk_start_s:.1f}s  "
+              f"reject drift={raw_drift:.1f}px>{max_drift}px")
+    elif init_drift > max_init_drift:
+        print(f"[wok-edge] t={chunk_start_s:.1f}s  "
+              f"reject cumulative={init_drift:.1f}px>{max_init_drift:.1f}px")
+    elif (rx_init_ratio < 0.78 or rx_init_ratio > 1.22
+          or ry_init_ratio < 0.78 or ry_init_ratio > 1.22):
+        print(f"[wok-edge] t={chunk_start_s:.1f}s  "
+              f"reject radius rx={rx_init_ratio:.2f} ry={ry_init_ratio:.2f}")
+    elif raw_drift > 0.5:
+        cx_old, cy_old = wok_cx, wok_cy
+        rx_old, ry_old = wok_rx, wok_ry
+        smooth = 0.35
+        r_smooth = 0.18
+        wok_cx = wok_cx * (1.0 - smooth) + cx_candidate * smooth
+        wok_cy = wok_cy * (1.0 - smooth) + cy_candidate * smooth
+        wok_rx = wok_rx * (1.0 - r_smooth) + rx_candidate * r_smooth
+        wok_ry = wok_ry * (1.0 - r_smooth) + ry_candidate * r_smooth
+        drift = (((wok_cx - cx_old) ** 2 + (wok_cy - cy_old) ** 2) ** 0.5)
+
+        ir_h, ir_w = ir_shape
+        wm_new = np.zeros((ir_h, ir_w), dtype=np.uint8)
+        cv2.ellipse(
+            wm_new,
+            (int(round(wok_cx)), int(round(wok_cy))),
+            (int(round(wok_rx)), int(round(wok_ry))),
+            0,
+            0,
+            360,
+            255,
+            -1,
+        )
+        wok_mask_ir = wm_new > 0
+        if homography is not None:
+            wok_rgb_constraint = project_ir_wok_to_rgb_constraint(
+                wok_mask_ir, homography, rgb_shape)
+            disable_static_rgb_mask = True
+        history_entry = (chunk_start_abs, wok_cx, wok_cy)
+        print(f"[wok-hot] t={chunk_start_s:.1f}s  "
+              f"cx: {cx_old:.1f}->{wok_cx:.1f}  "
+              f"cy: {cy_old:.1f}->{wok_cy:.1f}  "
+              f"rx: {rx_old:.1f}->{wok_rx:.1f}  "
+              f"ry: {ry_old:.1f}->{wok_ry:.1f}  "
+              f"raw={raw_drift:.1f}px step={drift:.1f}px  "
+              f"pts={hot_fit['points']} sectors={hot_fit['sectors']} "
+              f"peak={hot_fit['peak']:.1f} mode={hot_fit['fit_mode']}")
+
+        updated_recent_drifts.append(drift)
+        if len(updated_recent_drifts) > 3:
+            updated_recent_drifts.pop(0)
+        cum_drift = sum(updated_recent_drifts)
+        was_tilting = updated_tilting
+        updated_tilting = (len(updated_recent_drifts) >= 2 and cum_drift > 30.0)
+        if updated_tilting and not was_tilting:
+            print(f"[tilt] t={chunk_start_s:.1f}s  "
+                  f"detected quick wok motion (cum drift={cum_drift:.1f}px)")
+        elif was_tilting and not updated_tilting:
+            print(f"[tilt] t={chunk_start_s:.1f}s  "
+                  f"wok motion stabilized (cum drift={cum_drift:.1f}px)")
+
+    return LegacyHotRingUpdate(
+        wok_cx=wok_cx,
+        wok_cy=wok_cy,
+        wok_rx=wok_rx,
+        wok_ry=wok_ry,
+        wok_mask_ir=wok_mask_ir,
+        wok_rgb_constraint=wok_rgb_constraint,
+        disable_static_rgb_mask=disable_static_rgb_mask,
+        history_entry=history_entry,
+        hot_ref_ready=hot_ref_ready,
+        hot_sx=hot_sx,
+        hot_sy=hot_sy,
+        recent_drifts=updated_recent_drifts,
+        tilting=updated_tilting,
     )

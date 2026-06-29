@@ -1517,91 +1517,43 @@ def main():
                     _ir_w_ud = _ir_frm_wok_upd.shape[1]
                     _hot_fit = _estimate_wok_from_ir_hot_ring(
                         _ir_frm_wok_upd, _wok_cx, _wok_cy, _wok_rx, _wok_ry)
-                    if _hot_fit and _hot_fit.get("ok"):
-                        _ring_cx = float(_hot_fit["cx"])
-                        _ring_cy = float(_hot_fit["cy"])
-                        _ring_rx = float(_hot_fit["rx"])
-                        _ring_ry = float(_hot_fit["ry"])
-                        if not _wok_hot_ref_ready:
-                            _wok_hot_dx = 0.0
-                            _wok_hot_dy = 0.0
-                            _wok_hot_sx = float(np.clip(
-                                _wok_rx / max(_ring_rx, 1.0), 1.02, 1.40))
-                            _wok_hot_sy = float(np.clip(
-                                _wok_ry / max(_ring_ry, 1.0), 1.02, 1.40))
-                            _wok_hot_ref_ready = True
-                            print(f"[wok-hot] expand locked  "
-                                  f"sx={_wok_hot_sx:.3f} sy={_wok_hot_sy:.3f}")
-
-                        _cx_candidate = _ring_cx
-                        _cy_candidate = _ring_cy
-                        _rx_candidate = _ring_rx * _wok_hot_sx
-                        _ry_candidate = _ring_ry * _wok_hot_sy
-                        _raw_drift = (((_cx_candidate - _wok_cx) ** 2
-                                       + (_cy_candidate - _wok_cy) ** 2) ** 0.5)
-                        _init_drift = (((_cx_candidate - float(wok_cfg["cx"])) ** 2
-                                        + (_cy_candidate - float(wok_cfg["cy"])) ** 2) ** 0.5)
-                        _WOK_MAX_INIT_DRIFT = max(12.0, max(_wok_rx, _wok_ry) * 0.28)
-                        _rx_init_ratio = _rx_candidate / max(float(wok_cfg["rx"]), 1.0)
-                        _ry_init_ratio = _ry_candidate / max(float(wok_cfg["ry"]), 1.0)
-
-                        if _raw_drift > _WOK_MAX_DRIFT:
-                            print(f"[wok-edge] t={chunk_start_s:.1f}s  "
-                                  f"reject drift={_raw_drift:.1f}px>{_WOK_MAX_DRIFT}px")
-                        elif _init_drift > _WOK_MAX_INIT_DRIFT:
-                            print(f"[wok-edge] t={chunk_start_s:.1f}s  "
-                                  f"reject cumulative={_init_drift:.1f}px>{_WOK_MAX_INIT_DRIFT:.1f}px")
-                        elif (_rx_init_ratio < 0.78 or _rx_init_ratio > 1.22
-                              or _ry_init_ratio < 0.78 or _ry_init_ratio > 1.22):
-                            print(f"[wok-edge] t={chunk_start_s:.1f}s  "
-                                  f"reject radius rx={_rx_init_ratio:.2f} ry={_ry_init_ratio:.2f}")
-                        elif _raw_drift > 0.5:
-                            _cx_old, _cy_old = _wok_cx, _wok_cy
-                            _rx_old, _ry_old = _wok_rx, _wok_ry
-                            _smooth = 0.35
-                            _r_smooth = 0.18
-                            _wok_cx = _wok_cx * (1.0 - _smooth) + _cx_candidate * _smooth
-                            _wok_cy = _wok_cy * (1.0 - _smooth) + _cy_candidate * _smooth
-                            _wok_rx = _wok_rx * (1.0 - _r_smooth) + _rx_candidate * _r_smooth
-                            _wok_ry = _wok_ry * (1.0 - _r_smooth) + _ry_candidate * _r_smooth
-                            _drift = (((_wok_cx - _cx_old) ** 2
-                                       + (_wok_cy - _cy_old) ** 2) ** 0.5)
-
-                            _wm_new = np.zeros((_ir_h_ud, _ir_w_ud), dtype=np.uint8)
-                            cv2.ellipse(_wm_new,
-                                        (int(round(_wok_cx)), int(round(_wok_cy))),
-                                        (int(round(_wok_rx)), int(round(_wok_ry))),
-                                        0, 0, 360, 255, -1)
-                            wok_mask_ir = _wm_new > 0
-                            _wok_mask_al = wok_mask_ir.copy()
-                            _wok_rgb_constraint = _ir_wok.project_ir_wok_to_rgb_constraint(
-                                wok_mask_ir, homography, (VH, VW))
-                            wok_rgb_mask_static = None
-                            _wok_cx_history.append((chunk_start_abs, _wok_cx, _wok_cy))
-                            print(f"[wok-hot] t={chunk_start_s:.1f}s  "
-                                  f"cx: {_cx_old:.1f}->{_wok_cx:.1f}  "
-                                  f"cy: {_cy_old:.1f}->{_wok_cy:.1f}  "
-                                  f"rx: {_rx_old:.1f}->{_wok_rx:.1f}  "
-                                  f"ry: {_ry_old:.1f}->{_wok_ry:.1f}  "
-                                  f"raw={_raw_drift:.1f}px step={_drift:.1f}px  "
-                                  f"pts={_hot_fit['points']} sectors={_hot_fit['sectors']} "
-                                  f"peak={_hot_fit['peak']:.1f} mode={_hot_fit['fit_mode']}")
-
-                            _wok_recent_drifts.append(_drift)
-                            if len(_wok_recent_drifts) > 3:
-                                _wok_recent_drifts.pop(0)
-                            _cum_drift = sum(_wok_recent_drifts)
-                            _was_tilting = _wok_tilting
-                            _wok_tilting = (len(_wok_recent_drifts) >= 2
-                                            and _cum_drift > 30.0)
-                            if _wok_tilting and not _was_tilting:
-                                print(f"[tilt] t={chunk_start_s:.1f}s  "
-                                      f"detected quick wok motion (cum drift={_cum_drift:.1f}px)")
-                            elif _was_tilting and not _wok_tilting:
-                                print(f"[tilt] t={chunk_start_s:.1f}s  "
-                                      f"wok motion stabilized (cum drift={_cum_drift:.1f}px)")
-                    elif _hot_fit:
-                        print(f"[wok-hot] t={chunk_start_s:.1f}s  skip: {_hot_fit.get('reason')}")
+                    _legacy_hot_update = _ir_wok.apply_legacy_hot_ring_update(
+                        _hot_fit,
+                        wok_cfg,
+                        _wok_cx,
+                        _wok_cy,
+                        _wok_rx,
+                        _wok_ry,
+                        _wok_hot_ref_ready,
+                        _wok_hot_sx,
+                        _wok_hot_sy,
+                        _WOK_MAX_DRIFT,
+                        chunk_start_abs,
+                        chunk_start_s,
+                        homography,
+                        (VH, VW),
+                        _wok_recent_drifts,
+                        _wok_tilting,
+                        (_ir_h_ud, _ir_w_ud),
+                    )
+                    _wok_cx = _legacy_hot_update.wok_cx
+                    _wok_cy = _legacy_hot_update.wok_cy
+                    _wok_rx = _legacy_hot_update.wok_rx
+                    _wok_ry = _legacy_hot_update.wok_ry
+                    _wok_hot_ref_ready = _legacy_hot_update.hot_ref_ready
+                    _wok_hot_sx = _legacy_hot_update.hot_sx
+                    _wok_hot_sy = _legacy_hot_update.hot_sy
+                    _wok_recent_drifts = _legacy_hot_update.recent_drifts
+                    _wok_tilting = _legacy_hot_update.tilting
+                    if _legacy_hot_update.wok_mask_ir is not None:
+                        wok_mask_ir = _legacy_hot_update.wok_mask_ir
+                        _wok_mask_al = wok_mask_ir.copy()
+                    if _legacy_hot_update.wok_rgb_constraint is not None:
+                        _wok_rgb_constraint = _legacy_hot_update.wok_rgb_constraint
+                    if _legacy_hot_update.disable_static_rgb_mask:
+                        wok_rgb_mask_static = None
+                    if _legacy_hot_update.history_entry is not None:
+                        _wok_cx_history.append(_legacy_hot_update.history_entry)
                     # 宽松椭圆（1.5×）搜索范围
                     _loose_mask = np.zeros((_ir_h_ud, _ir_w_ud), dtype=np.uint8)
                     cv2.ellipse(_loose_mask,
