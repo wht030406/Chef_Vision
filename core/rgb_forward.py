@@ -8,6 +8,23 @@ def build_forward_inject_keyframe(fg_points, bg_points=None, label="", local_fra
     }
 
 
+def build_forward_axis_bg(axis_cx, axis_cy):
+    """Build the optional axis-center background point list for forward injection."""
+    if axis_cx is None or axis_cy is None:
+        return []
+    return [[axis_cx, axis_cy]]
+
+
+def build_forward_ir_inject(fg_points, axis_cx, axis_cy, label, local_frame=0):
+    """Build a standard IR-derived forward injection payload."""
+    return build_forward_inject_keyframe(
+        fg_points,
+        build_forward_axis_bg(axis_cx, axis_cy),
+        label=label,
+        local_frame=local_frame,
+    )
+
+
 def compute_forward_reset_metrics(
     carry_mask,
     wok_rgb_constraint,

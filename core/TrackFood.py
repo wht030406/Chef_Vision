@@ -1677,12 +1677,10 @@ def main():
                                 print(f"[补强] IR定位失败({_re})，重置后用初始标注点")
                         if _ir_fg_pts:
                             # 旋转轴中心作为固定背景点
-                            _axis_bg = []
-                            if _AXIS_CX_RGB is not None:
-                                _axis_bg = [[_AXIS_CX_RGB, _AXIS_CY_RGB]]
-                            _reinforce_inject = _rgb_forward.build_forward_inject_keyframe(
+                            _reinforce_inject = _rgb_forward.build_forward_ir_inject(
                                 _ir_fg_pts,
-                                _axis_bg,
+                                _AXIS_CX_RGB,
+                                _AXIS_CY_RGB,
                                 label="IR-reset",
                             )
 
@@ -1839,10 +1837,10 @@ def main():
                                 except Exception:
                                     pass
                             if _ir_fg_pts_iou:
-                                _axis_bg_iou = [[_AXIS_CX_RGB, _AXIS_CY_RGB]] if _AXIS_CX_RGB is not None else []
-                                _reinforce_inject = _rgb_forward.build_forward_inject_keyframe(
+                                _reinforce_inject = _rgb_forward.build_forward_ir_inject(
                                     _ir_fg_pts_iou,
-                                    _axis_bg_iou,
+                                    _AXIS_CX_RGB,
+                                    _AXIS_CY_RGB,
                                     label="IR-IoU-reset",
                                 )
                             # 保存预览图
@@ -2544,10 +2542,10 @@ def main():
                                         continue
                                 _fg_ni.append([_xi_ni, _yi_ni])
                             if _fg_ni:
-                                _axis_bg_ni = [[_AXIS_CX_RGB, _AXIS_CY_RGB]] if _AXIS_CX_RGB is not None else []
-                                _next_inject = _rgb_forward.build_forward_inject_keyframe(
+                                _next_inject = _rgb_forward.build_forward_ir_inject(
                                     _fg_ni,
-                                    _axis_bg_ni,
+                                    _AXIS_CX_RGB,
+                                    _AXIS_CY_RGB,
                                     label="IR-fix-next",
                                 )
                                 print(f"[IR-fix接管] 已生成下批注入前景点 {len(_fg_ni)} 个"
