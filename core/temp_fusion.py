@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 
+from projection_utils import map_mask_to_ir
+
 
 def _kmeans_food_temperature(wok_temps, min_cluster_gap=30.0):
     """Estimate food temperature from the low-temperature cluster inside the wok."""
@@ -85,7 +87,6 @@ def measure_rgb_mask_temperature(
     temp_data,
     homography,
     ir_frame_idx,
-    project_mask_to_ir,
 ):
     """Project an RGB mask into IR space and return mean/min/max temperature."""
     nan_stats = (float("nan"), float("nan"), float("nan"))
@@ -95,7 +96,7 @@ def measure_rgb_mask_temperature(
         return nan_stats
 
     ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
-    ir_mask = project_mask_to_ir(rgb_mask, homography, (ir_h, ir_w))
+    ir_mask = map_mask_to_ir(rgb_mask, homography, (ir_h, ir_w))
     food_temps = temp_data[ir_frame_idx][ir_mask]
     if len(food_temps) == 0:
         return nan_stats
@@ -139,7 +140,6 @@ def measure_inverse_mask_temperature(
     temp_data,
     homography,
     ir_frame_idx,
-    project_mask_to_ir,
 ):
     """Project an inverse-semantic RGB mask into IR and return its mean temperature."""
     if inverse_mask is None or temp_data is None or homography is None:
@@ -150,7 +150,7 @@ def measure_inverse_mask_temperature(
         return float("nan")
 
     ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
-    ir_mask = project_mask_to_ir(inverse_mask, homography, (ir_h, ir_w))
+    ir_mask = map_mask_to_ir(inverse_mask, homography, (ir_h, ir_w))
     inv_temps = temp_data[ir_frame_idx][ir_mask]
     if len(inv_temps) == 0:
         return float("nan")

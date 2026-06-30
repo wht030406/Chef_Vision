@@ -291,27 +291,6 @@ def track_chunk(predictor, tmp_dir, frame_names,
     return masks, last_mask
 
 
-def map_mask_to_ir(rgb_mask, homography, ir_shape):
-    """Project an RGB mask into IR image coordinates."""
-    H_ir, W_ir = ir_shape
-    ys, xs = np.where(rgb_mask)
-    if len(xs) == 0:
-        return np.zeros(ir_shape, dtype=bool)
-
-    pts_rgb = np.stack([xs, ys, np.ones(len(xs))], axis=1).T
-    pts_ir = homography @ pts_rgb
-    pts_ir = pts_ir[:2] / pts_ir[2]
-
-    xi = np.round(pts_ir[0]).astype(int)
-    yi = np.round(pts_ir[1]).astype(int)
-    valid = (xi >= 0) & (xi < W_ir) & (yi >= 0) & (yi < H_ir)
-    xi, yi = xi[valid], yi[valid]
-
-    ir_mask = np.zeros(ir_shape, dtype=bool)
-    ir_mask[yi, xi] = True
-    return ir_mask
-
-
 def flow_propagate_mask(prev_gray, cur_gray, prev_mask):
     """
     用 Farneback 稠密光流将上一帧 mask 传播到当前帧。
@@ -2101,7 +2080,7 @@ def main():
 
                 vis       = render_overlay(frame, mask, MASK_COLOR, MASK_ALPHA)
                 temp_mean, temp_min, temp_max = _temp_fusion.measure_rgb_mask_temperature(
-                    mask, temp_data, homography, _get_ir_idx(abs_idx), map_mask_to_ir)
+                    mask, temp_data, homography, _get_ir_idx(abs_idx))
 
                 time_s     = abs_idx / fps
                 mask_ratio = mask.sum() / mask.size * 100
@@ -2306,7 +2285,6 @@ def main():
                                 temp_data,
                                 homography,
                                 _get_ir_idx(abs_idx),
-                                map_mask_to_ir,
                             )
                     except Exception as _inv_e:
                         pass  # 计算失败不影响主流程
@@ -2517,7 +2495,7 @@ def main():
 
             # 温度统计
             temp_mean, temp_min, temp_max = _temp_fusion.measure_rgb_mask_temperature(
-                mask, temp_data, homography, _get_ir_idx(abs_idx), map_mask_to_ir)
+                mask, temp_data, homography, _get_ir_idx(abs_idx))
 
             time_s     = abs_idx / fps
             mask_ratio = mask.sum() / mask.size * 100
