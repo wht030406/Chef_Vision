@@ -54,3 +54,26 @@ def measure_roi_temperature(temp_data, homography, ir_frame_idx, roi_cfg):
         return float(np.mean(roi_temps))
     except Exception:
         return float("nan")
+
+
+def measure_inverse_mask_temperature(
+    inverse_mask,
+    temp_data,
+    homography,
+    ir_frame_idx,
+    project_mask_to_ir,
+):
+    """Project an inverse-semantic RGB mask into IR and return its mean temperature."""
+    if inverse_mask is None or temp_data is None or homography is None:
+        return float("nan")
+    if ir_frame_idx < 0 or ir_frame_idx >= temp_data.shape[0]:
+        return float("nan")
+    if not inverse_mask.any():
+        return float("nan")
+
+    ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
+    ir_mask = project_mask_to_ir(inverse_mask, homography, (ir_h, ir_w))
+    inv_temps = temp_data[ir_frame_idx][ir_mask]
+    if len(inv_temps) == 0:
+        return float("nan")
+    return float(np.mean(inv_temps))

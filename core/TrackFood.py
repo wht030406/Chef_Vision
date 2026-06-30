@@ -2411,16 +2411,13 @@ def main():
                             _inv_mask = (_inv_mask_override
                                          if _inv_mask_override is not None
                                          else (_dyn_wok_bool & ~_bm_full))
-                            if _inv_mask.any() and temp_data is not None and homography is not None:
-                                ir_h_inv, ir_w_inv = temp_data.shape[1], temp_data.shape[2]
-                                ir_mask_inv = map_mask_to_ir(_inv_mask, homography,
-                                                             (ir_h_inv, ir_w_inv))
-                                ir_idx_inv  = _get_ir_idx(abs_idx)
-                                if ir_idx_inv < temp_data.shape[0]:
-                                    t_frame_inv  = temp_data[ir_idx_inv]
-                                    inv_temps    = t_frame_inv[ir_mask_inv]
-                                    if len(inv_temps) > 0:
-                                        inverse_temp_mean = float(np.mean(inv_temps))
+                            inverse_temp_mean = _temp_fusion.measure_inverse_mask_temperature(
+                                _inv_mask,
+                                temp_data,
+                                homography,
+                                _get_ir_idx(abs_idx),
+                                map_mask_to_ir,
+                            )
                     except Exception as _inv_e:
                         pass  # 计算失败不影响主流程
                 # ── 反向语义面积门控：inv_mask > 60% wok椭圆时视为锅直立/异常，清空 ──
