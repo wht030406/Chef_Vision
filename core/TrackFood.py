@@ -292,15 +292,15 @@ def track_chunk(predictor, tmp_dir, frame_names,
 
 
 def map_mask_to_ir(rgb_mask, homography, ir_shape):
-    """用单应矩阵将 RGB mask 映射到红外图像坐标系"""
+    """Project an RGB mask into IR image coordinates."""
     H_ir, W_ir = ir_shape
     ys, xs = np.where(rgb_mask)
     if len(xs) == 0:
         return np.zeros(ir_shape, dtype=bool)
 
-    pts_rgb = np.stack([xs, ys, np.ones(len(xs))], axis=1).T  # (3, N)
-    pts_ir  = homography @ pts_rgb
-    pts_ir  = pts_ir[:2] / pts_ir[2]
+    pts_rgb = np.stack([xs, ys, np.ones(len(xs))], axis=1).T
+    pts_ir = homography @ pts_rgb
+    pts_ir = pts_ir[:2] / pts_ir[2]
 
     xi = np.round(pts_ir[0]).astype(int)
     yi = np.round(pts_ir[1]).astype(int)
@@ -310,26 +310,6 @@ def map_mask_to_ir(rgb_mask, homography, ir_shape):
     ir_mask = np.zeros(ir_shape, dtype=bool)
     ir_mask[yi, xi] = True
     return ir_mask
-
-
-def _measure_rgb_mask_temperature(rgb_mask, temp_data, homography, ir_idx):
-    """Map an RGB mask to IR and return mean/min/max temperature."""
-    nan_stats = (float("nan"), float("nan"), float("nan"))
-    if rgb_mask is None or temp_data is None or homography is None:
-        return nan_stats
-    if ir_idx < 0 or ir_idx >= temp_data.shape[0]:
-        return nan_stats
-
-    ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
-    ir_mask = map_mask_to_ir(rgb_mask, homography, (ir_h, ir_w))
-    food_temps = temp_data[ir_idx][ir_mask]
-    if len(food_temps) == 0:
-        return nan_stats
-    return (
-        float(np.mean(food_temps)),
-        float(np.min(food_temps)),
-        float(np.max(food_temps)),
-    )
 
 
 def flow_propagate_mask(prev_gray, cur_gray, prev_mask):
