@@ -2154,7 +2154,7 @@ def main():
                         try:
                             _ir_idx_fr = _get_ir_idx(abs_idx)
                             _ir_frm_fr = temp_data[_ir_idx_fr]
-                            _food_ir = _build_ir_food_mask_by_temperature(
+                            _food_ir = _temp_fusion.build_ir_food_mask_by_temperature(
                                 _ir_frm_fr, _wok_mask_al, min_cluster_gap=30.0)
                             if _food_ir is not None:
                                     _ys_f, _xs_f = np.where(_food_ir > 0)
