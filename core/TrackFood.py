@@ -2315,10 +2315,11 @@ def main():
                 cv2.putText(info_bar, "  ".join(parts),
                             (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (100, 255, 200), 1)
 
-                chart_bar = draw_temp_chart(temp_history, time_s, VW, CHART_H, CURVE_WIN_S,
-                                            roi_history=roi_history,
-                                            ir_mask_history=ir_mask_history,
-                                            inverse_history=inverse_history if has_bottom else None)
+                chart_bar = _viz_utils.draw_temp_chart(
+                    temp_history, time_s, VW, CHART_H, CURVE_WIN_S,
+                    roi_history=roi_history,
+                    ir_mask_history=ir_mask_history,
+                    inverse_history=inverse_history if has_bottom else None)
                 writer.write(np.vstack([vis, info_bar, chart_bar]))
                 # 三策略数据分别记录
                 sam2_rows.append([abs_idx, local_idx, time_s,
@@ -2506,7 +2507,8 @@ def main():
                          if not np.isnan(temp_mean) else "Temp: N/A"),
                         (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 255, 200), 1)
 
-            chart_bar = draw_temp_chart(temp_history, time_s, VW, CHART_H, CURVE_WIN_S)
+            chart_bar = _viz_utils.draw_temp_chart(
+                temp_history, time_s, VW, CHART_H, CURVE_WIN_S)
             writer.write(np.vstack([vis, info_bar, chart_bar]))
             sam2_rows.append([abs_idx, local_idx, time_s,
                               int(mask.sum()), round(mask_ratio, 2),
