@@ -396,53 +396,6 @@ def render_overlay(frame_bgr, mask, color_bgr, alpha):
     return vis
 
 
-def _kmeans_food_temp(wok_temps, min_cluster_gap=30.0):
-    """
-    用 K-means 把锅内温度分成两类（高温=锅壁/锅底，低温=食物），
-    返回低温类的均值作为食物温度。
-
-    参数：
-      wok_temps       : 1D float array，锅内所有像素温度
-      min_cluster_gap : 两个聚类中心差距的最小值（°C）。
-                        若两类中心差距 < 此值，说明锅内温度分布均匀
-                        （锅倾斜/空锅/翻炒过渡期），返回 nan 表示帧不可靠。
-
-    返回：
-      float，食物温度均值；或 nan（帧不可靠）
-    """
-    vals = wok_temps.astype(np.float32).flatten()
-    if len(vals) < 10:
-        return float("nan")
-
-    # 初始化：用最小值和最大值作为两个初始中心
-    c_low  = float(np.percentile(vals, 10))
-    c_high = float(np.percentile(vals, 90))
-
-    # 迭代 K-means（最多 20 次，收敛即停）
-    for _ in range(20):
-        # 分配：每个像素归入更近的中心
-        dist_low  = np.abs(vals - c_low)
-        dist_high = np.abs(vals - c_high)
-        label_low = dist_low <= dist_high   # True = 低温类（食物）
-
-        new_low  = float(np.mean(vals[label_low]))  if label_low.any()  else c_low
-        new_high = float(np.mean(vals[~label_low])) if (~label_low).any() else c_high
-
-        if abs(new_low - c_low) < 0.1 and abs(new_high - c_high) < 0.1:
-            break
-        c_low, c_high = new_low, new_high
-
-    # 可靠性检查：两类中心差距太小 → 帧不可靠（翻炒/倾斜/空锅）
-    if (c_high - c_low) < min_cluster_gap:
-        return float("nan")
-
-    # 返回低温类（食物）的均值
-    dist_low  = np.abs(vals - c_low)
-    dist_high = np.abs(vals - c_high)
-    food_mask = dist_low <= dist_high
-    return float(np.mean(vals[food_mask])) if food_mask.any() else float("nan")
-
-
 def _estimate_wok_center_from_ir_edge(ir_frame, cx, cy, rx, ry,
                                       n_angles=160,
                                       r_min=0.72, r_max=1.32,
