@@ -2210,8 +2210,8 @@ def main():
                             print(f"[IR-fix异常] {_irfix_e}")
 
                 vis       = render_overlay(frame, mask, MASK_COLOR, MASK_ALPHA)
-                temp_mean, temp_min, temp_max = _measure_rgb_mask_temperature(
-                    mask, temp_data, homography, _get_ir_idx(abs_idx))
+                temp_mean, temp_min, temp_max = _temp_fusion.measure_rgb_mask_temperature(
+                    mask, temp_data, homography, _get_ir_idx(abs_idx), map_mask_to_ir)
 
                 time_s     = abs_idx / fps
                 mask_ratio = mask.sum() / mask.size * 100
@@ -2629,8 +2629,8 @@ def main():
             flow_prev_mask = mask
 
             # 温度统计
-            temp_mean, temp_min, temp_max = _measure_rgb_mask_temperature(
-                mask, temp_data, homography, _get_ir_idx(abs_idx))
+            temp_mean, temp_min, temp_max = _temp_fusion.measure_rgb_mask_temperature(
+                mask, temp_data, homography, _get_ir_idx(abs_idx), map_mask_to_ir)
 
             time_s     = abs_idx / fps
             mask_ratio = mask.sum() / mask.size * 100

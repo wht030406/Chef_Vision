@@ -2,6 +2,32 @@ import cv2
 import numpy as np
 
 
+def measure_rgb_mask_temperature(
+    rgb_mask,
+    temp_data,
+    homography,
+    ir_frame_idx,
+    project_mask_to_ir,
+):
+    """Project an RGB mask into IR space and return mean/min/max temperature."""
+    nan_stats = (float("nan"), float("nan"), float("nan"))
+    if rgb_mask is None or temp_data is None or homography is None:
+        return nan_stats
+    if ir_frame_idx < 0 or ir_frame_idx >= temp_data.shape[0]:
+        return nan_stats
+
+    ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
+    ir_mask = project_mask_to_ir(rgb_mask, homography, (ir_h, ir_w))
+    food_temps = temp_data[ir_frame_idx][ir_mask]
+    if len(food_temps) == 0:
+        return nan_stats
+    return (
+        float(np.mean(food_temps)),
+        float(np.min(food_temps)),
+        float(np.max(food_temps)),
+    )
+
+
 def measure_roi_temperature(temp_data, homography, ir_frame_idx, roi_cfg):
     """Project the configured RGB ROI circle into IR and return its mean temperature."""
     if roi_cfg is None or temp_data is None or homography is None:
