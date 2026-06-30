@@ -2266,7 +2266,7 @@ def main():
                 ir_mask_temp = float("nan")
                 if wok_mask_ir is not None and temp_data is not None:
                     ir_idx_wok = _get_ir_idx(abs_idx)
-                    ir_mask_temp = _estimate_ir_wok_food_temp(
+                    ir_mask_temp = _temp_fusion.estimate_ir_wok_food_temperature(
                         temp_data, ir_idx_wok, wok_mask_ir)
                 if not np.isnan(ir_mask_temp):
                     ir_mask_history.append((time_s, ir_mask_temp))
