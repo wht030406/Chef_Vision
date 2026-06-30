@@ -472,20 +472,6 @@ def _build_ir_food_mask_by_temperature(ir_frame, wok_mask_ir, min_cluster_gap=30
     return food_ir
 
 
-def _estimate_ir_wok_food_temp(temp_data, ir_idx, wok_mask_ir):
-    """Estimate food temperature inside the current IR wok mask."""
-    if temp_data is None or wok_mask_ir is None:
-        return float("nan")
-    if ir_idx < 0 or ir_idx >= temp_data.shape[0]:
-        return float("nan")
-
-    t_frame = temp_data[ir_idx]
-    wok_temps = t_frame[wok_mask_ir]
-    if len(wok_temps) < 10:
-        return float("nan")
-    return _kmeans_food_temp(wok_temps)
-
-
 def _estimate_wok_center_from_ir_edge(ir_frame, cx, cy, rx, ry,
                                       n_angles=160,
                                       r_min=0.72, r_max=1.32,
