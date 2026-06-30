@@ -35,6 +35,7 @@ import rgb_forward as _rgb_forward
 import rgb_inverse as _rgb_inverse
 import temp_fusion as _temp_fusion
 import track_config as _track_config
+import viz_utils as _viz_utils
 
 # ── 路径基准（本文件所在目录）────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -342,17 +343,6 @@ def flow_propagate_mask(prev_gray, cur_gray, prev_mask):
     cur_mask = cv2.morphologyEx(cur_mask, cv2.MORPH_CLOSE, kernel)
 
     return cur_mask.astype(bool)
-
-
-def render_overlay(frame_bgr, mask, color_bgr, alpha):
-    """在帧上叠加半透明 mask + 轮廓"""
-    vis = frame_bgr.copy()
-    c   = np.array(color_bgr, dtype=np.uint8)
-    vis[mask] = (vis[mask].astype(float) * (1 - alpha) + c * alpha).astype(np.uint8)
-    mask_u8 = mask.astype(np.uint8) * 255
-    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(vis, contours, -1, (255, 255, 255), 1)
-    return vis
 
 
 def _estimate_wok_center_from_ir_edge(ir_frame, cx, cy, rx, ry,
@@ -2078,7 +2068,7 @@ def main():
                         except Exception as _irfix_e:
                             print(f"[IR-fix异常] {_irfix_e}")
 
-                vis       = render_overlay(frame, mask, MASK_COLOR, MASK_ALPHA)
+                vis = _viz_utils.render_overlay(frame, mask, MASK_COLOR, MASK_ALPHA)
                 temp_mean, temp_min, temp_max = _temp_fusion.measure_rgb_mask_temperature(
                     mask, temp_data, homography, _get_ir_idx(abs_idx))
 
@@ -2357,8 +2347,8 @@ def main():
                             else:
                                 _fb = np.ones((VH, VW), dtype=bool)
                                 _inv_vis_mask = _fb & ~_bm_f2
-                            vis_inv = render_overlay(frame, _inv_vis_mask,
-                                                     (200, 80, 255), MASK_ALPHA)
+                            vis_inv = _viz_utils.render_overlay(
+                                frame, _inv_vis_mask, (200, 80, 255), MASK_ALPHA)
                             cv2.putText(vis_inv,
                                         (f"Inverse(Wok-Bottom)  t={time_s:.1f}s"
                                          f"  Inv={inverse_temp_mean:.1f}C"
@@ -2505,7 +2495,7 @@ def main():
             info_bar  = np.zeros((INFO_H, VW, 3), dtype=np.uint8)
             hud_color = (255, 255, 255) if mask_src == "SAM2" else (80, 220, 255)
             color     = MASK_COLOR if mask_src == "SAM2" else (0, 200, 80)
-            vis       = render_overlay(frame, mask, color, MASK_ALPHA)
+            vis = _viz_utils.render_overlay(frame, mask, color, MASK_ALPHA)
 
             cv2.putText(info_bar,
                         f"Frame {abs_idx}  t={time_s:.1f}s  "
