@@ -443,35 +443,6 @@ def _kmeans_food_temp(wok_temps, min_cluster_gap=30.0):
     return float(np.mean(vals[food_mask])) if food_mask.any() else float("nan")
 
 
-def _build_ir_food_mask_by_temperature(ir_frame, wok_mask_ir, min_cluster_gap=30.0):
-    """Build an IR food mask from the low-temperature cluster inside the wok."""
-    if ir_frame is None or wok_mask_ir is None:
-        return None
-
-    wok_temps = ir_frame[wok_mask_ir]
-    if len(wok_temps) < 10:
-        return None
-
-    c_low = float(np.percentile(wok_temps, 10))
-    c_high = float(np.percentile(wok_temps, 90))
-    for _ in range(20):
-        food_sel = np.abs(wok_temps - c_low) <= np.abs(wok_temps - c_high)
-        new_low = float(np.mean(wok_temps[food_sel])) if food_sel.any() else c_low
-        new_high = float(np.mean(wok_temps[~food_sel])) if (~food_sel).any() else c_high
-        if abs(new_low - c_low) < 0.1 and abs(new_high - c_high) < 0.1:
-            break
-        c_low, c_high = new_low, new_high
-
-    if (c_high - c_low) < min_cluster_gap:
-        return None
-
-    ys_wok, xs_wok = np.where(wok_mask_ir)
-    food_sel = np.abs(ir_frame[wok_mask_ir] - c_low) <= np.abs(ir_frame[wok_mask_ir] - c_high)
-    food_ir = np.zeros(ir_frame.shape, dtype=np.uint8)
-    food_ir[ys_wok[food_sel], xs_wok[food_sel]] = 255
-    return food_ir
-
-
 def _estimate_wok_center_from_ir_edge(ir_frame, cx, cy, rx, ry,
                                       n_angles=160,
                                       r_min=0.72, r_max=1.32,
