@@ -2021,9 +2021,10 @@ def main():
                             _wok_px_inv = int(_dyn_wok_bool.sum())
                             _raw_inv_ratio = int(_raw_inv_mask.sum()) / max(_wok_px_inv, 1) * 100
                             _inv_mask_override = None
-                            _inv_too_large = (_raw_inv_ratio > 50.0)
-                            _inv_too_small = (_raw_inv_ratio < 10.0)
-                            if _inv_too_large or _inv_too_small:
+                            _inv_reset = _rgb_inverse.evaluate_inverse_reset(_raw_inv_ratio)
+                            _inv_too_large = _inv_reset["too_large"]
+                            _inv_too_small = _inv_reset["too_small"]
+                            if _inv_reset["need_reset"]:
                                 _bottom_fail_streak += 1
                                 if (_bottom_auto_reset is None and temp_data is not None
                                         and homography is not None and wok_mask_ir is not None
@@ -2051,11 +2052,7 @@ def main():
                                                 _auto_pts_b["bg_points"],
                                             )
                                             _bottom_carry = None
-                                            _inv_fail_reason = (
-                                                f"inv_ratio<{10.0:.0f}%"
-                                                if _inv_too_small else
-                                                f"inv_ratio>{50.0:.0f}%"
-                                            )
+                                            _inv_fail_reason = _rgb_inverse.describe_inverse_reset(_inv_reset)
                                             print(f"[Inv跟丢补点] frame={abs_idx} "
                                                   f"{_inv_fail_reason}  "
                                                   f"FG-hot={len(_auto_fg_b)} BG-food={len(_auto_bg_b)} "
@@ -2117,7 +2114,7 @@ def main():
                                     print(f"[Inv兜底] frame={abs_idx}  {_inv_fail_desc} "
                                           f"inv_ratio={_raw_inv_ratio:.1f}%  "
                                           f"使用上一帧有效bottom_mask  streak={_bottom_fail_streak}")
-                            elif 10.0 <= _raw_inv_ratio <= 60.0:
+                            elif _rgb_inverse.is_inverse_ratio_stable(_raw_inv_ratio):
                                 _bottom_fail_streak = 0
                             _inv_mask = (_inv_mask_override
                                          if _inv_mask_override is not None
@@ -2149,13 +2146,13 @@ def main():
                         _wok_px_chk2  = int(_dyn_wok_bool_chk.sum())
                         _inv_px_chk   = int(_inv_mask_chk.sum())
                         _inv_ratio    = _inv_px_chk / max(_wok_px_chk2, 1) * 100
-                        if _inv_ratio > 60.0:
+                        if False and _inv_ratio > 60.0:
                             _inv_area_ok = False
                             inverse_temp_mean = float("nan")
                             print(f"[Inv门控] frame={abs_idx}  inv_ratio={_inv_ratio:.1f}%>60%，"
                                   f"跳过该帧反向语义温度")
 
-                if _inv_area_ok and not np.isnan(inverse_temp_mean):
+                if not np.isnan(inverse_temp_mean):
                     inverse_history.append((time_s, inverse_temp_mean))
                 inverse_rows.append([abs_idx, local_idx, time_s, inverse_temp_mean])
 

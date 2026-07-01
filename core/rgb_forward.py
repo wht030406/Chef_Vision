@@ -61,10 +61,10 @@ def evaluate_forward_reset(metrics, last_reinforce_wok_pct):
 
     if overlap_pct < 60.0:
         return {"need_reset": True, "reason": "overlap"}
-    if mask_vs_wok > 35.0:
+    if mask_vs_wok > 50.0:
         return {"need_reset": True, "reason": "oversize"}
     if wok_px > 0:
-        if mask_vs_wok < 2.0:
+        if mask_vs_wok < 5.0:
             return {"need_reset": True, "reason": "undersize"}
         if last_reinforce_wok_pct > 5.0 and drop_pct > 70.0:
             return {"need_reset": True, "reason": "drop"}
@@ -78,12 +78,12 @@ def resolve_forward_reset_reason(
     drop_pct,
 ):
     """Resolve the reason text for a forward-tracking reset."""
-    if mask_vs_wok < 2.0:
-        return f"RESET: mask过小({mask_vs_wok:.1f}%<2%)"
+    if mask_vs_wok < 5.0:
+        return f"RESET: mask too small ({mask_vs_wok:.1f}%<5%)"
     if last_reinforce_wok_pct > 5.0 and drop_pct > 70.0:
-        return f"RESET: 骤降({last_reinforce_wok_pct:.0f}%→{mask_vs_wok:.0f}%)"
-    if mask_vs_wok > 35.0:
-        return f"RESET: mask过大({mask_vs_wok:.0f}%>wok35%)"
+        return f"RESET: sharp drop ({last_reinforce_wok_pct:.0f}%->{mask_vs_wok:.0f}%)"
+    if mask_vs_wok > 50.0:
+        return f"RESET: mask too large ({mask_vs_wok:.0f}%>wok50%)"
     if overlap_pct < 60.0:
-        return f"RESET: 偏离锅内(overlap={overlap_pct:.0f}%)"
+        return f"RESET: mask left wok area (overlap={overlap_pct:.0f}%)"
     return "RESET"

@@ -50,6 +50,34 @@ def build_inverse_point_result(fg_points, bg_points, ok):
     }
 
 
+def evaluate_inverse_reset(raw_inv_ratio, min_ratio=5.0, max_ratio=50.0):
+    """Evaluate whether inverse semantic tracking should auto-reset."""
+    too_small = raw_inv_ratio < min_ratio
+    too_large = raw_inv_ratio > max_ratio
+    return {
+        "need_reset": bool(too_small or too_large),
+        "too_small": too_small,
+        "too_large": too_large,
+        "ratio": float(raw_inv_ratio),
+        "min_ratio": float(min_ratio),
+        "max_ratio": float(max_ratio),
+    }
+
+
+def describe_inverse_reset(decision):
+    """Build a short reason string for inverse auto-reset logging."""
+    if decision["too_small"]:
+        return f"inv_ratio<{decision['min_ratio']:.0f}%"
+    if decision["too_large"]:
+        return f"inv_ratio>{decision['max_ratio']:.0f}%"
+    return "inv_ratio_ok"
+
+
+def is_inverse_ratio_stable(raw_inv_ratio, min_ratio=5.0, max_ratio=50.0):
+    """Return True when inverse area is inside the healthy range."""
+    return float(min_ratio) <= float(raw_inv_ratio) <= float(max_ratio)
+
+
 def generate_inverse_bottom_points_from_ir(
     rgb_frame,
     ir_frame,
