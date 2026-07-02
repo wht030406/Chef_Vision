@@ -240,7 +240,7 @@ def track_chunk(predictor, tmp_dir, frame_names,
                 obj_id=1,
                 mask=carry_mask,
             )
-        else:
+        elif fg_points or bg_points:
             # ── 第一批：用用户标注点 ────────────────────────────────────────
             points = np.array(fg_points + bg_points, dtype=np.float32)
             labels = np.array(
@@ -254,6 +254,15 @@ def track_chunk(predictor, tmp_dir, frame_names,
                 points=points,
                 labels=labels,
             )
+        else:
+            has_frame0_inject = any(
+                int(kf.get("local_frame", -1)) == 0 and kf.get("fg_points")
+                for kf in inject_keyframes
+            )
+            if not has_frame0_inject:
+                raise ValueError(
+                    "track_chunk requires carry_mask, base points, or a frame-0 inject keyframe"
+                )
 
         # ── 注入额外关键帧的前景点 ───────────────────────────────────────────
         # local_frame=0：补强点追加到第0帧（与 carry_mask 同帧，SAM2 会合并两者）
@@ -1317,7 +1326,35 @@ def main():
                         # ── 尝试用 IR 当前帧低温区定位食材，生成新前景点 ────────
                         # 原理：食材温度 < 锅壁温度，取锅内低温像素 → 反投影到 RGB
                         _ir_fg_pts = []
+                        _ir_bg_pts = []
                         if (temp_data is not None and homography is not None
+                                and _wok_mask_al is not None and _H_inv_al is not None
+                                and _rng_al is not None):
+                            try:
+                                _ir_idx_rst = _get_ir_idx(chunk_start_abs)
+                                _ir_frm_rst = temp_data[_ir_idx_rst]
+                                _ir_fg_pts, _ir_bg_pts, _ir_pts_ok, _ir_pts_stats = (
+                                    _rgb_forward.generate_forward_relabel_points_from_ir(
+                                        _ir_frm_rst,
+                                        _wok_mask_al,
+                                        _H_inv_al,
+                                        (VH, VW),
+                                        rng=_rng_al,
+                                        wok_rgb_constraint=_wok_rgb_constraint,
+                                        gray_frame=_rgb_ref_gray,
+                                        axis_cx=_AXIS_CX_RGB,
+                                        axis_cy=_AXIS_CY_RGB,
+                                        axis_excl_r=_AXIS_EXCL_R,
+                                    )
+                                )
+                                if _ir_pts_ok:
+                                    print(f"[琛ュ己] t={chunk_start_s:.1f}s  "
+                                          f"IR reset points FG={len(_ir_fg_pts)} BG={len(_ir_bg_pts)}  "
+                                          f"K-low={_ir_pts_stats['food_center']:.1f}C  "
+                                          f"K-high={_ir_pts_stats['hot_center']:.1f}C")
+                            except Exception as _re:
+                                print(f"[琛ュ己] IR瀹氫綅澶辫触({_re})锛岄噸缃悗鐢ㄥ垵濮嬫爣娉ㄧ偣")
+                        if False and (temp_data is not None and homography is not None
                                 and _wok_mask_al is not None and _H_inv_al is not None
                                 and _rng_al is not None):
                             try:
@@ -1389,10 +1426,9 @@ def main():
                                 print(f"[补强] IR定位失败({_re})，重置后用初始标注点")
                         if _ir_fg_pts:
                             # 旋转轴中心作为固定背景点
-                            _reinforce_inject = _rgb_forward.build_forward_ir_inject(
+                            _reinforce_inject = _rgb_forward.build_forward_ir_relabel_inject(
                                 _ir_fg_pts,
-                                _AXIS_CX_RGB,
-                                _AXIS_CY_RGB,
+                                _ir_bg_pts,
                                 label="IR-reset",
                             )
 
@@ -1519,7 +1555,36 @@ def main():
                             _reinforce_inject = None
                             # 尝试 IR 采点
                             _ir_fg_pts_iou = []
+                            _ir_bg_pts_iou = []
                             if (temp_data is not None and homography is not None
+                                    and _wok_mask_al is not None and _H_inv_al is not None
+                                    and _rng_al is not None):
+                                try:
+                                    _ir_idx_r2 = _get_ir_idx(chunk_start_abs)
+                                    _ir_frm_r2 = temp_data[_ir_idx_r2]
+                                    (_ir_fg_pts_iou, _ir_bg_pts_iou,
+                                     _ir_iou_pts_ok, _ir_iou_pts_stats) = (
+                                        _rgb_forward.generate_forward_relabel_points_from_ir(
+                                            _ir_frm_r2,
+                                            _wok_mask_al,
+                                            _H_inv_al,
+                                            (VH, VW),
+                                            rng=_rng_al,
+                                            wok_rgb_constraint=_wok_rgb_constraint,
+                                            gray_frame=_rgb_ref_gray,
+                                            axis_cx=_AXIS_CX_RGB,
+                                            axis_cy=_AXIS_CY_RGB,
+                                            axis_excl_r=_AXIS_EXCL_R,
+                                        )
+                                    )
+                                    if _ir_iou_pts_ok:
+                                        print(f"[IR-IoU] t={chunk_start_s:.1f}s  "
+                                              f"relabel points FG={len(_ir_fg_pts_iou)} BG={len(_ir_bg_pts_iou)}  "
+                                              f"K-low={_ir_iou_pts_stats['food_center']:.1f}C  "
+                                              f"K-high={_ir_iou_pts_stats['hot_center']:.1f}C")
+                                except Exception:
+                                    pass
+                            if False and (temp_data is not None and homography is not None
                                     and _wok_mask_al is not None and _H_inv_al is not None
                                     and _rng_al is not None):
                                 try:
@@ -1549,10 +1614,9 @@ def main():
                                 except Exception:
                                     pass
                             if _ir_fg_pts_iou:
-                                _reinforce_inject = _rgb_forward.build_forward_ir_inject(
+                                _reinforce_inject = _rgb_forward.build_forward_ir_relabel_inject(
                                     _ir_fg_pts_iou,
-                                    _AXIS_CX_RGB,
-                                    _AXIS_CY_RGB,
+                                    _ir_bg_pts_iou,
                                     label="IR-IoU-reset",
                                 )
                             # 保存预览图
@@ -1683,6 +1747,13 @@ def main():
                 else:
                     carry_mask_infer = carry_mask
 
+                fg_run = fg_infer
+                bg_run = bg_infer
+                if carry_mask_infer is None and _reinforce_inject is not None:
+                    fg_run = []
+                    bg_run = []
+                    print(f"[forward-reset] chunk {chunk_i+1} starts from current IR relabel points only")
+
                 if _skip_sam2_tilt:
                     # 倾斜冻结：SAM2 跳过，本批所有帧输出空 mask（锅直立期无食材）
                     # 清零 carry_mask，避免漂移碎片遗留在锅外侧
@@ -1693,7 +1764,7 @@ def main():
                 else:
                     chunk_masks, carry_mask_raw = track_chunk(
                         predictor, tmp_dir, frame_names,
-                        fg_infer, bg_infer,
+                        fg_run, bg_run,
                         carry_mask=carry_mask_infer,
                         inject_keyframes=inject_this_chunk,
                     )
@@ -1795,12 +1866,51 @@ def main():
                                 print(f"[Inv自动补点] 批次{chunk_i+1} 失败: {_bae}")
                         if _bottom_auto_reset is not None:
                             _bottom_reset_run = _rgb_inverse.apply_inverse_auto_reset(_bottom_auto_reset)
-                            _bottom_fg_run = _bottom_reset_run["fg_points"]
-                            _bottom_bg_run = _bottom_reset_run["bg_points"]
                             _bc_infer = None
-                            print(f"[Inv自动重启] 批次{chunk_i+1} 使用跟丢时IR自动点 "
-                                  f"FG={len(_bottom_fg_run)} BG={len(_bottom_bg_run)} "
-                                  f"src_frame={_bottom_reset_run.get('frame')}")
+                            _reset_reason = _bottom_reset_run.get("reason", "")
+                            _reset_src_frame = _bottom_reset_run.get("frame")
+                            _reset_msg = (f" fail_frame={_reset_src_frame}"
+                                          if _reset_src_frame is not None else "")
+                            if (temp_data is not None and homography is not None
+                                    and wok_mask_ir is not None
+                                    and _wok_rgb_constraint is not None):
+                                try:
+                                    _rgb_b0 = cv2.imread(os.path.join(tmp_dir, frame_names[0]))
+                                    _ir_b0 = temp_data[_get_ir_idx(chunk_start_abs)]
+                                    _H_inv_bottom = (_H_inv_al if _H_inv_al is not None
+                                                     else np.linalg.inv(homography))
+                                    _prev_btm = _rgb_inverse.build_inverse_autopoints_preview_path(
+                                        out_dir,
+                                        f"{chunk_start_s:.0f}",
+                                        chunk_start_abs,
+                                    )
+                                    _auto_fg_b, _auto_bg_b, _auto_ok_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
+                                        _rgb_b0, _ir_b0, wok_mask_ir, _H_inv_bottom,
+                                        _wok_rgb_constraint, rng=_rng_al, preview_path=_prev_btm
+                                    )
+                                    _auto_pts_b = _rgb_inverse.build_inverse_point_result(
+                                        _auto_fg_b, _auto_bg_b, _auto_ok_b
+                                    )
+                                    if _auto_pts_b["ok"]:
+                                        _bottom_fg_run = _auto_pts_b["fg_points"]
+                                        _bottom_bg_run = _auto_pts_b["bg_points"]
+                                        print(f"[InvAutoRestart] chunk={chunk_i+1} "
+                                              f"start_frame={chunk_start_abs} {_reset_reason}"
+                                              f"{_reset_msg} FG-hot={len(_bottom_fg_run)} "
+                                              f"BG-food={len(_bottom_bg_run)} "
+                                              f"preview={os.path.basename(_prev_btm)}")
+                                    else:
+                                        print(f"[InvAutoRestart] chunk={chunk_i+1} "
+                                              f"start_frame={chunk_start_abs} {_reset_reason}"
+                                              f"{_reset_msg} IR_points_unavailable fallback=manual")
+                                except Exception as _bae:
+                                    print(f"[InvAutoRestart] chunk={chunk_i+1} "
+                                          f"start_frame={chunk_start_abs} {_reset_reason}"
+                                          f"{_reset_msg} failed: {_bae}")
+                            else:
+                                print(f"[InvAutoRestart] chunk={chunk_i+1} "
+                                      f"start_frame={chunk_start_abs} {_reset_reason}"
+                                      f"{_reset_msg} missing_ir_context fallback=manual")
                             _bottom_auto_reset = None
                         elif _bottom_carry is not None and do_resize:
                             _bc_infer = upscale_mask(_bottom_carry, infer_wh)
@@ -2029,36 +2139,14 @@ def main():
                                 if (_bottom_auto_reset is None and temp_data is not None
                                         and homography is not None and wok_mask_ir is not None
                                         and _wok_rgb_constraint is not None):
-                                    try:
-                                        _H_inv_bottom = (_H_inv_al if _H_inv_al is not None
-                                                         else np.linalg.inv(homography))
-                                        _prev_btm = _rgb_inverse.build_inverse_autopoints_preview_path(
-                                            out_dir,
-                                            f"{time_s:.1f}",
-                                            abs_idx,
-                                        )
-                                        _auto_fg_b, _auto_bg_b, _auto_ok_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
-                                            frame, temp_data[_get_ir_idx(abs_idx)],
-                                            wok_mask_ir, _H_inv_bottom, _wok_rgb_constraint,
-                                            rng=_rng_al, preview_path=_prev_btm
-                                        )
-                                        _auto_pts_b = _rgb_inverse.build_inverse_point_result(
-                                            _auto_fg_b, _auto_bg_b, _auto_ok_b
-                                        )
-                                        if _auto_pts_b["ok"]:
-                                            _bottom_auto_reset = _rgb_inverse.build_inverse_auto_reset(
-                                                abs_idx,
-                                                _auto_pts_b["fg_points"],
-                                                _auto_pts_b["bg_points"],
-                                            )
-                                            _bottom_carry = None
-                                            _inv_fail_reason = _rgb_inverse.describe_inverse_reset(_inv_reset)
-                                            print(f"[Inv跟丢补点] frame={abs_idx} "
-                                                  f"{_inv_fail_reason}  "
-                                                  f"FG-hot={len(_auto_fg_b)} BG-food={len(_auto_bg_b)} "
-                                                  f"preview={os.path.basename(_prev_btm)}")
-                                    except Exception as _bae:
-                                        print(f"[Inv跟丢补点] frame={abs_idx} 失败: {_bae}")
+                                    _inv_fail_reason = _rgb_inverse.describe_inverse_reset(_inv_reset)
+                                    _bottom_auto_reset = _rgb_inverse.build_inverse_auto_reset(
+                                        abs_idx,
+                                        reason=_inv_fail_reason,
+                                    )
+                                    _bottom_carry = None
+                                    print(f"[InvAutoResetPending] frame={abs_idx} {_inv_fail_reason}  "
+                                          f"restart_at_next_chunk=1")
                                 if (False and temp_data is not None and homography is not None
                                         and wok_mask_ir is not None):
                                     try:

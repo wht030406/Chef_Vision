@@ -23,21 +23,19 @@ def build_inverse_autopoints_preview_path(out_dir, time_text, frame_idx):
     return os.path.join(out_dir, f"inverse_autopoints_t{time_text}s_f{frame_idx}.jpg")
 
 
-def build_inverse_auto_reset(frame_idx, fg_points, bg_points):
-    """Standardize the payload used to restart inverse tracking after failure."""
+def build_inverse_auto_reset(frame_idx, reason=None):
+    """Store a pending inverse restart request after failure is detected."""
     return {
         "frame": frame_idx,
-        "fg_points": fg_points,
-        "bg_points": bg_points,
+        "reason": reason,
     }
 
 
 def apply_inverse_auto_reset(auto_reset_payload):
-    """Normalize how inverse auto-reset payloads are consumed by the caller."""
+    """Normalize a pending inverse restart request for chunk startup."""
     return {
-        "fg_points": auto_reset_payload["fg_points"],
-        "bg_points": auto_reset_payload["bg_points"],
         "frame": auto_reset_payload.get("frame"),
+        "reason": auto_reset_payload.get("reason"),
     }
 
 
