@@ -91,6 +91,10 @@ CURVE_WIN_S     = 60              # 曲线滑动窗口（秒），只显示最�
 # 0 = 关闭（使用 food_labels.json 中的关键帧）
 RELABEL_INTERVAL_S = 4
 
+# Disabled by default for trimmed datasets. Enable only when raw videos still
+# contain upright-wok / flip interference segments that should output empty masks.
+ENABLE_UPRIGHT_WOK_FREEZE = False
+
 # 临时帧目录（放在 core/ 下）
 TMP_BASE        = os.path.join(_HERE, "tmp_sam2_frames")
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -1193,7 +1197,10 @@ def main():
             #   白烟：均值 > 150 AND 方差 < 800（整锅均匀偏白）
             #   空锅/锅直立：均值 < 25（整锅极暗，食材不在画面中）
             _scene_frozen = False
-            if carry_mask is not None and chunk_i > 0 and _wok_rgb_constraint is not None:
+            if (ENABLE_UPRIGHT_WOK_FREEZE
+                    and carry_mask is not None
+                    and chunk_i > 0
+                    and _wok_rgb_constraint is not None):
                 try:
                     _cap_sc = cv2.VideoCapture(video_path)
                     _cap_sc.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
@@ -1447,14 +1454,19 @@ def main():
                                     for _p in _reinforce_inject["fg_points"]:
                                         cv2.circle(_vis_rst, (int(_p[0]), int(_p[1])), 10, (0, 255, 255), -1)
                                         cv2.circle(_vis_rst, (int(_p[0]), int(_p[1])), 11, (0, 0, 0), 1)
+                                    for _p in _reinforce_inject.get("bg_points", []):
+                                        cv2.circle(_vis_rst, (int(_p[0]), int(_p[1])), 9, (255, 80, 0), -1)
+                                        cv2.circle(_vis_rst, (int(_p[0]), int(_p[1])), 10, (255, 255, 255), 1)
                                 # 信息文字
-                                n_new_pts = len(_reinforce_inject["fg_points"]) if _reinforce_inject else 0
+                                n_fg_pts = len(_reinforce_inject["fg_points"]) if _reinforce_inject else 0
+                                n_bg_pts = len(_reinforce_inject.get("bg_points", [])) if _reinforce_inject else 0
+                                n_new_pts = n_fg_pts
                                 cv2.putText(_vis_rst, _rst_reason,
                                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
                                             1.0, (0, 0, 255), 2)
                                 cv2.putText(_vis_rst,
                                             f"t={chunk_start_s:.0f}s  f={chunk_start_abs}"
-                                            f"  [blue=old_mask | cyan=new_pts({n_new_pts})]",
+                                            f"  [red=old bad mask | yellow=FG({n_fg_pts}) | blue=BG({n_bg_pts})]",
                                             (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
                                             0.75, (0, 255, 255), 2)
                                 _rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
@@ -1628,8 +1640,15 @@ def main():
                                     if _reinforce_inject:
                                         for _p in _reinforce_inject["fg_points"]:
                                             cv2.circle(_vis_iou, (int(_p[0]), int(_p[1])), 10, (0, 255, 255), -1)
+                                            cv2.circle(_vis_iou, (int(_p[0]), int(_p[1])), 11, (0, 0, 0), 1)
+                                        for _p in _reinforce_inject.get("bg_points", []):
+                                            cv2.circle(_vis_iou, (int(_p[0]), int(_p[1])), 9, (255, 80, 0), -1)
+                                            cv2.circle(_vis_iou, (int(_p[0]), int(_p[1])), 10, (255, 255, 255), 1)
+                                    _iou_fg_n = len(_reinforce_inject["fg_points"]) if _reinforce_inject else 0
+                                    _iou_bg_n = len(_reinforce_inject.get("bg_points", [])) if _reinforce_inject else 0
                                     cv2.putText(_vis_iou, _rst_reason, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-                                    cv2.putText(_vis_iou, f"t={chunk_start_s:.0f}s  [blue=bad_mask | cyan=new_pts]",
+                                    cv2.putText(_vis_iou,
+                                                f"t={chunk_start_s:.0f}s  [red=old bad mask | yellow=FG({_iou_fg_n}) | blue=BG({_iou_bg_n})]",
                                                 (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
                                     _iou_rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}_iou.jpg"
                                     cv2.imwrite(os.path.join(out_dir, _iou_rst_name), _vis_iou)
@@ -1683,7 +1702,7 @@ def main():
             # ── 倾斜冻结：K-means 双峰差 < 30°C → 跳过本批 SAM2 ──────────────
             # 锅倾斜/翻炒时锅内无食材信号，强制追踪只会追到锅壁
             _skip_sam2_tilt = False
-            if temp_data is not None and _wok_mask_al is not None:
+            if ENABLE_UPRIGHT_WOK_FREEZE and temp_data is not None and _wok_mask_al is not None:
                 try:
                     _ir_idx_tilt = _get_ir_idx(chunk_start_abs)
                     _ir_frm_tilt = temp_data[_ir_idx_tilt]

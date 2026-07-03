@@ -76,6 +76,16 @@ def is_inverse_ratio_stable(raw_inv_ratio, min_ratio=5.0, max_ratio=50.0):
     return float(min_ratio) <= float(raw_inv_ratio) <= float(max_ratio)
 
 
+def _largest_component(mask_u8):
+    if mask_u8 is None or int(mask_u8.sum()) == 0:
+        return mask_u8
+    cc_n, cc_lbl, cc_stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    if cc_n <= 1:
+        return mask_u8
+    max_cc = 1 + int(np.argmax(cc_stats[1:, cv2.CC_STAT_AREA]))
+    return (cc_lbl == max_cc).astype(np.uint8) * 255
+
+
 def generate_inverse_bottom_points_from_ir(
     rgb_frame,
     ir_frame,
@@ -121,8 +131,10 @@ def generate_inverse_bottom_points_from_ir(
     hot_ir[ys_w[d_high < d_low], xs_w[d_high < d_low]] = 255
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    food_ir = cv2.morphologyEx(food_ir, cv2.MORPH_OPEN, kernel) > 0
-    hot_ir = cv2.morphologyEx(hot_ir, cv2.MORPH_OPEN, kernel) > 0
+    food_ir = cv2.morphologyEx(food_ir, cv2.MORPH_OPEN, kernel)
+    hot_ir = cv2.morphologyEx(hot_ir, cv2.MORPH_OPEN, kernel)
+    food_ir = _largest_component(food_ir) > 0
+    hot_ir = _largest_component(hot_ir) > 0
 
     def _sample_points(mask_ir, n):
         ys, xs = np.where(mask_ir)
