@@ -703,11 +703,43 @@ def main():
     run_ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir  = os.path.join(output_root, run_ts)
     os.makedirs(out_dir, exist_ok=True)
+    relabel_preview_dir = os.path.join(out_dir, "relabel_previews")
+    violation_event_dir = os.path.join(out_dir, "violation_events")
+    os.makedirs(relabel_preview_dir, exist_ok=True)
+    os.makedirs(violation_event_dir, exist_ok=True)
     out_video_viz = os.path.join(out_dir, "track_result_viz.mp4")
     out_csv       = os.path.join(out_dir, "food_temp_log.csv")      # noqa (reserved)
     out_xlsx      = os.path.join(out_dir, "food_temp_log.xlsx")     # noqa (reserved)
     out_curve     = os.path.join(out_dir, "food_temp_curve.png")
     print(f"[输出] 本次结果目录: {out_dir}")
+
+    def _slug_reason_token(text, default="event"):
+        token_chars = []
+        for ch in str(text or ""):
+            if ch.isalnum():
+                token_chars.append(ch.lower())
+            elif ch in (" ", "-", "_", "%", "<", ">", "=", "(", ")", ":", "."):
+                token_chars.append("_")
+        token = "".join(token_chars)
+        while "__" in token:
+            token = token.replace("__", "_")
+        token = token.strip("_")
+        return token or default
+
+    def _save_violation_event_image(filename, frame_bgr, bad_mask, header, detail_lines):
+        if frame_bgr is None:
+            return
+        vis = frame_bgr.copy()
+        if bad_mask is not None and np.any(bad_mask):
+            vis[bad_mask] = (
+                vis[bad_mask].astype(float) * 0.5
+                + np.array([0, 0, 220]) * 0.5
+            ).astype(np.uint8)
+        cv2.putText(vis, header, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 0, 255), 2)
+        for idx, line in enumerate(detail_lines or []):
+            y = 78 + idx * 32
+            cv2.putText(vis, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+        cv2.imwrite(os.path.join(violation_event_dir, filename), vis)
 
     # ── 检查依赖文件 ──────────────────────────────────────────────────────────
     if not os.path.exists(labels_json):
@@ -1289,6 +1321,7 @@ def main():
                     # 食材正常情况下占锅内面积 < 35%，超过说明 SAM2 追踪到了锅底/空白区域
                     _wok_px_chk = _reset_metrics["wok_px"]
                     _mask_vs_wok = _reset_metrics["mask_vs_wok"]
+                    _drop_pct = _reset_metrics["drop_pct"]
                     if _reset_kind == "oversize":
                             print(f"[补强] t={chunk_start_s:.1f}s  "
                                   f"mask过大({_mask_vs_wok:.0f}%>wok35%)，"
@@ -1297,7 +1330,6 @@ def main():
                     # last_reinforce_wok_pct = 上次补强时 mask 占 wok% （不是批次均值）
                     # 骤降 > 70% 或绝对值 < 2% → 重置
                     if _wok_px_chk > 0:
-                        _drop_pct = _reset_metrics["drop_pct"]
                         if _reset_kind == "undersize":
                             print(f"[补强] t={chunk_start_s:.1f}s  "
                                   f"mask过小({_mask_vs_wok:.1f}%<2%，可能是旋转轴碎片)，"
@@ -1324,6 +1356,26 @@ def main():
                             _cap_rst.release()
                             if _ret_rst:
                                 _rst_rgb_frame = _rgb_rst
+                        except Exception:
+                            pass
+
+                        try:
+                            _violation_name = (
+                                f"forward_t{chunk_start_s:.0f}s_f{chunk_start_abs}_"
+                                f"{_slug_reason_token(_rst_reason, 'reset')}.jpg"
+                            )
+                            _save_violation_event_image(
+                                _violation_name,
+                                _rst_rgb_frame,
+                                _rst_carry_mask,
+                                "FORWARD violation",
+                                [
+                                    _rst_reason,
+                                    f"frame={chunk_start_abs}  t={chunk_start_s:.1f}s",
+                                    f"overlap={_overlap_pct:.1f}%  mask_vs_wok={_mask_vs_wok:.1f}%",
+                                    f"drop={_drop_pct:.1f}%  mask_px={_mask_px}",
+                                ],
+                            )
                         except Exception:
                             pass
 
@@ -1470,19 +1522,25 @@ def main():
                                             (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
                                             0.75, (0, 255, 255), 2)
                                 _rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
-                                cv2.imwrite(os.path.join(out_dir, _rst_name), _vis_rst)
+                                cv2.imwrite(os.path.join(relabel_preview_dir, _rst_name), _vis_rst)
                                 print(f"[重置] 预览图已保存: {_rst_name}  原因: {_rst_reason}"
                                       f"  新前景点: {n_new_pts}")
                         except Exception as _rpe:
                             print(f"[重置] 预览图保存失败: {_rpe}")
 
                     else:
-                        # ── mask 正常：IR-IoU 检查（语义反转检测）──────────────
-                        # 原理：SAM2 mask 与 IR 低温区（真实食材位置）的 IoU
-                        # 如果重叠 < 15%，说明 SAM2 追踪到了错误区域（锅壁/旋转轴）
-                        # 在这种情况下强制重置，比等待面积检查更快更准
+                        # Optional forward semantic guard (currently disabled).
+                        # IoU here means:
+                        #   inter(carry_mask, ir_food_rgb) / union(carry_mask, ir_food_rgb) * 100
+                        # where `carry_mask` is the RGB forward mask carried from the
+                        # previous chunk, and `ir_food_rgb` is the current chunk-start IR
+                        # low-temperature food region projected into RGB.
+                        # This guard is disabled for now because the IR food region can be
+                        # unstable near the rotation-axis area and may trigger bad relabels.
                         _ir_iou_ok = True   # 默认通过（无 IR 数据时不触发）
-                        if (temp_data is not None and homography is not None
+                        _forward_ir_iou_guard_enabled = False
+                        if (_forward_ir_iou_guard_enabled
+                                and temp_data is not None and homography is not None
                                 and _wok_mask_al is not None and _H_inv_al is not None
                                 and carry_mask is not None and carry_mask.any()):
                             try:
@@ -1542,7 +1600,7 @@ def main():
                                             if _iou < 15.0:
                                                 _ir_iou_ok = False
                                                 print(f"[IR-IoU] t={chunk_start_s:.1f}s  "
-                                                      f"IoU={_iou:.1f}%<8%，SAM2 mask 与食材区域严重不符，"
+                                                      f"IoU={_iou:.1f}%<15%，SAM2 mask 与食材区域严重不符，"
                                                       f"强制重置")
                             except Exception as _iou_e:
                                 pass   # IoU 检查失败不影响主流程
@@ -1651,7 +1709,7 @@ def main():
                                                 f"t={chunk_start_s:.0f}s  [red=old bad mask | yellow=FG({_iou_fg_n}) | blue=BG({_iou_bg_n})]",
                                                 (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
                                     _iou_rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}_iou.jpg"
-                                    cv2.imwrite(os.path.join(out_dir, _iou_rst_name), _vis_iou)
+                                    cv2.imwrite(os.path.join(relabel_preview_dir, _iou_rst_name), _vis_iou)
                                     print(f"[IR-IoU] 预览图已保存: {_iou_rst_name}")
                             except Exception:
                                 pass
@@ -1864,13 +1922,15 @@ def main():
                                 _H_inv_bottom = (_H_inv_al if _H_inv_al is not None
                                                  else np.linalg.inv(homography))
                                 _prev_btm = _rgb_inverse.build_inverse_autopoints_preview_path(
-                                    out_dir,
+                                    relabel_preview_dir,
                                     f"{chunk_start_s:.0f}",
                                     chunk_start_abs,
                                 )
                                 _auto_fg_b, _auto_bg_b, _auto_ok_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
                                     _rgb_b0, _ir_b0, wok_mask_ir, _H_inv_bottom,
-                                    _wok_rgb_constraint, rng=_rng_al, preview_path=_prev_btm
+                                    _wok_rgb_constraint,
+                                    rng=_rng_al,
+                                    preview_path=_prev_btm,
                                 )
                                 _auto_pts_b = _rgb_inverse.build_inverse_point_result(
                                     _auto_fg_b, _auto_bg_b, _auto_ok_b
@@ -1890,7 +1950,28 @@ def main():
                             _reset_src_frame = _bottom_reset_run.get("frame")
                             _reset_msg = (f" fail_frame={_reset_src_frame}"
                                           if _reset_src_frame is not None else "")
+                            _old_inv_mask_btm = None
+                            _carry_inv_ratio = None
+                            _carry_inv_reset = None
+                            if _bottom_carry is not None and _wok_rgb_constraint is not None:
+                                _old_inv_mask_btm = _wok_rgb_constraint & ~_bottom_carry
+                                _carry_inv_ratio = (
+                                    int(_old_inv_mask_btm.sum())
+                                    / max(int(_wok_rgb_constraint.sum()), 1)
+                                    * 100.0
+                                )
+                                _carry_inv_reset = _rgb_inverse.evaluate_inverse_reset(_carry_inv_ratio)
+                            if _carry_inv_reset is not None and not _carry_inv_reset["need_reset"]:
+                                if _bottom_carry is not None and do_resize:
+                                    _bc_infer = upscale_mask(_bottom_carry, infer_wh)
+                                else:
+                                    _bc_infer = _bottom_carry
+                                print(f"[InvAutoRestart] chunk={chunk_i+1} "
+                                      f"start_frame={chunk_start_abs} canceled carry_recovered"
+                                      f" inv_ratio={_carry_inv_ratio:.1f}%")
+                                _bottom_auto_reset = None
                             if (temp_data is not None and homography is not None
+                                    and _bottom_auto_reset is not None
                                     and wok_mask_ir is not None
                                     and _wok_rgb_constraint is not None):
                                 try:
@@ -1899,13 +1980,25 @@ def main():
                                     _H_inv_bottom = (_H_inv_al if _H_inv_al is not None
                                                      else np.linalg.inv(homography))
                                     _prev_btm = _rgb_inverse.build_inverse_autopoints_preview_path(
-                                        out_dir,
+                                        relabel_preview_dir,
                                         f"{chunk_start_s:.0f}",
                                         chunk_start_abs,
                                     )
+                                    if _old_inv_mask_btm is None and _bottom_reset_run.get("old_mask") is not None:
+                                        _old_inv_mask_btm = _bottom_reset_run.get("old_mask")
                                     _auto_fg_b, _auto_bg_b, _auto_ok_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
                                         _rgb_b0, _ir_b0, wok_mask_ir, _H_inv_bottom,
-                                        _wok_rgb_constraint, rng=_rng_al, preview_path=_prev_btm
+                                        _wok_rgb_constraint,
+                                        rng=_rng_al,
+                                        preview_path=_prev_btm,
+                                        old_mask=_old_inv_mask_btm,
+                                        reason_text=(
+                                            f"Inverse auto reset {_reset_reason}"
+                                            f"{_reset_msg}"
+                                        ),
+                                        axis_cx=_axis_cx_rgb_dyn,
+                                        axis_cy=_axis_cy_rgb_dyn,
+                                        axis_excl_r=_AXIS_EXCL_R,
                                     )
                                     _auto_pts_b = _rgb_inverse.build_inverse_point_result(
                                         _auto_fg_b, _auto_bg_b, _auto_ok_b
@@ -1927,9 +2020,10 @@ def main():
                                           f"start_frame={chunk_start_abs} {_reset_reason}"
                                           f"{_reset_msg} failed: {_bae}")
                             else:
-                                print(f"[InvAutoRestart] chunk={chunk_i+1} "
-                                      f"start_frame={chunk_start_abs} {_reset_reason}"
-                                      f"{_reset_msg} missing_ir_context fallback=manual")
+                                if _bottom_auto_reset is not None:
+                                    print(f"[InvAutoRestart] chunk={chunk_i+1} "
+                                          f"start_frame={chunk_start_abs} {_reset_reason}"
+                                          f"{_reset_msg} missing_ir_context fallback=manual")
                             _bottom_auto_reset = None
                         elif _bottom_carry is not None and do_resize:
                             _bc_infer = upscale_mask(_bottom_carry, infer_wh)
@@ -2162,10 +2256,30 @@ def main():
                                     _bottom_auto_reset = _rgb_inverse.build_inverse_auto_reset(
                                         abs_idx,
                                         reason=_inv_fail_reason,
+                                        old_mask=_raw_inv_mask.copy(),
+                                        ratio=_raw_inv_ratio,
                                     )
-                                    _bottom_carry = None
                                     print(f"[InvAutoResetPending] frame={abs_idx} {_inv_fail_reason}  "
                                           f"restart_at_next_chunk=1")
+                                    try:
+                                        _inv_violation_name = (
+                                            f"inverse_t{time_s:.0f}s_f{abs_idx}_"
+                                            f"{_slug_reason_token(_inv_fail_reason, 'reset')}.jpg"
+                                        )
+                                        _save_violation_event_image(
+                                            _inv_violation_name,
+                                            frame,
+                                            _raw_inv_mask,
+                                            "INVERSE violation",
+                                            [
+                                                _inv_fail_reason,
+                                                f"frame={abs_idx}  t={time_s:.1f}s",
+                                                f"inv_ratio={_raw_inv_ratio:.1f}%  "
+                                                f"range={_inv_reset['min_ratio']:.0f}%~{_inv_reset['max_ratio']:.0f}%",
+                                            ],
+                                        )
+                                    except Exception:
+                                        pass
                                 if (False and temp_data is not None and homography is not None
                                         and wok_mask_ir is not None):
                                     try:

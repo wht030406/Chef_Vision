@@ -23,11 +23,13 @@ def build_inverse_autopoints_preview_path(out_dir, time_text, frame_idx):
     return os.path.join(out_dir, f"inverse_autopoints_t{time_text}s_f{frame_idx}.jpg")
 
 
-def build_inverse_auto_reset(frame_idx, reason=None):
+def build_inverse_auto_reset(frame_idx, reason=None, old_mask=None, ratio=None):
     """Store a pending inverse restart request after failure is detected."""
     return {
         "frame": frame_idx,
         "reason": reason,
+        "old_mask": old_mask,
+        "ratio": ratio,
     }
 
 
@@ -36,6 +38,8 @@ def apply_inverse_auto_reset(auto_reset_payload):
     return {
         "frame": auto_reset_payload.get("frame"),
         "reason": auto_reset_payload.get("reason"),
+        "old_mask": auto_reset_payload.get("old_mask"),
+        "ratio": auto_reset_payload.get("ratio"),
     }
 
 
@@ -48,7 +52,7 @@ def build_inverse_point_result(fg_points, bg_points, ok):
     }
 
 
-def evaluate_inverse_reset(raw_inv_ratio, min_ratio=5.0, max_ratio=50.0):
+def evaluate_inverse_reset(raw_inv_ratio, min_ratio=5.0, max_ratio=60.0):
     """Evaluate whether inverse semantic tracking should auto-reset."""
     too_small = raw_inv_ratio < min_ratio
     too_large = raw_inv_ratio > max_ratio
@@ -71,7 +75,7 @@ def describe_inverse_reset(decision):
     return "inv_ratio_ok"
 
 
-def is_inverse_ratio_stable(raw_inv_ratio, min_ratio=5.0, max_ratio=50.0):
+def is_inverse_ratio_stable(raw_inv_ratio, min_ratio=5.0, max_ratio=60.0):
     """Return True when inverse area is inside the healthy range."""
     return float(min_ratio) <= float(raw_inv_ratio) <= float(max_ratio)
 
@@ -86,16 +90,98 @@ def _largest_component(mask_u8):
     return (cc_lbl == max_cc).astype(np.uint8) * 255
 
 
+def _select_spread_points(
+    mask_ir,
+    homography_inv,
+    wok_rgb_constraint,
+    n,
+    rng,
+    gray_frame=None,
+    max_gray=None,
+    axis_cx=None,
+    axis_cy=None,
+    axis_excl_r=None,
+):
+    if mask_ir is None or not np.any(mask_ir) or n <= 0:
+        return []
+
+    mask_u8 = mask_ir.astype(np.uint8) * 255
+    dist = cv2.distanceTransform(mask_u8, cv2.DIST_L2, 5)
+    max_dist = float(dist.max())
+    if max_dist <= 0.0:
+        return []
+
+    ys, xs = np.where(mask_ir)
+    if len(xs) == 0:
+        return []
+
+    scores = dist[ys, xs]
+    h, w = wok_rgb_constraint.shape
+    jitter = rng.random(len(xs)) * 1e-3
+    order = np.lexsort((jitter, -scores))
+
+    def _collect_with_spacing(min_spacing):
+        pts_ir = []
+        pts_rgb = []
+        for idx in order:
+            x_ir = float(xs[idx])
+            y_ir = float(ys[idx])
+            if any((x_ir - px) ** 2 + (y_ir - py) ** 2 < (min_spacing ** 2) for px, py in pts_ir):
+                continue
+            pt_ir = np.array([[[x_ir, y_ir]]], dtype=np.float32)
+            pt_rgb = cv2.perspectiveTransform(pt_ir, homography_inv).reshape(-1, 2)[0]
+            xi = int(round(float(pt_rgb[0])))
+            yi = int(round(float(pt_rgb[1])))
+            if not (0 <= xi < w and 0 <= yi < h):
+                continue
+            if not wok_rgb_constraint[yi, xi]:
+                continue
+            if gray_frame is not None and max_gray is not None and int(gray_frame[yi, xi]) > int(max_gray):
+                continue
+            if axis_cx is not None and axis_cy is not None and axis_excl_r is not None:
+                if ((xi - axis_cx) ** 2 + (yi - axis_cy) ** 2) ** 0.5 < axis_excl_r:
+                    continue
+            pts_ir.append((x_ir, y_ir))
+            pts_rgb.append([float(xi), float(yi)])
+            if len(pts_rgb) >= n:
+                break
+        return pts_rgb
+
+    spacing_levels = [
+        max(3.0, max_dist * 0.55),
+        max(3.0, max_dist * 0.40),
+        max(3.0, max_dist * 0.28),
+        max(2.0, max_dist * 0.18),
+        0.0,
+    ]
+    best_pts = []
+    for spacing in spacing_levels:
+        pts = _collect_with_spacing(spacing)
+        if len(pts) > len(best_pts):
+            best_pts = pts
+        if len(best_pts) >= n:
+            break
+
+    return best_pts
+
+
 def generate_inverse_bottom_points_from_ir(
     rgb_frame,
     ir_frame,
     wok_mask_ir,
     homography_inv,
     wok_rgb_constraint,
-    n_fg=18,
-    n_bg=18,
+    n_fg=10,
+    n_bg=10,
     rng=None,
     preview_path=None,
+    old_mask=None,
+    reason_text=None,
+    gray_frame=None,
+    fg_max_gray=210,
+    axis_cx=None,
+    axis_cy=None,
+    axis_excl_r=None,
 ):
     """Generate inverse-SAM2 points from current IR: hot wok/body=FG, cool food=BG."""
     if (rgb_frame is None or ir_frame is None or wok_mask_ir is None
@@ -136,25 +222,28 @@ def generate_inverse_bottom_points_from_ir(
     food_ir = _largest_component(food_ir) > 0
     hot_ir = _largest_component(hot_ir) > 0
 
-    def _sample_points(mask_ir, n):
-        ys, xs = np.where(mask_ir)
-        if len(xs) == 0:
-            return []
-        idx = rng.choice(len(xs), size=min(len(xs), n * 8), replace=False)
-        pts_ir = np.array([[[float(xs[i]), float(ys[i])]] for i in idx], dtype=np.float32)
-        pts_rgb = cv2.perspectiveTransform(pts_ir, homography_inv).reshape(-1, 2)
-        h, w = wok_rgb_constraint.shape
-        pts = []
-        for x, y in pts_rgb:
-            xi, yi = int(round(float(x))), int(round(float(y)))
-            if 0 <= xi < w and 0 <= yi < h and wok_rgb_constraint[yi, xi]:
-                pts.append([float(xi), float(yi)])
-                if len(pts) >= n:
-                    break
-        return pts
+    if gray_frame is None and rgb_frame is not None:
+        gray_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2GRAY)
 
-    fg_pts = _sample_points(hot_ir, n_fg)
-    bg_pts = _sample_points(food_ir, n_bg)
+    fg_pts = _select_spread_points(
+        hot_ir,
+        homography_inv,
+        wok_rgb_constraint,
+        n_fg,
+        rng,
+        gray_frame=gray_frame,
+        max_gray=fg_max_gray,
+    )
+    bg_pts = _select_spread_points(
+        food_ir,
+        homography_inv,
+        wok_rgb_constraint,
+        n_bg,
+        rng,
+        axis_cx=axis_cx,
+        axis_cy=axis_cy,
+        axis_excl_r=axis_excl_r,
+    )
     ok = len(fg_pts) >= 4 and len(bg_pts) >= 4
 
     if ok and preview_path:
@@ -162,16 +251,26 @@ def generate_inverse_bottom_points_from_ir(
         shade = np.zeros_like(vis)
         shade[wok_rgb_constraint] = (70, 70, 70)
         vis = cv2.addWeighted(vis, 1.0, shade, 0.25, 0)
+        if old_mask is not None and np.any(old_mask):
+            vis[old_mask] = (
+                vis[old_mask].astype(float) * 0.5
+                + np.array([0, 0, 220]) * 0.5
+            ).astype(np.uint8)
         for x, y in fg_pts:
             cv2.circle(vis, (int(x), int(y)), 8, (0, 255, 80), -1)
             cv2.circle(vis, (int(x), int(y)), 9, (0, 0, 0), 1)
         for x, y in bg_pts:
-            cv2.circle(vis, (int(x), int(y)), 8, (0, 0, 255), -1)
+            cv2.circle(vis, (int(x), int(y)), 8, (255, 80, 0), -1)
             cv2.circle(vis, (int(x), int(y)), 9, (0, 0, 0), 1)
-        cv2.putText(vis, f"Inverse auto points FG-hot={len(fg_pts)} BG-food={len(bg_pts)}",
+        header = (reason_text if reason_text
+                  else f"Inverse auto points FG-hot={len(fg_pts)} BG-food={len(bg_pts)}")
+        cv2.putText(vis, header,
                     (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        cv2.putText(vis,
+                    f"[red=old bad mask | green=FG-hot({len(fg_pts)}) | blue=BG-food({len(bg_pts)})]",
+                    (20, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
         cv2.putText(vis, f"K-low/high=({c_low:.1f},{c_high:.1f})C",
-                    (20, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+                    (20, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
         cv2.imwrite(preview_path, vis)
 
     return fg_pts, bg_pts, ok
