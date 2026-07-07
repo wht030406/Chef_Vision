@@ -228,7 +228,7 @@ def evaluate_forward_reset(metrics, last_reinforce_wok_pct):
 
     if overlap_pct < 60.0:
         return {"need_reset": True, "reason": "overlap"}
-    if mask_vs_wok > 50.0:
+    if mask_vs_wok > 60.0:
         return {"need_reset": True, "reason": "oversize"}
     if wok_px > 0:
         if mask_vs_wok < 5.0:
@@ -249,8 +249,8 @@ def resolve_forward_reset_reason(
         return f"RESET: mask too small ({mask_vs_wok:.1f}%<5%)"
     if last_reinforce_wok_pct > 5.0 and drop_pct > 70.0:
         return f"RESET: sharp drop ({last_reinforce_wok_pct:.0f}%->{mask_vs_wok:.0f}%)"
-    if mask_vs_wok > 50.0:
-        return f"RESET: mask too large ({mask_vs_wok:.0f}%>wok50%)"
+    if mask_vs_wok > 60.0:
+        return f"RESET: mask too large ({mask_vs_wok:.0f}%>wok60%)"
     if overlap_pct < 60.0:
         return f"RESET: mask left wok area (overlap={overlap_pct:.0f}%)"
     return "RESET"

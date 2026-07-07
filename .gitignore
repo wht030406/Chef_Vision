@@ -41,3 +41,6 @@ calibration_verify.png
 filter_result.png
 segment_result.png
 temp_verify.png
+
+# Local device auth token for TN220 fill-light HTTP control.
+field/fill_light_token.txt

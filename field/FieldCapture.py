@@ -24,6 +24,10 @@ import cv2
 import time
 import os
 import sys
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from ctypes import (
     c_int, c_int64, c_uint8, c_uint16, c_uint32, c_uint64, c_void_p,
@@ -38,6 +42,19 @@ DEVICE_IP   = "192.168.1.123"
 DEVICE_PORT = 80
 USERNAME    = "admin"
 PASSWORD    = "ZGTC2026"
+
+# Fill light control. Press L to toggle white fill light for RGB:
+# 0 -> 100 -> 0. Startup and exit both force the light off.
+FILL_LIGHT_HOTKEY_ENABLE = True
+FILL_LIGHT_ON_LEVEL      = 100
+FILL_LIGHT_MAX           = 100
+FILL_LIGHT_IR_LEVEL      = 100
+FILL_LIGHT_HFOV          = 100
+FILL_LIGHT_HTTP_ENABLE   = True
+FILL_LIGHT_HTTP_AUTO_LOGIN = True
+FILL_LIGHT_HTTP_PASSWORD_PARAM = "G3D2cWdjF+Rp6EYEOj7ZTg=="
+FILL_LIGHT_USE_PTZ_AUX   = False
+PTZ_CMD_LIGHT            = 15
 
 # DLL 路径（与本脚本同目录，适配下位机所有文件放在同一文件夹的情况）
 _HERE    = os.path.dirname(os.path.abspath(__file__))
@@ -84,6 +101,25 @@ class IRC_NET_PREVIEW_INFO(Structure):
         ("frameFmt",   c_int),
     ]
 
+class IRC_NET_FILL_LIGHT_CONFIG_INFO(Structure):
+    _fields_ = [
+        ("fillLightMode", c_int),
+        ("infraredLight", c_int),
+        ("whiteLight", c_int),
+        ("hFov", c_int),
+        ("hFovFactor", ctypes.c_float),
+    ]
+
+class IRC_NET_PTZ_CONTROL_INFO(Structure):
+    _fields_ = [
+        ("channel", c_int),
+        ("cmd", c_int),
+        ("param1", c_int),
+        ("param2", c_int),
+        ("param3", c_int),
+        ("stop", c_int),
+    ]
+
 VIDEO_CALLBACK = CFUNCTYPE(
     None, c_uint64, POINTER(IRC_NET_VIDEO_INFO_CB), c_void_p, c_void_p
 )
@@ -108,6 +144,9 @@ ir_ts_list      = []     # IR 逐帧时间戳（Unix float64）
 frame_count     = 0
 temp_count      = 0
 ir_frame_count  = 0
+fill_light_level = 0
+fill_light_original_config = None
+fill_light_http_token = ""
 rec_ts          = None   # 录制开始时间戳（按 S 时记录，视频和 npy 共用）
 
 # IR 视频输出分辨率（原始 192×256 放大 2 倍，方便查看）
@@ -162,6 +201,23 @@ def load_dll():
     dll.IRC_NET_StopPullTemp.argtypes = [c_uint64]
     dll.IRC_NET_StopPullTemp.restype  = c_int
 
+    # Optional fill light control.
+    if hasattr(dll, "IRC_NET_GetFillLightConfigInfo"):
+        dll.IRC_NET_GetFillLightConfigInfo.argtypes = [
+            c_uint64, POINTER(IRC_NET_FILL_LIGHT_CONFIG_INFO)
+        ]
+        dll.IRC_NET_GetFillLightConfigInfo.restype = c_int
+    if hasattr(dll, "IRC_NET_SetFillLightConfigInfo"):
+        dll.IRC_NET_SetFillLightConfigInfo.argtypes = [
+            c_uint64, POINTER(IRC_NET_FILL_LIGHT_CONFIG_INFO)
+        ]
+        dll.IRC_NET_SetFillLightConfigInfo.restype = c_int
+    if hasattr(dll, "IRC_NET_PtzControl"):
+        dll.IRC_NET_PtzControl.argtypes = [
+            c_uint64, POINTER(IRC_NET_PTZ_CONTROL_INFO)
+        ]
+        dll.IRC_NET_PtzControl.restype = c_int
+
     return dll
 
 
@@ -187,6 +243,346 @@ def sdk_login(dll):
 
     print(f"[OK] 登录成功，句柄: {handle.value}")
     return handle.value
+
+
+def clone_fill_light_config(config):
+    copied = IRC_NET_FILL_LIGHT_CONFIG_INFO()
+    copied.fillLightMode = config.fillLightMode
+    copied.infraredLight = config.infraredLight
+    copied.whiteLight = config.whiteLight
+    copied.hFov = config.hFov
+    copied.hFovFactor = config.hFovFactor
+    return copied
+
+
+def read_fill_light_config(dll, handle):
+    if not hasattr(dll, "IRC_NET_GetFillLightConfigInfo"):
+        return None
+
+    config = IRC_NET_FILL_LIGHT_CONFIG_INFO()
+    ret = dll.IRC_NET_GetFillLightConfigInfo(handle, ctypes.byref(config))
+    if ret != 0:
+        print(f"[LIGHT] Get fill light config failed: {ret}")
+        return None
+    return config
+
+
+def get_fill_light_token_path():
+    return os.path.join(_HERE, "fill_light_token.txt")
+
+
+def save_fill_light_http_token(token):
+    if not token:
+        return
+
+    token_path = get_fill_light_token_path()
+    try:
+        with open(token_path, "w", encoding="utf-8") as f:
+            f.write(token.strip() + "\n")
+    except Exception as e:
+        print(f"[LIGHT] Save fill_light_token.txt failed: {e}")
+
+
+def find_token_in_response(value):
+    if isinstance(value, str):
+        token = value.strip()
+        if token.startswith("eyJ") and token.count(".") >= 2:
+            return token
+        return ""
+
+    if isinstance(value, dict):
+        for key in ("X-Token", "XToken", "Token", "token", "AccessToken", "access_token"):
+            token = find_token_in_response(value.get(key))
+            if token:
+                return token
+        for nested in value.values():
+            token = find_token_in_response(nested)
+            if token:
+                return token
+
+    if isinstance(value, list):
+        for item in value:
+            token = find_token_in_response(item)
+            if token:
+                return token
+
+    return ""
+
+
+def login_fill_light_http_token():
+    global fill_light_http_token
+
+    if not FILL_LIGHT_HTTP_AUTO_LOGIN:
+        return ""
+
+    username = os.environ.get("TN220_HTTP_USERNAME", USERNAME).strip()
+    password_param = os.environ.get(
+        "TN220_HTTP_PASSWORD_PARAM", FILL_LIGHT_HTTP_PASSWORD_PARAM
+    ).strip()
+    if not username or not password_param:
+        print("[LIGHT] HTTP auto login skipped: missing username or password parameter.")
+        return ""
+
+    query = urllib.parse.urlencode({
+        "username": username,
+        "password": password_param,
+    })
+    url = f"http://{DEVICE_IP}/v1/token/?{query}"
+    req = urllib.request.Request(
+        url,
+        data=b"",
+        method="POST",
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Origin": f"http://{DEVICE_IP}",
+            "Referer": f"http://{DEVICE_IP}/",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            try:
+                result = json.loads(text)
+            except json.JSONDecodeError:
+                result = text
+
+        token = find_token_in_response(result)
+        if not token:
+            print(f"[LIGHT] HTTP auto login did not return a token: {text[:160]}")
+            return ""
+
+        fill_light_http_token = token
+        save_fill_light_http_token(token)
+        print("[LIGHT] HTTP auto login OK; token refreshed.")
+        return token
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", errors="replace")
+        print(f"[LIGHT] HTTP auto login failed: {e.code} {text[:160]}")
+    except Exception as e:
+        print(f"[LIGHT] HTTP auto login failed: {e}")
+    return ""
+
+
+def get_fill_light_http_token(force_login=False):
+    global fill_light_http_token
+
+    if not force_login:
+        token = os.environ.get("TN220_X_TOKEN", "").strip()
+        if token:
+            return token
+
+        if fill_light_http_token:
+            return fill_light_http_token
+
+    token_path = get_fill_light_token_path()
+    if os.path.exists(token_path):
+        try:
+            with open(token_path, "r", encoding="utf-8") as f:
+                token = f.read().strip()
+            if token and not force_login:
+                fill_light_http_token = token
+                return token
+        except Exception as e:
+            print(f"[LIGHT] Read fill_light_token.txt failed: {e}")
+
+    return login_fill_light_http_token()
+
+
+def send_fill_light_level_http(white_level, token):
+    if not FILL_LIGHT_HTTP_ENABLE:
+        return None, False
+
+    if not token:
+        return None, False
+
+    level = max(0, min(FILL_LIGHT_MAX, int(white_level)))
+    payload = {
+        "FillLightMode": 1,
+        "HFovFactor": 1,
+        "WhiteLight": level,
+        "InfraredLight": FILL_LIGHT_IR_LEVEL if level > 0 else 0,
+        "HFov": FILL_LIGHT_HFOV,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    url = f"http://{DEVICE_IP}/v1/peripheral/filllight?debug=false"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="PUT",
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": f"http://{DEVICE_IP}",
+            "Referer": f"http://{DEVICE_IP}/",
+            "X-Token": token,
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            print(f"[LIGHT] HTTP fill light level {level}: {resp.status} {text[:120]}")
+            try:
+                result = json.loads(text)
+            except json.JSONDecodeError:
+                result = None
+
+            if isinstance(result, dict):
+                code = result.get("Code")
+                if code in (0, "0", 200, "200", None):
+                    return True, False
+                else:
+                    message = result.get("Message") or result.get("Translate") or text[:160]
+                    print(f"[LIGHT] HTTP fill light rejected: Code={code}, {message}")
+                    if str(code) == "400701":
+                        print("[LIGHT] Token invalid. Refreshing token and retrying once.")
+                        return False, True
+                    return False, False
+        return True, False
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", errors="replace")
+        print(f"[LIGHT] HTTP fill light failed: {e.code} {text[:160]}")
+    except Exception as e:
+        print(f"[LIGHT] HTTP fill light failed: {e}")
+    return False, False
+
+
+def set_fill_light_level_http(white_level):
+    if not FILL_LIGHT_HTTP_ENABLE:
+        return None
+
+    token = get_fill_light_http_token()
+    if not token:
+        print("[LIGHT] HTTP control skipped: auto login failed and no fill_light_token.txt token is available.")
+        return None
+
+    ok, token_invalid = send_fill_light_level_http(white_level, token)
+    if ok is True:
+        return True
+
+    if token_invalid:
+        new_token = get_fill_light_http_token(force_login=True)
+        if new_token:
+            ok, _ = send_fill_light_level_http(white_level, new_token)
+            return ok
+
+    return ok
+
+
+def set_fill_light_level(dll, handle, white_level):
+    if not hasattr(dll, "IRC_NET_SetFillLightConfigInfo"):
+        print("[LIGHT] Fill light setting is not supported by this SDK.")
+        return False
+
+    current = read_fill_light_config(dll, handle)
+    if current is None:
+        current = IRC_NET_FILL_LIGHT_CONFIG_INFO()
+
+    level = max(0, min(FILL_LIGHT_MAX, int(white_level)))
+    current.fillLightMode = 1
+    current.whiteLight = level
+    current.infraredLight = FILL_LIGHT_IR_LEVEL if level > 0 else 0
+    current.hFov = FILL_LIGHT_HFOV
+
+    ret = dll.IRC_NET_SetFillLightConfigInfo(handle, ctypes.byref(current))
+    if ret != 0:
+        print(f"[LIGHT] Set white fill light {level} failed: {ret}")
+        return False
+
+    print(f"[LIGHT] White fill light level: {level}")
+    updated = read_fill_light_config(dll, handle)
+    if updated is not None:
+        print(
+            "[LIGHT] Device config now: "
+            f"mode={updated.fillLightMode}, "
+            f"white={updated.whiteLight}, "
+            f"infrared={updated.infraredLight}, "
+            f"hFov={updated.hFov}, "
+            f"hFovFactor={updated.hFovFactor:.3f}"
+        )
+    return True
+
+
+def set_fill_light_aux_state(dll, handle, enabled):
+    if not FILL_LIGHT_USE_PTZ_AUX:
+        return True
+    if not hasattr(dll, "IRC_NET_PtzControl"):
+        return True
+
+    control = IRC_NET_PTZ_CONTROL_INFO()
+    control.channel = 0
+    control.cmd = PTZ_CMD_LIGHT
+    control.param1 = 0
+    control.param2 = 0
+    control.param3 = 0
+    control.stop = 0 if enabled else 1
+
+    ret = dll.IRC_NET_PtzControl(handle, ctypes.byref(control))
+    if ret != 0:
+        state = "on" if enabled else "off"
+        print(f"[LIGHT] PTZ light {state} command failed: {ret}")
+        return False
+    return True
+
+
+def apply_fill_light_level(dll, handle, white_level):
+    level = max(0, min(FILL_LIGHT_MAX, int(white_level)))
+    http_ok = set_fill_light_level_http(level)
+    if http_ok is True:
+        return True
+
+    config_ok = set_fill_light_level(dll, handle, level)
+    aux_ok = set_fill_light_aux_state(dll, handle, level > 0)
+    return config_ok and aux_ok
+
+
+def init_fill_light_control(dll, handle):
+    global fill_light_original_config, fill_light_level
+
+    if not FILL_LIGHT_HOTKEY_ENABLE:
+        return
+
+    print("[LIGHT] Resetting fill light to OFF at startup.")
+    apply_fill_light_level(dll, handle, 0)
+    fill_light_level = 0
+
+    if not hasattr(dll, "IRC_NET_GetFillLightConfigInfo") or not hasattr(dll, "IRC_NET_SetFillLightConfigInfo"):
+        print("[LIGHT] SDK fill light config is not available; HTTP control will still be used.")
+        print("[LIGHT] Hotkey ready. Press L to toggle white fill light: 100/0")
+        return
+
+    config = read_fill_light_config(dll, handle)
+    if config is not None:
+        fill_light_original_config = clone_fill_light_config(config)
+
+    print("[LIGHT] Hotkey ready. Press L to toggle white fill light: 100/0")
+
+
+def toggle_fill_light_level(dll, handle):
+    global fill_light_level
+
+    next_level = 0 if fill_light_level > 0 else FILL_LIGHT_ON_LEVEL
+
+    if apply_fill_light_level(dll, handle, next_level):
+        fill_light_level = next_level
+
+
+def restore_fill_light_config(dll, handle):
+    global fill_light_original_config, fill_light_level
+
+    print("[LIGHT] Turning fill light OFF before exit.")
+    apply_fill_light_level(dll, handle, 0)
+    fill_light_level = 0
+    fill_light_original_config = None
+
+
+def shutdown_fill_light_now(dll, handle):
+    global fill_light_level
+
+    print("[LIGHT] Turning fill light OFF now.")
+    apply_fill_light_level(dll, handle, 0)
+    fill_light_level = 0
 
 # ============================================================
 # 回调函数
@@ -398,6 +794,7 @@ def temp_to_colormap(temp_matrix, width=640, height=480):
 def main():
     global is_recording, video_writer, ir_video_writer, ir_frame_count
     global temp_list, frame_count, temp_count, rec_ts
+    global rgb_ts_list, ir_ts_list
     global roi_editing, roi_cx, roi_cy, roi_radius, roi_dragging
 
     print("=" * 55)
@@ -426,6 +823,8 @@ def main():
         return
 
     # 2. 注册回调
+    init_fill_light_control(dll, handle)
+
     _video_cb = VIDEO_CALLBACK(on_video_frame)
     _temp_cb  = TEMP_CALLBACK(on_temp_frame)
 
@@ -448,7 +847,7 @@ def main():
 
     # 5. 主循环：显示双画面预览
     PREVIEW_W, PREVIEW_H = 640, 480
-    WIN_NAME = "Chef Vision — [S] 录制  [Q] 退出  [R] 编辑ROI"
+    WIN_NAME = "Chef Vision [S] REC  [Q] Quit  [R] ROI  [L] Light"
 
     # 加载已有 ROI 配置
     load_roi_config()
@@ -532,6 +931,10 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
         # 左右拼接
+        light_text = f"White Light: {fill_light_level}  [L]=ON/OFF"
+        cv2.putText(right, light_text, (10, PREVIEW_H - 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
         combined = np.hstack([left, right])
         cv2.imshow(WIN_NAME, combined)
 
@@ -551,6 +954,7 @@ def main():
                 rec_ts          = datetime.now().strftime("%Y%m%d_%H%M%S")  # 统一时间戳
                 is_recording    = True
                 temp_list       = []
+                # Reset the shared timestamp buffers used by the callbacks and final save.
                 rgb_ts_list     = []
                 ir_ts_list      = []
                 frame_count     = 0
@@ -561,8 +965,12 @@ def main():
             else:
                 print("[提示] 已在录制中")
 
+        elif key == ord('l') or key == ord('L'):
+            toggle_fill_light_level(dll, handle)
+
         elif key == ord('q') or key == ord('Q'):
             print("\n[停止] 正在保存数据...")
+            shutdown_fill_light_now(dll, handle)
             # 无论 ROI 有没有手动编辑，都强制保存一份当前状态
             save_roi_config(PREVIEW_W, PREVIEW_H, rgb_orig_w, rgb_orig_h)
             break
@@ -610,6 +1018,7 @@ def main():
         print(f"[OK] RGB 时间戳已保存: {rgb_ts_name}  ({len(rgb_ts_arr)} 帧)")
 
     # 9. 登出
+    restore_fill_light_config(dll, handle)
     dll.IRC_NET_Logout(handle)
     dll.IRC_NET_Deinit()
     print("\n[完成] 设备已断开，文件保存在脚本所在文件夹")
