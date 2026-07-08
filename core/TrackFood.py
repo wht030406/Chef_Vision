@@ -741,6 +741,38 @@ def main():
             cv2.putText(vis, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
         cv2.imwrite(os.path.join(violation_event_dir, filename), vis)
 
+    def _draw_action_badge(vis, action_tag, color=(0, 220, 255)):
+        if vis is None or not action_tag:
+            return vis
+        tag = str(action_tag)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (tw, th), _ = cv2.getTextSize(tag, font, 0.9, 2)
+        right_pad = 140
+        x1 = max(tw + 46, vis.shape[1] - right_pad)
+        x0 = max(20, x1 - tw - 26)
+        y0 = 20
+        x1 = min(vis.shape[1] - 20, x0 + tw + 26)
+        y1 = y0 + th + 20
+        cv2.rectangle(vis, (x0, y0), (x1, y1), (20, 20, 20), -1)
+        cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
+        cv2.putText(vis, tag, (x0 + 12, y1 - 10), font, 0.9, color, 2)
+        return vis
+
+    def _append_violation_event_action(filename, action_tag, action_line):
+        if not filename:
+            return
+        path = os.path.join(violation_event_dir, filename)
+        if not os.path.exists(path):
+            return
+        vis = cv2.imread(path)
+        if vis is None:
+            return
+        _draw_action_badge(vis, action_tag)
+        y0 = min(vis.shape[0] - 24, 176)
+        cv2.putText(vis, action_line, (20, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+        cv2.imwrite(path, vis)
+
     # ── 检查依赖文件 ──────────────────────────────────────────────────────────
     if not os.path.exists(labels_json):
         print(f"[error] labels file not found: {labels_json}")
@@ -1517,10 +1549,15 @@ def main():
                                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
                                             1.0, (0, 0, 255), 2)
                                 cv2.putText(_vis_rst,
-                                            f"t={chunk_start_s:.0f}s  f={chunk_start_abs}"
-                                            f"  [red=old bad mask | yellow=FG({n_fg_pts}) | blue=BG({n_bg_pts})]",
+                                            f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
                                             (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
                                             0.75, (0, 255, 255), 2)
+                                cv2.putText(_vis_rst,
+                                            (f"[red=old bad mask | yellow=FG({n_fg_pts}) | blue=BG({n_bg_pts})]  "
+                                             f"decision=IR_relabel"),
+                                            (20, 112), cv2.FONT_HERSHEY_SIMPLEX,
+                                            0.72, (255, 255, 255), 2)
+                                _draw_action_badge(_vis_rst, "IR_relabel")
                                 _rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
                                 cv2.imwrite(os.path.join(relabel_preview_dir, _rst_name), _vis_rst)
                                 print(f"[重置] 预览图已保存: {_rst_name}  原因: {_rst_reason}"
@@ -1706,8 +1743,13 @@ def main():
                                     _iou_bg_n = len(_reinforce_inject.get("bg_points", [])) if _reinforce_inject else 0
                                     cv2.putText(_vis_iou, _rst_reason, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
                                     cv2.putText(_vis_iou,
-                                                f"t={chunk_start_s:.0f}s  [red=old bad mask | yellow=FG({_iou_fg_n}) | blue=BG({_iou_bg_n})]",
+                                                f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
                                                 (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+                                    cv2.putText(_vis_iou,
+                                                (f"[red=old bad mask | yellow=FG({_iou_fg_n}) | blue=BG({_iou_bg_n})]  "
+                                                 f"decision=IR_relabel"),
+                                                (20, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+                                    _draw_action_badge(_vis_iou, "IR_relabel")
                                     _iou_rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}_iou.jpg"
                                     cv2.imwrite(os.path.join(relabel_preview_dir, _iou_rst_name), _vis_iou)
                                     print(f"[IR-IoU] 预览图已保存: {_iou_rst_name}")
@@ -1948,6 +1990,8 @@ def main():
                             _bc_infer = None
                             _reset_reason = _bottom_reset_run.get("reason", "")
                             _reset_src_frame = _bottom_reset_run.get("frame")
+                            _reset_src_time = _bottom_reset_run.get("time_s")
+                            _reset_violation_name = _bottom_reset_run.get("violation_filename")
                             _reset_msg = (f" fail_frame={_reset_src_frame}"
                                           if _reset_src_frame is not None else "")
                             _old_inv_mask_btm = None
@@ -1966,6 +2010,37 @@ def main():
                                     _bc_infer = upscale_mask(_bottom_carry, infer_wh)
                                 else:
                                     _bc_infer = _bottom_carry
+                                _append_violation_event_action(
+                                    _reset_violation_name,
+                                    "reuse_carry",
+                                    (f"next_chunk_action=reuse_carry  "
+                                     f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
+                                )
+                                try:
+                                    _reuse_rgb = cv2.imread(os.path.join(tmp_dir, frame_names[0]))
+                                    _reuse_preview = os.path.join(
+                                        relabel_preview_dir,
+                                        f"inverse_carry_reuse_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg",
+                                    )
+                                    _rgb_inverse.save_inverse_preview(
+                                        _reuse_preview,
+                                        _reuse_rgb,
+                                        _wok_rgb_constraint,
+                                        old_mask=_old_inv_mask_btm,
+                                        header="Inverse carry recovered",
+                                        detail_lines=[
+                                            f"reason={_reset_reason}",
+                                            (f"fail_t={_reset_src_time:.1f}s  fail_frame={_reset_src_frame}"
+                                             if _reset_src_time is not None and _reset_src_frame is not None
+                                             else f"fail_frame={_reset_src_frame}"),
+                                            f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
+                                            f"decision=reuse_carry  inv_ratio={_carry_inv_ratio:.1f}%",
+                                        ],
+                                        header_color=(80, 255, 180),
+                                        action_tag="reuse_carry",
+                                    )
+                                except Exception:
+                                    pass
                                 print(f"[InvAutoRestart] chunk={chunk_i+1} "
                                       f"start_frame={chunk_start_abs} canceled carry_recovered"
                                       f" inv_ratio={_carry_inv_ratio:.1f}%")
@@ -1999,11 +2074,25 @@ def main():
                                         axis_cx=_axis_cx_rgb_dyn,
                                         axis_cy=_axis_cy_rgb_dyn,
                                         axis_excl_r=_AXIS_EXCL_R,
+                                        detail_lines=[
+                                            (f"fail_t={_reset_src_time:.1f}s  fail_frame={_reset_src_frame}"
+                                             if _reset_src_time is not None and _reset_src_frame is not None
+                                             else f"fail_frame={_reset_src_frame}"),
+                                            f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
+                                            "decision=IR_relabel",
+                                        ],
+                                        action_tag="IR_relabel",
                                     )
                                     _auto_pts_b = _rgb_inverse.build_inverse_point_result(
                                         _auto_fg_b, _auto_bg_b, _auto_ok_b
                                     )
                                     if _auto_pts_b["ok"]:
+                                        _append_violation_event_action(
+                                            _reset_violation_name,
+                                            "IR_relabel",
+                                            (f"next_chunk_action=IR_relabel  "
+                                             f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
+                                        )
                                         _bottom_fg_run = _auto_pts_b["fg_points"]
                                         _bottom_bg_run = _auto_pts_b["bg_points"]
                                         print(f"[InvAutoRestart] chunk={chunk_i+1} "
@@ -2012,15 +2101,33 @@ def main():
                                               f"BG-food={len(_bottom_bg_run)} "
                                               f"preview={os.path.basename(_prev_btm)}")
                                     else:
+                                        _append_violation_event_action(
+                                            _reset_violation_name,
+                                            "manual_fallback",
+                                            (f"next_chunk_action=manual_fallback  "
+                                             f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
+                                        )
                                         print(f"[InvAutoRestart] chunk={chunk_i+1} "
                                               f"start_frame={chunk_start_abs} {_reset_reason}"
                                               f"{_reset_msg} IR_points_unavailable fallback=manual")
                                 except Exception as _bae:
+                                    _append_violation_event_action(
+                                        _reset_violation_name,
+                                        "manual_fallback",
+                                        (f"next_chunk_action=manual_fallback  "
+                                         f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
+                                    )
                                     print(f"[InvAutoRestart] chunk={chunk_i+1} "
                                           f"start_frame={chunk_start_abs} {_reset_reason}"
                                           f"{_reset_msg} failed: {_bae}")
                             else:
                                 if _bottom_auto_reset is not None:
+                                    _append_violation_event_action(
+                                        _reset_violation_name,
+                                        "manual_fallback",
+                                        (f"next_chunk_action=manual_fallback  "
+                                         f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
+                                    )
                                     print(f"[InvAutoRestart] chunk={chunk_i+1} "
                                           f"start_frame={chunk_start_abs} {_reset_reason}"
                                           f"{_reset_msg} missing_ir_context fallback=manual")
@@ -2258,14 +2365,16 @@ def main():
                                         reason=_inv_fail_reason,
                                         old_mask=_raw_inv_mask.copy(),
                                         ratio=_raw_inv_ratio,
+                                        time_s=time_s,
+                                        violation_filename=(
+                                            f"inverse_t{time_s:.0f}s_f{abs_idx}_"
+                                            f"{_slug_reason_token(_inv_fail_reason, 'reset')}.jpg"
+                                        ),
                                     )
                                     print(f"[InvAutoResetPending] frame={abs_idx} {_inv_fail_reason}  "
                                           f"restart_at_next_chunk=1")
                                     try:
-                                        _inv_violation_name = (
-                                            f"inverse_t{time_s:.0f}s_f{abs_idx}_"
-                                            f"{_slug_reason_token(_inv_fail_reason, 'reset')}.jpg"
-                                        )
+                                        _inv_violation_name = _bottom_auto_reset.get("violation_filename")
                                         _save_violation_event_image(
                                             _inv_violation_name,
                                             frame,
@@ -2273,9 +2382,10 @@ def main():
                                             "INVERSE violation",
                                             [
                                                 _inv_fail_reason,
-                                                f"frame={abs_idx}  t={time_s:.1f}s",
+                                                f"fail_frame={abs_idx}  fail_t={time_s:.1f}s",
                                                 f"inv_ratio={_raw_inv_ratio:.1f}%  "
                                                 f"range={_inv_reset['min_ratio']:.0f}%~{_inv_reset['max_ratio']:.0f}%",
+                                                "next_chunk_action=pending",
                                             ],
                                         )
                                     except Exception:

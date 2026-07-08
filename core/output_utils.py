@@ -215,8 +215,10 @@ def stitch_rgb_ir(
     n_rgb_cols = 2 if cap_inv is not None else 1
     total_w = pure_w * n_rgb_cols + ir_out_w
 
-    new_info_h = int(info_h * 1.8)
-    new_chart_h = int(chart_h * 1.8)
+    # Leave a bit more room for the stitched three-panel HUD so
+    # text rows and the curve strip are easier to read.
+    new_info_h = int(info_h * 2.2)
+    new_chart_h = int(chart_h * 4.2)
     if new_info_h % 2 != 0:
         new_info_h += 1
     if new_chart_h % 2 != 0:

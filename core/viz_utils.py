@@ -34,13 +34,45 @@ def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
     if roi_history:
         roi_pts = [(t, v) for t, v in roi_history if t >= t0 and not np.isnan(v)]
 
-    all_vals = vals + [v for _, v in roi_pts]
+    ir_pts = []
+    if ir_mask_history:
+        ir_pts = [(t, v) for t, v in ir_mask_history if t >= t0 and not np.isnan(v)]
+
+    inv_pts = []
+    if inverse_history:
+        inv_pts = [(t, v) for t, v in inverse_history if t >= t0 and not np.isnan(v)]
+
+    all_vals = vals + [v for _, v in roi_pts] + [v for _, v in ir_pts] + [v for _, v in inv_pts]
     t_min = t0
     t_max = max(cur_time_s, t0 + 1.0)
-    v_min = max(0.0, min(all_vals) - 5.0)
-    v_max = max(all_vals) + 5.0
+    if len(all_vals) >= 8:
+        lo = float(np.percentile(all_vals, 5))
+        hi = float(np.percentile(all_vals, 95))
+    else:
+        lo = float(min(all_vals))
+        hi = float(max(all_vals))
+    if hi <= lo:
+        hi = lo + 1.0
+    pad_v = max(2.0, (hi - lo) * 0.08)
+    latest_vals = [vals[-1]]
+    if roi_pts:
+        latest_vals.append(roi_pts[-1][1])
+    if ir_pts:
+        latest_vals.append(ir_pts[-1][1])
+    if inv_pts:
+        latest_vals.append(inv_pts[-1][1])
+    v_min = max(0.0, min(lo, min(latest_vals)) - pad_v)
+    v_max = max(hi, max(latest_vals)) + pad_v
     if v_max <= v_min:
         v_max = v_min + 10.0
+
+    # Use a cleaner 10C vertical unit so the chart is easier to read.
+    v_min = float(np.floor(v_min / 10.0) * 10.0)
+    v_max = float(np.ceil(v_max / 10.0) * 10.0)
+    if v_max - v_min < 20.0:
+        mid = 0.5 * (v_min + v_max)
+        v_min = max(0.0, mid - 10.0)
+        v_max = mid + 10.0
 
     pad_l, pad_r, pad_t, pad_b = 48, 12, 10, 22
 
@@ -50,7 +82,8 @@ def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
     def ty(v):
         return pad_t + int((1.0 - (v - v_min) / (v_max - v_min)) * (h - pad_t - pad_b))
 
-    for v in np.linspace(v_min, v_max, 3):
+    grid_vals = np.arange(v_min, v_max + 0.1, 10.0)
+    for v in grid_vals:
         yy = ty(v)
         cv2.line(bar, (pad_l, yy), (w - pad_r, yy), (45, 45, 45), 1)
         cv2.putText(bar, f"{v:.0f}", (2, yy + 4),
@@ -82,9 +115,6 @@ def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
             cv2.putText(bar, f"ROI:{roi_pts[-1][1]:.1f}C", (rx + 6, ry + 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 180, 60), 1)
 
-    ir_pts = []
-    if ir_mask_history:
-        ir_pts = [(t, v) for t, v in ir_mask_history if t >= t0 and not np.isnan(v)]
     if len(ir_pts) >= 2:
         ir_screen = [(tx(t), ty(v)) for t, v in ir_pts]
         for i in range(1, len(ir_screen)):
@@ -103,9 +133,6 @@ def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
         cv2.putText(bar, f"Mask:{vals[-1]:.1f}C", (cx + 6, cy + 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 200, 255), 1)
 
-    inv_pts = []
-    if inverse_history:
-        inv_pts = [(t, v) for t, v in inverse_history if t >= t0 and not np.isnan(v)]
     if len(inv_pts) >= 2:
         inv_screen = [(tx(t), ty(v)) for t, v in inv_pts]
         for i in range(1, len(inv_screen)):
