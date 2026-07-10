@@ -705,8 +705,10 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     relabel_preview_dir = os.path.join(out_dir, "relabel_previews")
     violation_event_dir = os.path.join(out_dir, "violation_events")
+    ir_relabel_frame_dir = os.path.join(out_dir, "ir_relabel_frames")
     os.makedirs(relabel_preview_dir, exist_ok=True)
     os.makedirs(violation_event_dir, exist_ok=True)
+    os.makedirs(ir_relabel_frame_dir, exist_ok=True)
     out_video_viz = os.path.join(out_dir, "track_result_viz.mp4")
     out_csv       = os.path.join(out_dir, "food_temp_log.csv")      # noqa (reserved)
     out_xlsx      = os.path.join(out_dir, "food_temp_log.xlsx")     # noqa (reserved)
@@ -741,6 +743,59 @@ def main():
             cv2.putText(vis, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
         cv2.imwrite(os.path.join(violation_event_dir, filename), vis)
 
+    def _read_rgb_frame_at_abs(abs_frame):
+        if abs_frame is None:
+            return None
+        try:
+            cap = cv2.VideoCapture(video_path)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(abs_frame))
+            ok, frame = cap.read()
+            cap.release()
+            return frame if ok else None
+        except Exception:
+            return None
+
+    def _save_ir_relabel_frame_image(filename, ir_frame, wok_mask, header, detail_lines,
+                                     food_mask=None, hot_mask=None):
+        if ir_frame is None:
+            return
+        try:
+            ir_vis = ir_frame.astype(np.float32)
+            if wok_mask is not None and np.any(wok_mask):
+                vals = ir_vis[wok_mask]
+            else:
+                vals = ir_vis.reshape(-1)
+            lo = float(np.percentile(vals, 2)) if len(vals) else float(np.min(ir_vis))
+            hi = float(np.percentile(vals, 98)) if len(vals) else float(np.max(ir_vis))
+            if hi <= lo:
+                hi = lo + 1.0
+            norm = np.clip((ir_vis - lo) / (hi - lo), 0.0, 1.0)
+            ir_u8 = (norm * 255.0).astype(np.uint8)
+            vis = cv2.applyColorMap(ir_u8, cv2.COLORMAP_TURBO)
+            vis = cv2.resize(vis, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_NEAREST)
+
+            def _draw_mask_outline(mask, color):
+                if mask is None:
+                    return
+                mask_u8 = (mask > 0).astype(np.uint8) * 255
+                cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not cnts:
+                    return
+                scaled = [(c * 4).astype(np.int32) for c in cnts]
+                cv2.drawContours(vis, scaled, -1, color, 2)
+
+            _draw_mask_outline(wok_mask, (255, 255, 255))
+            _draw_mask_outline(food_mask, (0, 255, 255))
+            _draw_mask_outline(hot_mask, (0, 80, 255))
+
+            cv2.putText(vis, header, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (255, 255, 255), 2)
+            for idx, line in enumerate(detail_lines or []):
+                y = 78 + idx * 30
+                cv2.putText(vis, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
+            cv2.imwrite(os.path.join(ir_relabel_frame_dir, filename), vis)
+        except Exception:
+            pass
+
     def _draw_action_badge(vis, action_tag, color=(0, 220, 255)):
         if vis is None or not action_tag:
             return vis
@@ -768,7 +823,7 @@ def main():
         if vis is None:
             return
         _draw_action_badge(vis, action_tag)
-        y0 = min(vis.shape[0] - 24, 176)
+        y0 = min(vis.shape[0] - 24, 220)
         cv2.putText(vis, action_line, (20, y0),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
         cv2.imwrite(path, vis)
@@ -1030,10 +1085,14 @@ def main():
     #   - 混合模式（OPTICAL_FLOW_INTERVAL>1）：SAM2 只处理锚点帧（单帧批次），
     #     其余帧完全用光流传播，不再调用 SAM2
     carry_mask     = None   # 上批末帧 SAM2 mask，用于跨批传递
+    carry_mask_src_abs = None
     _next_inject   = None   # IR-fix接管后延迟到下批注入的前景点（让SAM2精细化）
     global_local   = 0      # 全局相对帧计数
     flow_prev_gray = None   # 光流：上一帧灰度图
     flow_prev_mask = None   # 光流：上一帧 mask
+
+    carry_mask_src_abs = None
+    _pending_forward_violation = None
 
     use_flow = (OPTICAL_FLOW_INTERVAL > 1)
     if use_flow:
@@ -1128,6 +1187,8 @@ def main():
     prev_mask_ratio = 0.0                # 上批末帧 mask 面积占比（%），用于异常检测
     last_reinforce_wok_pct = 0.0         # 上次补强时 mask 占 wok 区域的%（骤降检测用）
     _in_recovery = False                 # 重置后进入 recovery 模式，每批强制检查直到恢复
+    _forward_axis_stuck_streak = 0
+    _FORWARD_AXIS_STUCK_FRAMES = 15
 
     # ── 预计算 wok RGB mask（用于每帧后处理约束，避免循环内重复计算）────────
     _wok_rgb_constraint = None   # (VH, VW) bool
@@ -1335,15 +1396,23 @@ def main():
                         _wok_rgb_constraint,
                         VW * VH,
                         last_reinforce_wok_pct,
+                        axis_cx=_axis_cx_rgb_dyn,
+                        axis_cy=_axis_cy_rgb_dyn,
+                        axis_excl_r=_AXIS_EXCL_R,
                     )
                     _mask_px = _reset_metrics["mask_px"]
                     _reset_decision = _rgb_forward.evaluate_forward_reset(
                         _reset_metrics,
                         last_reinforce_wok_pct,
+                        axis_stuck_streak=_forward_axis_stuck_streak,
+                        axis_stuck_min_frames=_FORWARD_AXIS_STUCK_FRAMES,
+                        axis_excl_r=_AXIS_EXCL_R,
                     )
                     _need_reset = _reset_decision["need_reset"]
                     _reset_kind = _reset_decision["reason"]
                     _overlap_pct = _reset_metrics["overlap_pct"]
+                    _axis_overlap_pct = _reset_metrics.get("axis_overlap_pct")
+                    _centroid_dist_px = _reset_metrics.get("centroid_dist_px")
                     if _wok_rgb_constraint is not None and _mask_px > 0:
                         if _reset_kind == "overlap":
                             print(f"[补强] t={chunk_start_s:.1f}s  "
@@ -1370,6 +1439,11 @@ def main():
                             print(f"[补强] t={chunk_start_s:.1f}s  "
                                   f"mask面积骤降({last_reinforce_wok_pct:.0f}%→{_mask_vs_wok:.0f}%，"
                                   f"跌幅{_drop_pct:.0f}%>70%)，重置SAM2→初始标注点")
+                    if _reset_kind == "axis_stuck":
+                        print(f"[forward-axis] t={chunk_start_s:.1f}s  "
+                              f"axis_overlap={(_axis_overlap_pct if _axis_overlap_pct is not None else float('nan')):.0f}%  "
+                              f"centroid={(_centroid_dist_px if _centroid_dist_px is not None else float('nan')):.0f}px  "
+                              f"streak={_forward_axis_stuck_streak}  reset next chunk")
                     if _need_reset:
                         # ── 记录重置原因（预览图在 IR 采点完成后保存）─────────
                         _rst_reason = _rgb_forward.resolve_forward_reset_reason(
@@ -1377,41 +1451,71 @@ def main():
                             _overlap_pct,
                             last_reinforce_wok_pct,
                             _drop_pct,
+                            axis_overlap_pct=_axis_overlap_pct,
+                            centroid_dist_px=_centroid_dist_px,
+                            axis_stuck_streak=_forward_axis_stuck_streak,
+                            axis_stuck_min_frames=_FORWARD_AXIS_STUCK_FRAMES,
                         )
                         # 保留跑偏时的帧和 mask，供稍后保存预览图
                         _rst_carry_mask = carry_mask   # 跑偏的旧 mask（可能是 None）
-                        _rst_rgb_frame  = None
-                        try:
-                            _cap_rst = cv2.VideoCapture(video_path)
-                            _cap_rst.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
-                            _ret_rst, _rgb_rst = _cap_rst.read()
-                            _cap_rst.release()
-                            if _ret_rst:
-                                _rst_rgb_frame = _rgb_rst
-                        except Exception:
-                            pass
+                        _fail_frame_abs = carry_mask_src_abs
+                        if _fail_frame_abs is None and chunk_start_abs > start_frame:
+                            _fail_frame_abs = chunk_start_abs - 1
+                        _fail_time_s = (_fail_frame_abs / fps) if _fail_frame_abs is not None else None
+                        _fail_rgb_frame = _read_rgb_frame_at_abs(_fail_frame_abs)
+                        _rst_rgb_frame = _read_rgb_frame_at_abs(chunk_start_abs)
+                        if _pending_forward_violation is not None:
+                            _pv = _pending_forward_violation
+                            _rst_reason = _pv.get("reason", _rst_reason)
+                            _rst_carry_mask = _pv.get("mask", _rst_carry_mask)
+                            _fail_frame_abs = _pv.get("frame", _fail_frame_abs)
+                            _fail_time_s = _pv.get("time_s", _fail_time_s)
+                            _fail_rgb_frame = _pv.get("frame_bgr", _fail_rgb_frame)
+                            _pv_metrics = _pv.get("metrics", {})
+                            _overlap_pct = _pv_metrics.get("overlap_pct", _overlap_pct)
+                            _mask_vs_wok = _pv_metrics.get("mask_vs_wok", _mask_vs_wok)
+                            _drop_pct = _pv_metrics.get("drop_pct", _drop_pct)
+                            _mask_px = _pv_metrics.get("mask_px", _mask_px)
+                            _axis_overlap_pct = _pv_metrics.get("axis_overlap_pct", _axis_overlap_pct)
+                            _centroid_dist_px = _pv_metrics.get("centroid_dist_px", _centroid_dist_px)
 
                         try:
                             _violation_name = (
-                                f"forward_t{chunk_start_s:.0f}s_f{chunk_start_abs}_"
-                                f"{_slug_reason_token(_rst_reason, 'reset')}.jpg"
+                                _pending_forward_violation.get("violation_filename")
+                                if _pending_forward_violation is not None else None
                             )
-                            _save_violation_event_image(
+                            if not _violation_name:
+                                _violation_name = (
+                                    f"forward_t{(_fail_time_s if _fail_time_s is not None else chunk_start_s):.0f}s_"
+                                    f"f{(_fail_frame_abs if _fail_frame_abs is not None else chunk_start_abs)}_"
+                                    f"{_slug_reason_token(_rst_reason, 'reset')}.jpg"
+                                )
+                                _save_violation_event_image(
+                                    _violation_name,
+                                    (_fail_rgb_frame if _fail_rgb_frame is not None else _rst_rgb_frame),
+                                    _rst_carry_mask,
+                                    "FORWARD violation",
+                                    [
+                                        _rst_reason,
+                                        (f"fail_t={_fail_time_s:.1f}s  fail_frame={_fail_frame_abs}"
+                                         if _fail_time_s is not None and _fail_frame_abs is not None
+                                         else f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}"),
+                                        f"overlap={_overlap_pct:.1f}%  mask_vs_wok={_mask_vs_wok:.1f}%",
+                                        f"drop={_drop_pct:.1f}%  mask_px={_mask_px}",
+                                    ],
+                                )
+                            _append_violation_event_action(
                                 _violation_name,
-                                _rst_rgb_frame,
-                                _rst_carry_mask,
-                                "FORWARD violation",
-                                [
-                                    _rst_reason,
-                                    f"frame={chunk_start_abs}  t={chunk_start_s:.1f}s",
-                                    f"overlap={_overlap_pct:.1f}%  mask_vs_wok={_mask_vs_wok:.1f}%",
-                                    f"drop={_drop_pct:.1f}%  mask_px={_mask_px}",
-                                ],
+                                "IR_relabel",
+                                (f"next_chunk_action=IR_relabel  "
+                                 f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
                             )
                         except Exception:
                             pass
+                        _pending_forward_violation = None
 
                         carry_mask = None
+                        _forward_axis_stuck_streak = 0
                         last_relabel_s = chunk_start_s
                         _in_recovery = True   # 进入 recovery 模式，下批立即检查
                         # ── 尝试用 IR 当前帧低温区定位食材，生成新前景点 ────────
@@ -1437,6 +1541,27 @@ def main():
                                         axis_cy=_AXIS_CY_RGB,
                                         axis_excl_r=_AXIS_EXCL_R,
                                     )
+                                )
+                                _food_ir_rst = _temp_fusion.build_ir_food_mask_by_temperature(
+                                    _ir_frm_rst, _wok_mask_al, min_cluster_gap=30.0)
+                                _hot_ir_rst = None
+                                if _food_ir_rst is not None:
+                                    _hot_ir_rst = ((_wok_mask_al > 0) & (_food_ir_rst == 0)).astype(np.uint8) * 255
+                                _save_ir_relabel_frame_image(
+                                    f"forward_ir_relabel_t{chunk_start_s:.0f}s_f{chunk_start_abs}_ir{_ir_idx_rst}.jpg",
+                                    _ir_frm_rst,
+                                    _wok_mask_al,
+                                    "FORWARD IR relabel frame",
+                                    [
+                                        (f"fail_t={_fail_time_s:.1f}s  fail_frame={_fail_frame_abs}"
+                                         if _fail_time_s is not None and _fail_frame_abs is not None
+                                         else "fail_t=NA"),
+                                        f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
+                                        f"ir_idx={_ir_idx_rst}",
+                                        f"decision=IR_relabel  FG={len(_ir_fg_pts)} BG={len(_ir_bg_pts)}",
+                                    ],
+                                    food_mask=_food_ir_rst,
+                                    hot_mask=_hot_ir_rst,
                                 )
                                 if _ir_pts_ok:
                                     print(f"[琛ュ己] t={chunk_start_s:.1f}s  "
@@ -1548,14 +1673,21 @@ def main():
                                 cv2.putText(_vis_rst, _rst_reason,
                                             (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
                                             1.0, (0, 0, 255), 2)
+                                if _fail_time_s is not None and _fail_frame_abs is not None:
+                                    cv2.putText(_vis_rst,
+                                                f"fail_t={_fail_time_s:.1f}s  fail_frame={_fail_frame_abs}",
+                                                (20, 76), cv2.FONT_HERSHEY_SIMPLEX,
+                                                0.72, (255, 255, 255), 2)
                                 cv2.putText(_vis_rst,
                                             f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
-                                            (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                                            (20, 112 if _fail_time_s is not None and _fail_frame_abs is not None else 80),
+                                            cv2.FONT_HERSHEY_SIMPLEX,
                                             0.75, (0, 255, 255), 2)
                                 cv2.putText(_vis_rst,
                                             (f"[red=old bad mask | yellow=FG({n_fg_pts}) | blue=BG({n_bg_pts})]  "
                                              f"decision=IR_relabel"),
-                                            (20, 112), cv2.FONT_HERSHEY_SIMPLEX,
+                                            (20, 146 if _fail_time_s is not None and _fail_frame_abs is not None else 112),
+                                            cv2.FONT_HERSHEY_SIMPLEX,
                                             0.72, (255, 255, 255), 2)
                                 _draw_action_badge(_vis_rst, "IR_relabel")
                                 _rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
@@ -1565,98 +1697,95 @@ def main():
                         except Exception as _rpe:
                             print(f"[重置] 预览图保存失败: {_rpe}")
 
-                    else:
-                        # Optional forward semantic guard (currently disabled).
-                        # IoU here means:
-                        #   inter(carry_mask, ir_food_rgb) / union(carry_mask, ir_food_rgb) * 100
-                        # where `carry_mask` is the RGB forward mask carried from the
-                        # previous chunk, and `ir_food_rgb` is the current chunk-start IR
-                        # low-temperature food region projected into RGB.
-                        # This guard is disabled for now because the IR food region can be
-                        # unstable near the rotation-axis area and may trigger bad relabels.
-                        _ir_iou_ok = True   # 默认通过（无 IR 数据时不触发）
-                        _forward_ir_iou_guard_enabled = False
-                        if (_forward_ir_iou_guard_enabled
+                        else:
+                            # Optional forward semantic guard (currently disabled).
+                            # IoU here means:
+                            #   inter(carry_mask, ir_food_rgb) / union(carry_mask, ir_food_rgb) * 100
+                            # where `carry_mask` is the RGB forward mask carried from the
+                            # previous chunk, and `ir_food_rgb` is the current chunk-start IR
+                            # low-temperature food region projected into RGB.
+                            # This guard is disabled for now because the IR food region can be
+                            # unstable near the rotation-axis area and may trigger bad relabels.
+                            _ir_iou_ok = True   # 默认通过（无 IR 数据时不触发）
+                            _forward_ir_iou_guard_enabled = False
+                            if (_forward_ir_iou_guard_enabled
                                 and temp_data is not None and homography is not None
                                 and _wok_mask_al is not None and _H_inv_al is not None
                                 and carry_mask is not None and carry_mask.any()):
-                            try:
-                                _ir_idx_iou = _get_ir_idx(chunk_start_abs)
-                                _ir_frm_iou = temp_data[_ir_idx_iou]
-                                _wok_t_iou  = _ir_frm_iou[_wok_mask_al]
-                                if len(_wok_t_iou) >= 10:
-                                    # 用 K-means 双峰分类代替固定 P40 阈值：
-                                    # K-means 自适应找食材（低温类）和锅壁（高温类）的分界
-                                    # 返回 NaN = 锅内温度均匀（锅直立/无热食材），跳过 IoU 检查
-                                    _km_c_low  = float(np.percentile(_wok_t_iou, 10))
-                                    _km_c_high = float(np.percentile(_wok_t_iou, 90))
-                                    for _ in range(20):
-                                        _km_d_low  = np.abs(_wok_t_iou - _km_c_low)
-                                        _km_d_high = np.abs(_wok_t_iou - _km_c_high)
-                                        _km_food   = _km_d_low <= _km_d_high
-                                        _km_nl = float(np.mean(_wok_t_iou[_km_food]))  if _km_food.any()  else _km_c_low
-                                        _km_nh = float(np.mean(_wok_t_iou[~_km_food])) if (~_km_food).any() else _km_c_high
-                                        if abs(_km_nl - _km_c_low) < 0.1 and abs(_km_nh - _km_c_high) < 0.1:
-                                            break
-                                        _km_c_low, _km_c_high = _km_nl, _km_nh
-                                    if (_km_c_high - _km_c_low) < 30.0:
-                                        # 锅内温度均匀，无法区分食材和锅壁，跳过 IoU 检查
-                                        _wok_t_iou = None   # 标记跳过
-                                    else:
-                                        # 用 K-means 低温类像素构建食材 mask
-                                        _km_d_low2  = np.abs(_ir_frm_iou[_wok_mask_al] - _km_c_low)
-                                        _km_d_high2 = np.abs(_ir_frm_iou[_wok_mask_al] - _km_c_high)
-                                        _food_flat  = _km_d_low2 <= _km_d_high2
-                                        _food_ir_iou = np.zeros(_ir_frm_iou.shape, dtype=bool)
-                                        _food_ir_iou[_wok_mask_al] = _food_flat
-                                    if _wok_t_iou is not None:
-                                        # 把 IR 低温区反投影到 RGB 坐标系
-                                        _ys_iou, _xs_iou = np.where(_food_ir_iou)
-                                        if len(_xs_iou) >= 10:
-                                            _pts_iou_h = np.stack([
-                                                _xs_iou.astype(float),
-                                                _ys_iou.astype(float),
-                                                np.ones(len(_xs_iou))
-                                            ])
-                                            _pts_rgb_iou = _H_inv_al @ _pts_iou_h
-                                            _pts_rgb_iou = _pts_rgb_iou[:2] / _pts_rgb_iou[2]
-                                            # 构建 IR 食材区域 RGB mask
-                                            _ir_food_rgb = np.zeros((VH, VW), dtype=bool)
-                                            _xi_iou = np.clip(np.round(_pts_rgb_iou[0]).astype(int), 0, VW-1)
-                                            _yi_iou = np.clip(np.round(_pts_rgb_iou[1]).astype(int), 0, VH-1)
-                                            _ir_food_rgb[_yi_iou, _xi_iou] = True
-                                            # 膨胀一下，容忍标定误差（~15px）
-                                            _ir_food_rgb_u8 = _ir_food_rgb.astype(np.uint8) * 255
-                                            _kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
-                                            _ir_food_rgb_u8 = cv2.dilate(_ir_food_rgb_u8, _kd)
-                                            _ir_food_rgb = _ir_food_rgb_u8 > 0
-                                            # 计算 IoU：carry_mask 与 IR 低温区的重叠
-                                            _inter = int((carry_mask & _ir_food_rgb).sum())
-                                            _union = int((carry_mask | _ir_food_rgb).sum())
-                                            _iou = _inter / max(_union, 1) * 100
-                                            if _iou < 15.0:
-                                                _ir_iou_ok = False
-                                                print(f"[IR-IoU] t={chunk_start_s:.1f}s  "
-                                                      f"IoU={_iou:.1f}%<15%，SAM2 mask 与食材区域严重不符，"
-                                                      f"强制重置")
-                            except Exception as _iou_e:
-                                pass   # IoU 检查失败不影响主流程
+                                try:
+                                    _ir_idx_iou = _get_ir_idx(chunk_start_abs)
+                                    _ir_frm_iou = temp_data[_ir_idx_iou]
+                                    _wok_t_iou  = _ir_frm_iou[_wok_mask_al]
+                                    if len(_wok_t_iou) >= 10:
+                                        # 用 K-means 双峰分类代替固定 P40 阈值：
+                                        # K-means 自适应找食材（低温类）和锅壁（高温类）的分界
+                                        # 返回 NaN = 锅内温度均匀（锅直立/无热食材），跳过 IoU 检查
+                                        _km_c_low  = float(np.percentile(_wok_t_iou, 10))
+                                        _km_c_high = float(np.percentile(_wok_t_iou, 90))
+                                        for _ in range(20):
+                                            _km_d_low  = np.abs(_wok_t_iou - _km_c_low)
+                                            _km_d_high = np.abs(_wok_t_iou - _km_c_high)
+                                            _km_food   = _km_d_low <= _km_d_high
+                                            _km_nl = float(np.mean(_wok_t_iou[_km_food]))  if _km_food.any()  else _km_c_low
+                                            _km_nh = float(np.mean(_wok_t_iou[~_km_food])) if (~_km_food).any() else _km_c_high
+                                            if abs(_km_nl - _km_c_low) < 0.1 and abs(_km_nh - _km_c_high) < 0.1:
+                                                break
+                                            _km_c_low, _km_c_high = _km_nl, _km_nh
+                                        if (_km_c_high - _km_c_low) < 30.0:
+                                            # 锅内温度均匀，无法区分食材和锅壁，跳过 IoU 检查
+                                            _wok_t_iou = None   # 标记跳过
+                                        else:
+                                            # 用 K-means 低温类像素构建食材 mask
+                                            _km_d_low2  = np.abs(_ir_frm_iou[_wok_mask_al] - _km_c_low)
+                                            _km_d_high2 = np.abs(_ir_frm_iou[_wok_mask_al] - _km_c_high)
+                                            _food_flat  = _km_d_low2 <= _km_d_high2
+                                            _food_ir_iou = np.zeros(_ir_frm_iou.shape, dtype=bool)
+                                            _food_ir_iou[_wok_mask_al] = _food_flat
+                                        if _wok_t_iou is not None:
+                                            # 把 IR 低温区反投影到 RGB 坐标系
+                                            _ys_iou, _xs_iou = np.where(_food_ir_iou)
+                                            if len(_xs_iou) >= 10:
+                                                _pts_iou_h = np.stack([
+                                                    _xs_iou.astype(float),
+                                                    _ys_iou.astype(float),
+                                                    np.ones(len(_xs_iou))
+                                                ])
+                                                _pts_rgb_iou = _H_inv_al @ _pts_iou_h
+                                                _pts_rgb_iou = _pts_rgb_iou[:2] / _pts_rgb_iou[2]
+                                                # 构建 IR 食材区域 RGB mask
+                                                _ir_food_rgb = np.zeros((VH, VW), dtype=bool)
+                                                _xi_iou = np.clip(np.round(_pts_rgb_iou[0]).astype(int), 0, VW-1)
+                                                _yi_iou = np.clip(np.round(_pts_rgb_iou[1]).astype(int), 0, VH-1)
+                                                _ir_food_rgb[_yi_iou, _xi_iou] = True
+                                                # 膨胀一下，容忍标定误差（~15px）
+                                                _ir_food_rgb_u8 = _ir_food_rgb.astype(np.uint8) * 255
+                                                _kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+                                                _ir_food_rgb_u8 = cv2.dilate(_ir_food_rgb_u8, _kd)
+                                                _ir_food_rgb = _ir_food_rgb_u8 > 0
+                                                # 计算 IoU：carry_mask 与 IR 低温区的重叠
+                                                _inter = int((carry_mask & _ir_food_rgb).sum())
+                                                _union = int((carry_mask | _ir_food_rgb).sum())
+                                                _iou = _inter / max(_union, 1) * 100
+                                                if _iou < 15.0:
+                                                    _ir_iou_ok = False
+                                                    print(f"[IR-IoU] t={chunk_start_s:.1f}s  "
+                                                          f"IoU={_iou:.1f}%<15%，SAM2 mask 与食材区域严重不符，"
+                                                          f"强制重置")
+                                except Exception as _iou_e:
+                                    pass   # IoU 检查失败不影响主流程
 
                         if not _ir_iou_ok:
                             # 强制重置（复用 _need_reset 路径的逻辑）
                             _rst_reason = f"RESET: IR-IoU语义反转"
                             _rst_carry_mask = carry_mask
-                            _rst_rgb_frame  = None
-                            try:
-                                _cap_iou_rst = cv2.VideoCapture(video_path)
-                                _cap_iou_rst.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
-                                _ret_iou_rst, _rgb_iou_rst = _cap_iou_rst.read()
-                                _cap_iou_rst.release()
-                                if _ret_iou_rst:
-                                    _rst_rgb_frame = _rgb_iou_rst
-                            except Exception:
-                                pass
+                            _fail_frame_abs = carry_mask_src_abs
+                            if _fail_frame_abs is None and chunk_start_abs > start_frame:
+                                _fail_frame_abs = chunk_start_abs - 1
+                            _fail_time_s = (_fail_frame_abs / fps) if _fail_frame_abs is not None else None
+                            _fail_rgb_frame = _read_rgb_frame_at_abs(_fail_frame_abs)
+                            _rst_rgb_frame = _read_rgb_frame_at_abs(chunk_start_abs)
                             carry_mask = None
+                            _pending_forward_violation = None
                             last_relabel_s = chunk_start_s
                             _in_recovery = True
                             _reinforce_inject = None
@@ -1742,13 +1871,19 @@ def main():
                                     _iou_fg_n = len(_reinforce_inject["fg_points"]) if _reinforce_inject else 0
                                     _iou_bg_n = len(_reinforce_inject.get("bg_points", [])) if _reinforce_inject else 0
                                     cv2.putText(_vis_iou, _rst_reason, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                                    if _fail_time_s is not None and _fail_frame_abs is not None:
+                                        cv2.putText(_vis_iou,
+                                                    f"fail_t={_fail_time_s:.1f}s  fail_frame={_fail_frame_abs}",
+                                                    (20, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
                                     cv2.putText(_vis_iou,
                                                 f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
-                                                (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+                                                (20, 112 if _fail_time_s is not None and _fail_frame_abs is not None else 80),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
                                     cv2.putText(_vis_iou,
                                                 (f"[red=old bad mask | yellow=FG({_iou_fg_n}) | blue=BG({_iou_bg_n})]  "
                                                  f"decision=IR_relabel"),
-                                                (20, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+                                                (20, 146 if _fail_time_s is not None and _fail_frame_abs is not None else 112),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
                                     _draw_action_badge(_vis_iou, "IR_relabel")
                                     _iou_rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}_iou.jpg"
                                     cv2.imwrite(os.path.join(relabel_preview_dir, _iou_rst_name), _vis_iou)
@@ -1759,8 +1894,58 @@ def main():
                             # ── mask 正常且 IoU 通过：SAM2 自主追踪，不注入 IR 采点 ──
                             # IR 只做门控（IoU 检查），通过后让 SAM2 完全靠视觉语义自由追踪
                             # 仅在 SAM2 跑偏（IoU<15%）或面积异常时才强制重置
+                            if _pending_forward_violation is not None:
+                                _violation_name = _pending_forward_violation.get("violation_filename")
+                                _append_violation_event_action(
+                                    _violation_name,
+                                    "reuse_carry",
+                                    (f"next_chunk_action=reuse_carry  "
+                                     f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
+                                )
+                                try:
+                                    _pv = _pending_forward_violation
+                                    _reuse_reason = _pv.get("reason", "FORWARD reuse_carry")
+                                    _reuse_fail_frame = _pv.get("frame")
+                                    _reuse_fail_time = _pv.get("time_s")
+                                    _reuse_mask = _pv.get("mask")
+                                    _reuse_metrics = _pv.get("metrics", {})
+                                    _reuse_rgb = _rgb_ref.copy() if _rgb_ref is not None else _read_rgb_frame_at_abs(chunk_start_abs)
+                                    if _reuse_rgb is not None:
+                                        _vis_reuse = _reuse_rgb.copy()
+                                        if _reuse_mask is not None and np.any(_reuse_mask):
+                                            _vis_reuse[_reuse_mask] = (
+                                                _vis_reuse[_reuse_mask].astype(float) * 0.5
+                                                + np.array([0, 0, 220]) * 0.5
+                                            ).astype(np.uint8)
+                                        cv2.putText(_vis_reuse, _reuse_reason,
+                                                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                                                    1.0, (0, 0, 255), 2)
+                                        if _reuse_fail_time is not None and _reuse_fail_frame is not None:
+                                            cv2.putText(_vis_reuse,
+                                                        f"fail_t={_reuse_fail_time:.1f}s  fail_frame={_reuse_fail_frame}",
+                                                        (20, 76), cv2.FONT_HERSHEY_SIMPLEX,
+                                                        0.72, (255, 255, 255), 2)
+                                        cv2.putText(_vis_reuse,
+                                                    f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
+                                                    (20, 112 if _reuse_fail_time is not None and _reuse_fail_frame is not None else 80),
+                                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                                    0.75, (0, 255, 255), 2)
+                                        cv2.putText(_vis_reuse,
+                                                    (f"[red=reused carry mask]  decision=reuse_carry  "
+                                                     f"overlap={_reuse_metrics.get('overlap_pct', float('nan')):.1f}%  "
+                                                     f"mask_vs_wok={_reuse_metrics.get('mask_vs_wok', float('nan')):.1f}%"),
+                                                    (20, 146 if _reuse_fail_time is not None and _reuse_fail_frame is not None else 112),
+                                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                                    0.72, (255, 255, 255), 2)
+                                        _draw_action_badge(_vis_reuse, "reuse_carry", color=(80, 255, 180))
+                                        _reuse_name = f"forward_carry_reuse_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
+                                        cv2.imwrite(os.path.join(relabel_preview_dir, _reuse_name), _vis_reuse)
+                                except Exception:
+                                    pass
+                            _pending_forward_violation = None
                             last_relabel_s = chunk_start_s
                             last_reinforce_wok_pct = _mask_vs_wok
+                            _forward_axis_stuck_streak = 0
                             _in_recovery = False
                             print(f"[补强] t={chunk_start_s:.1f}s  mask正常({_mask_vs_wok:.0f}%)"
                                   f"  SAM2自主追踪(IoU通过，无IR注入)")
@@ -1944,6 +2129,11 @@ def main():
                 print(f"[SAM2] 批次 {chunk_i+1} 追踪完成，{len(chunk_masks)} 帧")
 
                 # ── 锅底第二次 SAM2 追踪（反向语义）────────────────────────────
+                if carry_mask is not None:
+                    carry_mask_src_abs = chunk_start_abs + max(actual - 1, 0)
+                else:
+                    carry_mask_src_abs = None
+
                 bottom_chunk_masks = {}
                 if has_bottom and chunk_start_abs >= bottom_start_frame:
                     try:
@@ -2082,6 +2272,27 @@ def main():
                                             "decision=IR_relabel",
                                         ],
                                         action_tag="IR_relabel",
+                                    )
+                                    _food_ir_inv = _temp_fusion.build_ir_food_mask_by_temperature(
+                                        _ir_b0, wok_mask_ir, min_cluster_gap=30.0)
+                                    _hot_ir_inv = None
+                                    if _food_ir_inv is not None:
+                                        _hot_ir_inv = ((wok_mask_ir > 0) & (_food_ir_inv == 0)).astype(np.uint8) * 255
+                                    _save_ir_relabel_frame_image(
+                                        f"inverse_ir_relabel_t{chunk_start_s:.0f}s_f{chunk_start_abs}_ir{_get_ir_idx(chunk_start_abs)}.jpg",
+                                        _ir_b0,
+                                        wok_mask_ir,
+                                        "INVERSE IR relabel frame",
+                                        [
+                                            (f"fail_t={_reset_src_time:.1f}s  fail_frame={_reset_src_frame}"
+                                             if _reset_src_time is not None and _reset_src_frame is not None
+                                             else f"fail_frame={_reset_src_frame}"),
+                                            f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
+                                            f"ir_idx={_get_ir_idx(chunk_start_abs)}",
+                                            f"decision=IR_relabel  FG={len(_auto_fg_b)} BG={len(_auto_bg_b)}",
+                                        ],
+                                        food_mask=_food_ir_inv,
+                                        hot_mask=_hot_ir_inv,
                                     )
                                     _auto_pts_b = _rgb_inverse.build_inverse_point_result(
                                         _auto_fg_b, _auto_bg_b, _auto_ok_b
@@ -2256,6 +2467,85 @@ def main():
 
                 time_s     = abs_idx / fps
                 mask_ratio = mask.sum() / mask.size * 100
+                # Forward violation logging is event-based:
+                # once one bad frame opens a pending reset event, we keep only that
+                # first failing frame and wait for the next chunk-start decision
+                # (`reuse_carry` or `IR_relabel`) instead of saving every bad frame.
+                if _wok_rgb_constraint is not None:
+                    try:
+                        _frame_reset_metrics = _rgb_forward.compute_forward_reset_metrics(
+                            mask,
+                            _wok_rgb_constraint,
+                            VW * VH,
+                            last_reinforce_wok_pct,
+                            axis_cx=_axis_cx_rgb_dyn,
+                            axis_cy=_axis_cy_rgb_dyn,
+                            axis_excl_r=_AXIS_EXCL_R,
+                        )
+                        _axis_stuck_now = _rgb_forward.is_forward_axis_stuck_frame(
+                            _frame_reset_metrics,
+                            _AXIS_EXCL_R,
+                        )
+                        _forward_axis_stuck_streak = (
+                            _forward_axis_stuck_streak + 1 if _axis_stuck_now else 0
+                        )
+                        if _pending_forward_violation is None:
+                            _frame_reset_decision = _rgb_forward.evaluate_forward_reset(
+                                _frame_reset_metrics,
+                                last_reinforce_wok_pct,
+                                axis_stuck_streak=_forward_axis_stuck_streak,
+                                axis_stuck_min_frames=_FORWARD_AXIS_STUCK_FRAMES,
+                                axis_excl_r=_AXIS_EXCL_R,
+                            )
+                            if _frame_reset_decision["need_reset"]:
+                                _frame_reset_metrics["axis_stuck_streak"] = _forward_axis_stuck_streak
+                                _frame_reason = _rgb_forward.resolve_forward_reset_reason(
+                                    _frame_reset_metrics["mask_vs_wok"],
+                                    _frame_reset_metrics["overlap_pct"],
+                                    last_reinforce_wok_pct,
+                                    _frame_reset_metrics["drop_pct"],
+                                    axis_overlap_pct=_frame_reset_metrics.get("axis_overlap_pct"),
+                                    centroid_dist_px=_frame_reset_metrics.get("centroid_dist_px"),
+                                    axis_stuck_streak=_forward_axis_stuck_streak,
+                                    axis_stuck_min_frames=_FORWARD_AXIS_STUCK_FRAMES,
+                                )
+                                _violation_name = (
+                                    f"forward_t{time_s:.0f}s_f{abs_idx}_"
+                                    f"{_slug_reason_token(_frame_reason, 'reset')}.jpg"
+                                )
+                                _detail_lines = [
+                                    _frame_reason,
+                                    f"fail_t={time_s:.1f}s  fail_frame={abs_idx}",
+                                    (f"overlap={_frame_reset_metrics['overlap_pct']:.1f}%  "
+                                     f"mask_vs_wok={_frame_reset_metrics['mask_vs_wok']:.1f}%"),
+                                    (f"drop={_frame_reset_metrics['drop_pct']:.1f}%  "
+                                     f"mask_px={_frame_reset_metrics['mask_px']}"),
+                                ]
+                                if (_frame_reset_metrics.get("axis_overlap_pct") is not None
+                                        and _frame_reset_metrics.get("centroid_dist_px") is not None):
+                                    _detail_lines.append(
+                                        (f"axis_overlap={_frame_reset_metrics['axis_overlap_pct']:.1f}%  "
+                                         f"centroid={_frame_reset_metrics['centroid_dist_px']:.1f}px  "
+                                         f"streak={_forward_axis_stuck_streak}")
+                                    )
+                                _save_violation_event_image(
+                                    _violation_name,
+                                    frame,
+                                    mask,
+                                    "FORWARD violation",
+                                    _detail_lines,
+                                )
+                                _pending_forward_violation = {
+                                    "frame": abs_idx,
+                                    "time_s": time_s,
+                                    "frame_bgr": frame.copy(),
+                                    "mask": mask.copy(),
+                                    "reason": _frame_reason,
+                                    "metrics": _frame_reset_metrics,
+                                    "violation_filename": _violation_name,
+                                }
+                    except Exception:
+                        pass
                 if not np.isnan(temp_mean):
                     temp_history.append((time_s, temp_mean))
 
@@ -2564,6 +2854,7 @@ def main():
             if _irfix_count > actual * 0.5 and _irfix_last_mask is not None:
                 # carry_mask 仍用 IR 末帧 mask 覆盖（确保跨批位置正确）
                 carry_mask = _irfix_last_mask.copy()
+                carry_mask_src_abs = chunk_start_abs + max(actual - 1, 0)
                 _wok_px_ni = int(_wok_rgb_constraint.sum()) if _wok_rgb_constraint is not None else 1
                 _new_mask_pct = carry_mask.sum() / max(_wok_px_ni, 1) * 100
                 print(f"[IR-fix接管] 批次{chunk_i+1} 命中率={_irfix_count}/{actual}"

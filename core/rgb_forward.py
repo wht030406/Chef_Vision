@@ -197,10 +197,15 @@ def compute_forward_reset_metrics(
     wok_rgb_constraint,
     default_wok_pixels,
     last_reinforce_wok_pct,
+    axis_cx=None,
+    axis_cy=None,
+    axis_excl_r=None,
 ):
     """Compute shared metrics used by the forward reset checks."""
     mask_px = int(carry_mask.sum())
     overlap_pct = 100.0
+    axis_overlap_pct = None
+    centroid_dist_px = None
 
     if wok_rgb_constraint is not None and mask_px > 0:
         overlap_px = int((carry_mask & wok_rgb_constraint).sum())
@@ -210,16 +215,60 @@ def compute_forward_reset_metrics(
     mask_vs_wok = mask_px / max(wok_px, 1) * 100
     drop_pct = (last_reinforce_wok_pct - mask_vs_wok) / max(last_reinforce_wok_pct, 0.1) * 100
 
+    if (mask_px > 0 and axis_cx is not None and axis_cy is not None
+            and axis_excl_r is not None):
+        ys, xs = np.where(carry_mask)
+        if len(xs) > 0:
+            axis_mask_px = int(np.count_nonzero(
+                ((xs - float(axis_cx)) ** 2 + (ys - float(axis_cy)) ** 2)
+                <= float(axis_excl_r) ** 2
+            ))
+            axis_overlap_pct = axis_mask_px / mask_px * 100.0
+            centroid_x = float(xs.mean())
+            centroid_y = float(ys.mean())
+            centroid_dist_px = float(
+                ((centroid_x - float(axis_cx)) ** 2 + (centroid_y - float(axis_cy)) ** 2) ** 0.5
+            )
+
     return {
         "mask_px": mask_px,
         "overlap_pct": overlap_pct,
         "wok_px": wok_px,
         "mask_vs_wok": mask_vs_wok,
         "drop_pct": drop_pct,
+        "axis_overlap_pct": axis_overlap_pct,
+        "centroid_dist_px": centroid_dist_px,
     }
 
 
-def evaluate_forward_reset(metrics, last_reinforce_wok_pct):
+def is_forward_axis_stuck_frame(
+    metrics,
+    axis_excl_r,
+    min_axis_overlap_pct=60.0,
+    centroid_radius_ratio=1.0,
+):
+    """Return True when the forward mask is dominated by the rotation-axis area."""
+    if axis_excl_r is None:
+        return False
+    if metrics.get("mask_px", 0) <= 0:
+        return False
+    axis_overlap_pct = metrics.get("axis_overlap_pct")
+    centroid_dist_px = metrics.get("centroid_dist_px")
+    if axis_overlap_pct is None or centroid_dist_px is None:
+        return False
+    return (
+        axis_overlap_pct >= float(min_axis_overlap_pct)
+        and centroid_dist_px <= float(axis_excl_r) * float(centroid_radius_ratio)
+    )
+
+
+def evaluate_forward_reset(
+    metrics,
+    last_reinforce_wok_pct,
+    axis_stuck_streak=0,
+    axis_stuck_min_frames=15,
+    axis_excl_r=None,
+):
     """Evaluate whether forward tracking should reset, using shared metrics."""
     overlap_pct = metrics["overlap_pct"]
     mask_vs_wok = metrics["mask_vs_wok"]
@@ -235,6 +284,9 @@ def evaluate_forward_reset(metrics, last_reinforce_wok_pct):
             return {"need_reset": True, "reason": "undersize"}
         if last_reinforce_wok_pct > 5.0 and drop_pct > 70.0:
             return {"need_reset": True, "reason": "drop"}
+    if (axis_stuck_streak >= axis_stuck_min_frames
+            and is_forward_axis_stuck_frame(metrics, axis_excl_r)):
+        return {"need_reset": True, "reason": "axis_stuck"}
     return {"need_reset": False, "reason": None}
 
 
@@ -243,6 +295,10 @@ def resolve_forward_reset_reason(
     overlap_pct,
     last_reinforce_wok_pct,
     drop_pct,
+    axis_overlap_pct=None,
+    centroid_dist_px=None,
+    axis_stuck_streak=0,
+    axis_stuck_min_frames=15,
 ):
     """Resolve the reason text for a forward-tracking reset."""
     if mask_vs_wok < 5.0:
@@ -253,4 +309,10 @@ def resolve_forward_reset_reason(
         return f"RESET: mask too large ({mask_vs_wok:.0f}%>wok60%)"
     if overlap_pct < 60.0:
         return f"RESET: mask left wok area (overlap={overlap_pct:.0f}%)"
+    if (axis_stuck_streak >= axis_stuck_min_frames
+            and axis_overlap_pct is not None and centroid_dist_px is not None):
+        return ("RESET: mask stuck near axis "
+                f"(axis_overlap={axis_overlap_pct:.0f}%"
+                f", centroid={centroid_dist_px:.0f}px"
+                f", streak={axis_stuck_streak})")
     return "RESET"

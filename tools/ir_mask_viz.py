@@ -50,6 +50,20 @@ MIN_FOOD_AREA   = 20   # 最小菜区域像素数（IR 原始分辨率）
 
 # ── 锅区域椭圆 ────────────────────────────────────────────────────────────────
 
+def _draw_food_boundary_overlay(ir_img, food_mask_u8):
+    """Draw a high-contrast food boundary on the IR colormap."""
+    if food_mask_u8 is None or not np.any(food_mask_u8):
+        return
+
+    contours, _ = cv2.findContours(food_mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return
+
+    cv2.drawContours(ir_img, contours, -1, (0, 0, 0), 6)
+    cv2.drawContours(ir_img, contours, -1, (255, 255, 255), 4)
+    cv2.drawContours(ir_img, contours, -1, (255, 0, 220), 2)
+
+
 def load_wok_region(ir_h, ir_w):
     """加载锅区域椭圆配置，不存在则返回默认（覆盖整个画面中心）"""
     if os.path.exists(WOK_CFG_PATH):
@@ -387,8 +401,7 @@ def main():
         ir_img[food_bool] = (ir_img[food_bool].astype(float) * 0.65 +
                               np.array([255, 255, 255]) * 0.35).astype(np.uint8)
         # 亮紫色轮廓线（2px，在 IR 热力图上最醒目）
-        contours, _ = cv2.findContours(food_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(ir_img, contours, -1, (255, 0, 200), 2)
+        _draw_food_boundary_overlay(ir_img, food_resized)
 
         # 信息文字
         cv2.putText(ir_img, f"t={time_s:.1f}s  WokMask={mask_ratio:.1f}%",
@@ -476,8 +489,7 @@ def render_ir_frame(temp_frame, wok_cfg, pct=40,
     food_bool = food_resized > 127
     ir_img[food_bool] = (ir_img[food_bool].astype(float) * 0.65 +
                          np.array([255, 255, 255]) * 0.35).astype(np.uint8)
-    contours, _ = cv2.findContours(food_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(ir_img, contours, -1, (255, 0, 200), 2)
+    _draw_food_boundary_overlay(ir_img, food_resized)
 
     # 温度信息文字
     mask_ratio = food_mask.sum() / wok_mask_.sum() * 100 if wok_mask_.sum() > 0 else 0
