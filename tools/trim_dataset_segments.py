@@ -76,6 +76,8 @@ def main():
     ir_path = src_dir / args.ir
     temp_path = src_dir / args.temp
     roi_path = src_dir / "roi_config.json"
+    rgb_ts_path = src_dir / f"{Path(args.rgb).stem}_ts.npy"
+    temp_ts_path = src_dir / f"{Path(args.temp).stem}_ts.npy"
 
     segments = [parse_segment(seg) for seg in args.segments]
 
@@ -107,6 +109,16 @@ def main():
     ir_total, ir_written, _ = trim_video(ir_path, dst_dir / args.ir, ir_keep)
 
     np.save(dst_dir / args.temp, temp_data[ir_keep])
+    if rgb_ts_path.exists():
+        rgb_ts = np.load(rgb_ts_path)
+        if len(rgb_ts) != rgb_frames:
+            raise RuntimeError(f"RGB timestamp/frame mismatch: {len(rgb_ts)} vs {rgb_frames}")
+        np.save(dst_dir / rgb_ts_path.name, rgb_ts[rgb_keep])
+    if temp_ts_path.exists():
+        temp_ts = np.load(temp_ts_path)
+        if len(temp_ts) != temp_frames:
+            raise RuntimeError(f"temp timestamp/frame mismatch: {len(temp_ts)} vs {temp_frames}")
+        np.save(dst_dir / temp_ts_path.name, temp_ts[ir_keep])
     if roi_path.exists():
         shutil.copy2(roi_path, dst_dir / roi_path.name)
 
@@ -127,6 +139,10 @@ def main():
         "temp": {
             "frames_in": temp_frames,
             "frames_out": int(ir_keep.sum()),
+        },
+        "timestamps": {
+            "rgb_ts_saved": rgb_ts_path.exists(),
+            "temp_ts_saved": temp_ts_path.exists(),
         },
     }
     with open(dst_dir / "trim_summary.json", "w", encoding="utf-8") as f:

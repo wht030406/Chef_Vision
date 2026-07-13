@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 
+from ir_food_seg import SEG_TWO_CLUSTER, segment_ir_food
+
 
 def build_forward_inject_keyframe(fg_points, bg_points=None, label="", local_frame=0):
     """Build a standard injection payload for forward SAM2 tracking."""
@@ -109,6 +111,8 @@ def generate_forward_relabel_points_from_ir(
     n_fg=8,
     n_bg=8,
     min_cluster_gap=30.0,
+    seg_mode=SEG_TWO_CLUSTER,
+    seg_percentile=40,
 ):
     """Split IR wok pixels into food FG and hot-wok BG, then project both to RGB."""
     if (ir_frame is None or wok_mask_ir is None or homography_inv is None
@@ -116,39 +120,28 @@ def generate_forward_relabel_points_from_ir(
         return [], [], False, None
 
     rng = rng or np.random.default_rng(0)
-    wok_t = ir_frame[wok_mask_ir]
-    if len(wok_t) < 10:
+    seg_result = segment_ir_food(
+        ir_frame,
+        wok_mask_ir,
+        mode=seg_mode,
+        percentile=seg_percentile,
+        min_cluster_gap=min_cluster_gap,
+    )
+    if seg_result.reason == "too_few_wok_pixels":
         return [], [], False, None
-
-    c_low = float(np.percentile(wok_t, 10))
-    c_high = float(np.percentile(wok_t, 90))
-    for _ in range(20):
-        d_low = np.abs(wok_t - c_low)
-        d_high = np.abs(wok_t - c_high)
-        food_sel = d_low <= d_high
-        n_low = float(np.mean(wok_t[food_sel])) if food_sel.any() else c_low
-        n_high = float(np.mean(wok_t[~food_sel])) if (~food_sel).any() else c_high
-        if abs(n_low - c_low) < 0.1 and abs(n_high - c_high) < 0.1:
-            break
-        c_low, c_high = n_low, n_high
-
-    cluster_gap = c_high - c_low
-    if cluster_gap < min_cluster_gap:
+    c_low = seg_result.food_center
+    c_high = seg_result.hot_center
+    cluster_gap = seg_result.cluster_gap
+    if not seg_result.ok:
         return [], [], False, {
             "food_center": c_low,
             "hot_center": c_high,
             "cluster_gap": cluster_gap,
+            "threshold": seg_result.threshold,
+            "seg_mode": seg_result.mode,
         }
-
-    ys_wok, xs_wok = np.where(wok_mask_ir)
-    vals = ir_frame[wok_mask_ir]
-    d_low = np.abs(vals - c_low)
-    d_high = np.abs(vals - c_high)
-
-    food_ir = np.zeros_like(wok_mask_ir, dtype=np.uint8)
-    hot_ir = np.zeros_like(wok_mask_ir, dtype=np.uint8)
-    food_ir[ys_wok[d_low <= d_high], xs_wok[d_low <= d_high]] = 255
-    hot_ir[ys_wok[d_high < d_low], xs_wok[d_high < d_low]] = 255
+    food_ir = seg_result.food_u8
+    hot_ir = seg_result.hot_u8
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     food_ir = cv2.morphologyEx(food_ir, cv2.MORPH_OPEN, kernel)
@@ -187,6 +180,8 @@ def generate_forward_relabel_points_from_ir(
         "food_center": c_low,
         "hot_center": c_high,
         "cluster_gap": cluster_gap,
+        "threshold": seg_result.threshold,
+        "seg_mode": seg_result.mode,
         "fg_count": len(fg_points),
         "bg_count": len(bg_points),
     }

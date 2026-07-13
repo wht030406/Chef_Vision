@@ -44,6 +44,7 @@ OUTPUT_H = os.path.join(_HERE, "..", "data", "homography.npy")
 # 锅视频：500/1000/1500 = 约 20s/40s/60s（锅已加热，IR 特征清晰）
 # 短视频：10/50/100 备用
 CALIB_FRAMES = [500, 1000, 1500, 600, 800, 1200]   # 3个主帧 + 3个备用帧（均在锅内）
+SHORT_VIDEO_FRAMES = [10, 50, 100]
 
 DISPLAY_H = 480   # 显示高度（像素）
 
@@ -68,6 +69,19 @@ ir_orig_size  = (256, 192)
 frame_idx_list = []   # 实际使用的帧号列表
 cur_frame_pos  = 0    # 当前在 frame_idx_list 中的位置
 cur_frame_idx  = 0    # 当前帧号
+
+
+def choose_calibration_frames(total_frames):
+    """Pick long-video frames first, then fall back to short-video frames."""
+    selected = [f for f in CALIB_FRAMES if f < total_frames]
+    if selected:
+        return selected
+
+    selected = [f for f in SHORT_VIDEO_FRAMES if f < total_frames]
+    if selected:
+        return selected
+
+    return [0]
 
 
 def load_frame(rgb_file, npy_file, frame_idx):
@@ -275,7 +289,8 @@ def compute_and_save(rgb_file, npy_file):
     print(f"\n[OK] 已保存: {OUTPUT_H}")
 
     # 生成验证图
-    _make_verify(rgb_file, npy_file, H, CALIB_FRAMES[0])
+    verify_frame = frame_idx_list[0] if frame_idx_list else 0
+    _make_verify(rgb_file, npy_file, H, verify_frame)
     return True
 
 
@@ -331,9 +346,8 @@ def main():
 
     # 过滤超出范围的帧号
     total = get_rgb_total(rgb_file)
-    frame_idx_list.extend([f for f in CALIB_FRAMES if f < total])
-    if not frame_idx_list:
-        frame_idx_list.append(0)
+    frame_idx_list.clear()
+    frame_idx_list.extend(choose_calibration_frames(total))
 
     print("=" * 60)
     print("  Chef Vision - RGB/IR 多帧标定工具")
@@ -367,10 +381,10 @@ def main():
             btn_action[0] = None
             key = ord(action)   # 复用键盘处理逻辑
 
-        if key in (ord('q'), 27):
+        if key in (ord('q'), ord('Q'), 27):
             break
 
-        elif key == ord('n'):
+        elif key in (ord('n'), ord('N')):
             # 提交当前帧，切换到下一帧
             commit_current_frame()
             cur_frame_pos = (cur_frame_pos + 1) % len(frame_idx_list)
@@ -380,12 +394,12 @@ def main():
             make_display(rgb_img, ir_img)
             print(f"\n[帧 {cur_frame_pos+1}/{len(frame_idx_list)}] RGB帧{cur_frame_idx} / IR帧{ir_idx}")
 
-        elif key == ord('c'):
+        elif key in (ord('c'), ord('C')):
             commit_current_frame()
             if compute_and_save(rgb_file, npy_file):
                 print("\n标定完成！按 Q 退出")
 
-        elif key == ord('z'):
+        elif key in (ord('z'), ord('Z')):
             if click_state == "ir" and len(cur_rgb_points) > len(cur_ir_points):
                 p = cur_rgb_points.pop()
                 click_state = "rgb"

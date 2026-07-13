@@ -3,6 +3,8 @@ import os
 import cv2
 import numpy as np
 
+from ir_food_seg import SEG_TWO_CLUSTER, segment_ir_food
+
 
 def build_inverse_inject_keyframes(bottom_inject_map, chunk_start_abs, chunk_end_abs):
     """Collect inverse-tracking keyframes that fall inside the current chunk."""
@@ -580,6 +582,8 @@ def generate_inverse_bottom_points_from_ir(
     axis_excl_r=None,
     detail_lines=None,
     action_tag=None,
+    seg_mode=SEG_TWO_CLUSTER,
+    seg_percentile=40,
 ):
     """Generate inverse-SAM2 points from current IR: food interior=BG, other wok area=FG."""
     if (rgb_frame is None or ir_frame is None or wok_mask_ir is None
@@ -587,32 +591,22 @@ def generate_inverse_bottom_points_from_ir(
         return [], [], False
 
     rng = rng or np.random.default_rng(0)
-    wok_t = ir_frame[wok_mask_ir]
-    if len(wok_t) < 10:
+    seg_result = segment_ir_food(
+        ir_frame,
+        wok_mask_ir,
+        mode=seg_mode,
+        percentile=seg_percentile,
+        min_cluster_gap=25.0,
+    )
+    if seg_result.reason == "too_few_wok_pixels":
+        return [], [], False
+    if not seg_result.ok:
         return [], [], False
 
-    c_low = float(np.percentile(wok_t, 10))
-    c_high = float(np.percentile(wok_t, 90))
-    for _ in range(20):
-        d_low = np.abs(wok_t - c_low)
-        d_high = np.abs(wok_t - c_high)
-        low_sel = d_low <= d_high
-        n_low = float(np.mean(wok_t[low_sel])) if low_sel.any() else c_low
-        n_high = float(np.mean(wok_t[~low_sel])) if (~low_sel).any() else c_high
-        if abs(n_low - c_low) < 0.1 and abs(n_high - c_high) < 0.1:
-            break
-        c_low, c_high = n_low, n_high
-    if (c_high - c_low) < 25.0:
-        return [], [], False
-
-    ys_w, xs_w = np.where(wok_mask_ir)
-    vals = ir_frame[wok_mask_ir]
-    d_low = np.abs(vals - c_low)
-    d_high = np.abs(vals - c_high)
-    food_ir = np.zeros_like(wok_mask_ir, dtype=np.uint8)
-    hot_ir = np.zeros_like(wok_mask_ir, dtype=np.uint8)
-    food_ir[ys_w[d_low <= d_high], xs_w[d_low <= d_high]] = 255
-    hot_ir[ys_w[d_high < d_low], xs_w[d_high < d_low]] = 255
+    c_low = seg_result.food_center
+    c_high = seg_result.hot_center
+    food_ir = seg_result.food_u8
+    hot_ir = seg_result.hot_u8
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     food_ir = cv2.morphologyEx(food_ir, cv2.MORPH_OPEN, kernel)
@@ -776,7 +770,9 @@ def generate_inverse_bottom_points_from_ir(
                   else f"Inverse auto points FG-bottom={len(fg_pts)} BG-food={len(bg_pts)}")
         lines = [
             f"[red=old bad mask | green=FG-bottom({len(fg_pts)}) | blue=BG-food({len(bg_pts)})]",
-            f"K-low/high=({c_low:.1f},{c_high:.1f})C",
+            (f"K-low/high=({c_low:.1f},{c_high:.1f})C"
+             if c_low is not None and c_high is not None
+             else f"threshold={seg_result.threshold:.1f}C"),
         ]
         lines.extend(detail_lines or [])
         save_inverse_preview(

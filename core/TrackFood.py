@@ -90,6 +90,24 @@ CURVE_WIN_S     = 60              # 曲线滑动窗口（秒），只显示最�
 # 每隔 N 秒自动重新生成前景点并重置 SAM2，解决长时间追踪漂移问题
 # 0 = 关闭（使用 food_labels.json 中的关键帧）
 RELABEL_INTERVAL_S = 4
+IR_FOOD_SEG_MODE = "percentile"
+IR_FOOD_SEG_PERCENTILE = 40
+IR_PANEL_SEG_MODE = IR_FOOD_SEG_MODE
+
+
+def _format_ir_seg_stats(stats):
+    """Build a compact label for whichever IR segmentation mode is active."""
+    if not stats:
+        return "seg=NA"
+    mode = stats.get("seg_mode", IR_FOOD_SEG_MODE)
+    if stats.get("threshold") is not None:
+        return f"seg={mode} threshold={stats['threshold']:.1f}C"
+    if stats.get("food_center") is not None and stats.get("hot_center") is not None:
+        return (
+            f"seg={mode} low={stats['food_center']:.1f}C "
+            f"high={stats['hot_center']:.1f}C"
+        )
+    return f"seg={mode}"
 
 # Disabled by default for trimmed datasets. Enable only when raw videos still
 # contain upright-wok / flip interference segments that should output empty masks.
@@ -1540,10 +1558,14 @@ def main():
                                         axis_cx=_AXIS_CX_RGB,
                                         axis_cy=_AXIS_CY_RGB,
                                         axis_excl_r=_AXIS_EXCL_R,
+                                        seg_mode=IR_FOOD_SEG_MODE,
+                                        seg_percentile=IR_FOOD_SEG_PERCENTILE,
                                     )
                                 )
                                 _food_ir_rst = _temp_fusion.build_ir_food_mask_by_temperature(
-                                    _ir_frm_rst, _wok_mask_al, min_cluster_gap=30.0)
+                                    _ir_frm_rst, _wok_mask_al, min_cluster_gap=30.0,
+                                    seg_mode=IR_FOOD_SEG_MODE,
+                                    seg_percentile=IR_FOOD_SEG_PERCENTILE)
                                 _hot_ir_rst = None
                                 if _food_ir_rst is not None:
                                     _hot_ir_rst = ((_wok_mask_al > 0) & (_food_ir_rst == 0)).astype(np.uint8) * 255
@@ -1566,8 +1588,7 @@ def main():
                                 if _ir_pts_ok:
                                     print(f"[琛ュ己] t={chunk_start_s:.1f}s  "
                                           f"IR reset points FG={len(_ir_fg_pts)} BG={len(_ir_bg_pts)}  "
-                                          f"K-low={_ir_pts_stats['food_center']:.1f}C  "
-                                          f"K-high={_ir_pts_stats['hot_center']:.1f}C")
+                                          f"{_format_ir_seg_stats(_ir_pts_stats)}")
                             except Exception as _re:
                                 print(f"[琛ュ己] IR瀹氫綅澶辫触({_re})锛岄噸缃悗鐢ㄥ垵濮嬫爣娉ㄧ偣")
                         if False and (temp_data is not None and homography is not None
@@ -1811,13 +1832,14 @@ def main():
                                             axis_cx=_AXIS_CX_RGB,
                                             axis_cy=_AXIS_CY_RGB,
                                             axis_excl_r=_AXIS_EXCL_R,
+                                            seg_mode=IR_FOOD_SEG_MODE,
+                                            seg_percentile=IR_FOOD_SEG_PERCENTILE,
                                         )
                                     )
                                     if _ir_iou_pts_ok:
                                         print(f"[IR-IoU] t={chunk_start_s:.1f}s  "
                                               f"relabel points FG={len(_ir_fg_pts_iou)} BG={len(_ir_bg_pts_iou)}  "
-                                              f"K-low={_ir_iou_pts_stats['food_center']:.1f}C  "
-                                              f"K-high={_ir_iou_pts_stats['hot_center']:.1f}C")
+                                              f"{_format_ir_seg_stats(_ir_iou_pts_stats)}")
                                 except Exception:
                                     pass
                             if False and (temp_data is not None and homography is not None
@@ -2163,6 +2185,8 @@ def main():
                                     _wok_rgb_constraint,
                                     rng=_rng_al,
                                     preview_path=_prev_btm,
+                                    seg_mode=IR_FOOD_SEG_MODE,
+                                    seg_percentile=IR_FOOD_SEG_PERCENTILE,
                                 )
                                 _auto_pts_b = _rgb_inverse.build_inverse_point_result(
                                     _auto_fg_b, _auto_bg_b, _auto_ok_b
@@ -2264,6 +2288,8 @@ def main():
                                         axis_cx=_axis_cx_rgb_dyn,
                                         axis_cy=_axis_cy_rgb_dyn,
                                         axis_excl_r=_AXIS_EXCL_R,
+                                        seg_mode=IR_FOOD_SEG_MODE,
+                                        seg_percentile=IR_FOOD_SEG_PERCENTILE,
                                         detail_lines=[
                                             (f"fail_t={_reset_src_time:.1f}s  fail_frame={_reset_src_frame}"
                                              if _reset_src_time is not None and _reset_src_frame is not None
@@ -2274,7 +2300,9 @@ def main():
                                         action_tag="IR_relabel",
                                     )
                                     _food_ir_inv = _temp_fusion.build_ir_food_mask_by_temperature(
-                                        _ir_b0, wok_mask_ir, min_cluster_gap=30.0)
+                                        _ir_b0, wok_mask_ir, min_cluster_gap=30.0,
+                                        seg_mode=IR_FOOD_SEG_MODE,
+                                        seg_percentile=IR_FOOD_SEG_PERCENTILE)
                                     _hot_ir_inv = None
                                     if _food_ir_inv is not None:
                                         _hot_ir_inv = ((wok_mask_ir > 0) & (_food_ir_inv == 0)).astype(np.uint8) * 255
@@ -2421,7 +2449,9 @@ def main():
                             _ir_idx_fr = _get_ir_idx(abs_idx)
                             _ir_frm_fr = temp_data[_ir_idx_fr]
                             _food_ir = _temp_fusion.build_ir_food_mask_by_temperature(
-                                _ir_frm_fr, _wok_mask_al, min_cluster_gap=30.0)
+                                _ir_frm_fr, _wok_mask_al, min_cluster_gap=30.0,
+                                seg_mode=IR_FOOD_SEG_MODE,
+                                seg_percentile=IR_FOOD_SEG_PERCENTILE)
                             if _food_ir is not None:
                                     _ys_f, _xs_f = np.where(_food_ir > 0)
                                     if len(_xs_f) >= 6:
@@ -2685,25 +2715,11 @@ def main():
                                     try:
                                         _ir_idx_fb = _get_ir_idx(abs_idx)
                                         _ir_frm_fb = temp_data[_ir_idx_fb]
-                                        _wok_t_fb = _ir_frm_fb[wok_mask_ir]
-                                        if len(_wok_t_fb) >= 10:
-                                            _c_low = float(np.percentile(_wok_t_fb, 10))
-                                            _c_high = float(np.percentile(_wok_t_fb, 90))
-                                            for _ in range(20):
-                                                _dl = np.abs(_wok_t_fb - _c_low)
-                                                _dh = np.abs(_wok_t_fb - _c_high)
-                                                _low_sel = _dl <= _dh
-                                                _nl = float(np.mean(_wok_t_fb[_low_sel])) if _low_sel.any() else _c_low
-                                                _nh = float(np.mean(_wok_t_fb[~_low_sel])) if (~_low_sel).any() else _c_high
-                                                if abs(_nl - _c_low) < 0.1 and abs(_nh - _c_high) < 0.1:
-                                                    break
-                                                _c_low, _c_high = _nl, _nh
-                                            if (_c_high - _c_low) >= 25.0:
-                                                _food_ir = np.zeros_like(wok_mask_ir, dtype=np.uint8)
-                                                _ys_w, _xs_w = np.where(wok_mask_ir)
-                                                _dl2 = np.abs(_ir_frm_fb[wok_mask_ir] - _c_low)
-                                                _dh2 = np.abs(_ir_frm_fb[wok_mask_ir] - _c_high)
-                                                _food_ir[_ys_w[_dl2 <= _dh2], _xs_w[_dl2 <= _dh2]] = 255
+                                        _food_ir = _temp_fusion.build_ir_food_mask_by_temperature(
+                                            _ir_frm_fb, wok_mask_ir, min_cluster_gap=25.0,
+                                            seg_mode=IR_FOOD_SEG_MODE,
+                                            seg_percentile=IR_FOOD_SEG_PERCENTILE)
+                                        if _food_ir is not None:
                                                 _k_fb = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
                                                 _food_ir = cv2.morphologyEx(_food_ir, cv2.MORPH_OPEN, _k_fb)
                                                 _food_ir = cv2.morphologyEx(_food_ir, cv2.MORPH_CLOSE, _k_fb)
@@ -2721,7 +2737,7 @@ def main():
                                                         bottom_chunk_masks[local_in_chunk] = _bm_full
                                                     print(f"[Inv-IR兜底] frame={abs_idx} "
                                                           f"IR食材={_fb_ratio:.1f}% "
-                                                          f"K=({_c_low:.1f},{_c_high:.1f})")
+                                                          f"seg={IR_FOOD_SEG_MODE}")
                                     except Exception:
                                         pass
                                 if not do_resize:
@@ -3026,6 +3042,7 @@ def main():
             inv_viz_path=out_inv_viz if (has_bottom and os.path.exists(out_inv_viz)) else None,
             info_h=INFO_H,
             chart_h=CHART_H,
+            ir_seg_mode=IR_PANEL_SEG_MODE,
         )
         print(f"   并排视频: {out_combined}")
         # 删除中间产物（纯 RGB viz 视频），只保留最终并排视频

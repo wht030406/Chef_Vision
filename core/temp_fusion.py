@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+from ir_food_seg import SEG_TWO_CLUSTER, segment_ir_food
 from projection_utils import map_mask_to_ir
 
 
@@ -53,33 +54,22 @@ def estimate_ir_wok_food_temperature(
     return _kmeans_food_temperature(wok_temps, min_cluster_gap=min_cluster_gap)
 
 
-def build_ir_food_mask_by_temperature(ir_frame, wok_mask_ir, min_cluster_gap=30.0):
+def build_ir_food_mask_by_temperature(
+    ir_frame,
+    wok_mask_ir,
+    min_cluster_gap=30.0,
+    seg_mode=SEG_TWO_CLUSTER,
+    seg_percentile=40,
+):
     """Build an IR food mask from the low-temperature cluster inside the wok."""
-    if ir_frame is None or wok_mask_ir is None:
-        return None
-
-    wok_temps = ir_frame[wok_mask_ir]
-    if len(wok_temps) < 10:
-        return None
-
-    c_low = float(np.percentile(wok_temps, 10))
-    c_high = float(np.percentile(wok_temps, 90))
-    for _ in range(20):
-        food_sel = np.abs(wok_temps - c_low) <= np.abs(wok_temps - c_high)
-        new_low = float(np.mean(wok_temps[food_sel])) if food_sel.any() else c_low
-        new_high = float(np.mean(wok_temps[~food_sel])) if (~food_sel).any() else c_high
-        if abs(new_low - c_low) < 0.1 and abs(new_high - c_high) < 0.1:
-            break
-        c_low, c_high = new_low, new_high
-
-    if (c_high - c_low) < min_cluster_gap:
-        return None
-
-    ys_wok, xs_wok = np.where(wok_mask_ir)
-    food_sel = np.abs(ir_frame[wok_mask_ir] - c_low) <= np.abs(ir_frame[wok_mask_ir] - c_high)
-    food_ir = np.zeros(ir_frame.shape, dtype=np.uint8)
-    food_ir[ys_wok[food_sel], xs_wok[food_sel]] = 255
-    return food_ir
+    result = segment_ir_food(
+        ir_frame,
+        wok_mask_ir,
+        mode=seg_mode,
+        percentile=seg_percentile,
+        min_cluster_gap=min_cluster_gap,
+    )
+    return result.food_u8 if result.ok else None
 
 
 def measure_rgb_mask_temperature(

@@ -30,6 +30,11 @@ import cv2
 import json
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_CORE_DIR = os.path.abspath(os.path.join(_HERE, "..", "core"))
+if _CORE_DIR not in sys.path:
+    sys.path.insert(0, _CORE_DIR)
+
+from ir_food_seg import SEG_KMEANS, SEG_PERCENTILE, segment_ir_food
 
 # ── 配置 ─────────────────────────────────────────────────────────────────────
 DEFAULT_NPY   = os.path.join(_HERE, "..", "test_data", "test1", "temp_20260529_112414.npy")
@@ -439,7 +444,7 @@ def main():
 
 
 def render_ir_frame(temp_frame, wok_cfg, pct=40,
-                    out_w=512, out_h=384):
+                    out_w=512, out_h=384, seg_mode="percentile"):
     """
     渲染单帧 IR 热力图（带亮紫色菜区域边线），供外部调用。
 
@@ -458,17 +463,13 @@ def render_ir_frame(temp_frame, wok_cfg, pct=40,
 
     # 温度分割
     wok_mask_ = make_wok_mask(ir_h, ir_w, wok_cfg)
-    wok_temps = temp_frame[wok_mask_]
-    if len(wok_temps) > 0:
-        t_thresh  = np.percentile(wok_temps, pct)
-        food_mask = wok_mask_ & (temp_frame <= t_thresh)
-        m_u8 = food_mask.astype(np.uint8) * 255
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_OPEN,  kernel)
-        m_u8 = cv2.morphologyEx(m_u8, cv2.MORPH_CLOSE, kernel)
-        food_mask = m_u8 > 127
-    else:
-        food_mask = np.zeros((ir_h, ir_w), dtype=bool)
+    seg_result = segment_ir_food(
+        temp_frame,
+        wok_mask_,
+        mode=SEG_KMEANS if seg_mode in ("kmeans", "two_cluster") else SEG_PERCENTILE,
+        percentile=pct,
+    )
+    food_mask = seg_result.food_mask
 
     # 伪彩色渲染
     t_min_f = float(np.min(temp_frame))
@@ -497,7 +498,8 @@ def render_ir_frame(temp_frame, wok_cfg, pct=40,
     temp_mean = float(np.mean(food_temps_vals)) if len(food_temps_vals) >= MIN_FOOD_AREA else float("nan")
     cv2.putText(ir_img, f"mask={mask_ratio:.1f}%  avg={temp_mean:.1f}C",
                 (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    cv2.putText(ir_img, f"MAX:{t_max_f:.1f}C  MIN:{t_min_f:.1f}C  Pct<={pct}%",
+    mode_label = "KMeans" if seg_mode in ("kmeans", "two_cluster") else f"Pct<={pct}%"
+    cv2.putText(ir_img, f"MAX:{t_max_f:.1f}C  MIN:{t_min_f:.1f}C  {mode_label}",
                 (8, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
     return ir_img

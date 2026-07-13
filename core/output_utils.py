@@ -179,6 +179,7 @@ def stitch_rgb_ir(
     inv_viz_path=None,
     info_h=50,
     chart_h=120,
+    ir_seg_mode="percentile",
 ):
     """Build the combined RGB/IR output video."""
     tools_dir = os.path.join(_HERE, "..", "tools")
@@ -272,7 +273,8 @@ def stitch_rgb_ir(
         abs_frame = rgb_start_frame + idx
         dyn_wok = _get_dynamic_wok(abs_frame)
         ir_img = render_ir_frame(
-            temp_data[ir_idx], dyn_wok, pct=pct, out_w=ir_out_w, out_h=ir_out_h
+            temp_data[ir_idx], dyn_wok, pct=pct, out_w=ir_out_w, out_h=ir_out_h,
+            seg_mode=ir_seg_mode,
         )
 
         top_panel = np.hstack([pure_rgb, inv_rgb, ir_img]) if inv_rgb is not None else np.hstack([pure_rgb, ir_img])
