@@ -157,6 +157,302 @@ def project_ir_wok_to_rgb_constraint(wok_mask_ir, homography, rgb_shape):
     return projected > 64
 
 
+def estimate_wok_center_from_ir_edge(ir_frame, cx, cy, rx, ry,
+                                     n_angles=160,
+                                     r_min=0.72, r_max=1.32,
+                                     min_sectors=7,
+                                     min_points=35):
+    """Estimate the IR wok ellipse from the temperature cliff near the rim."""
+    if ir_frame is None or rx <= 1 or ry <= 1:
+        return None
+
+    h, w = ir_frame.shape[:2]
+    vals = ir_frame[np.isfinite(ir_frame)]
+    if vals.size < 100:
+        return None
+
+    temp_span = float(np.percentile(vals, 95) - np.percentile(vals, 5))
+    min_drop = max(2.5, temp_span * 0.06)
+    rs = np.linspace(r_min, r_max, 64)
+    angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
+
+    points = []
+    sectors = set()
+    kernel = np.ones(5, dtype=np.float32) / 5.0
+
+    for ai, th in enumerate(angles):
+        cos_t = np.cos(th)
+        sin_t = np.sin(th)
+        xs = np.rint(cx + rs * rx * cos_t).astype(np.int32)
+        ys = np.rint(cy + rs * ry * sin_t).astype(np.int32)
+        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        if valid.sum() < 12:
+            continue
+
+        xs_v = xs[valid]
+        ys_v = ys[valid]
+        rs_v = rs[valid]
+        ts = ir_frame[ys_v, xs_v].astype(np.float32)
+        if ts.size < 12 or not np.isfinite(ts).all():
+            continue
+
+        ts_s = np.convolve(ts, kernel, mode="same")
+        drop = ts_s[:-1] - ts_s[1:]
+        if drop.size == 0:
+            continue
+
+        bi = int(np.argmax(drop))
+        best_drop = float(drop[bi])
+        r_edge = float(rs_v[bi])
+        if best_drop < min_drop or r_edge < 0.82 or r_edge > 1.22:
+            continue
+
+        inner0 = max(0, bi - 6)
+        inner1 = max(inner0 + 1, bi - 1)
+        outer0 = min(ts_s.size - 1, bi + 2)
+        outer1 = min(ts_s.size, bi + 9)
+        if outer1 <= outer0 or inner1 <= inner0:
+            continue
+
+        inner_med = float(np.median(ts_s[inner0:inner1]))
+        outer_med = float(np.median(ts_s[outer0:outer1]))
+        if (inner_med - outer_med) < min_drop:
+            continue
+
+        sector = ai * 16 // n_angles
+        points.append((
+            float(xs_v[bi]), float(ys_v[bi]), r_edge, th,
+            best_drop, inner_med, outer_med, sector,
+        ))
+        sectors.add(sector)
+
+    if len(points) < min_points or len(sectors) < min_sectors:
+        return {
+            "ok": False,
+            "reason": f"edge points {len(points)}, sectors {len(sectors)}",
+        }
+
+    pts_arr = np.array([[p[0], p[1]] for p in points], dtype=np.float32)
+    r_arr = np.array([p[2] for p in points], dtype=np.float32)
+    drop_arr = np.array([p[4] for p in points], dtype=np.float32)
+    inner_arr = np.array([p[5] for p in points], dtype=np.float32)
+    sector_arr = np.array([p[7] for p in points], dtype=np.int32)
+    med_r = float(np.median(r_arr))
+    keep_radius = np.abs(r_arr - med_r) <= 0.16
+    if keep_radius.sum() < min_points:
+        return {
+            "ok": False,
+            "reason": f"rim radius unstable ({int(keep_radius.sum())}/{len(points)})",
+        }
+
+    drop_thr = float(np.percentile(drop_arr[keep_radius], 65))
+    inner_thr = float(np.percentile(inner_arr[keep_radius], 55))
+    keep_strong = keep_radius & (drop_arr >= drop_thr) & (inner_arr >= inner_thr)
+    strong_points_min = max(18, min_points // 2)
+    strong_sectors = set(sector_arr[keep_strong].tolist())
+    if keep_strong.sum() >= strong_points_min and len(strong_sectors) >= max(5, min_sectors - 1):
+        keep = keep_strong
+        fit_mode = "strong-rim"
+    else:
+        keep = keep_radius
+        fit_mode = "radius-rim"
+
+    pts_keep = pts_arr[keep]
+    if len(pts_keep) < 5:
+        return {"ok": False, "reason": "not enough fit points"}
+
+    try:
+        ellipse = cv2.fitEllipse(pts_keep)
+        (fit_cx, fit_cy), (ew, eh), _ = ellipse
+    except Exception as exc:
+        return {"ok": False, "reason": f"fit failed: {exc}"}
+
+    fit_rx = max(float(ew), float(eh)) / 2.0
+    fit_ry = min(float(ew), float(eh)) / 2.0
+    rx_ratio = fit_rx / max(float(rx), 1.0)
+    ry_ratio = fit_ry / max(float(ry), 1.0)
+    radius_ratio = max(fit_rx, fit_ry) / max(max(float(rx), float(ry)), 1.0)
+    if radius_ratio < 0.65 or radius_ratio > 1.45 or rx_ratio < 0.70 or rx_ratio > 1.30 or ry_ratio < 0.70 or ry_ratio > 1.30:
+        return {
+            "ok": False,
+            "reason": f"bad fit radius ratio {radius_ratio:.2f}",
+        }
+
+    return {
+        "ok": True,
+        "cx": float(fit_cx),
+        "cy": float(fit_cy),
+        "rx": float(fit_rx),
+        "ry": float(fit_ry),
+        "points": int(len(pts_keep)),
+        "sectors": int(len(set(sector_arr[keep].tolist()))),
+        "drop": float(np.median(drop_arr[keep])),
+        "fit_mode": fit_mode,
+        "radius_ratio": float(radius_ratio),
+        "rx_ratio": float(rx_ratio),
+        "ry_ratio": float(ry_ratio),
+    }
+
+
+def estimate_wok_from_ir_hot_ring(ir_frame, cx, cy, rx, ry,
+                                  n_angles=160,
+                                  r_min=0.58, r_max=1.08,
+                                  min_sectors=7,
+                                  min_points=28):
+    """Track the visible hot wok rim and estimate the business wok ellipse."""
+    if ir_frame is None or rx <= 1 or ry <= 1:
+        return None
+
+    h, w = ir_frame.shape[:2]
+    vals = ir_frame[np.isfinite(ir_frame)]
+    if vals.size < 100:
+        return None
+
+    rs = np.linspace(r_min, r_max, 72)
+    angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
+    band_tops = []
+    points = []
+    sectors = set()
+
+    for ai, th in enumerate(angles):
+        cos_t = np.cos(th)
+        sin_t = np.sin(th)
+        xs = np.rint(cx + rs * rx * cos_t).astype(np.int32)
+        ys = np.rint(cy + rs * ry * sin_t).astype(np.int32)
+        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+        if valid.sum() < 15:
+            continue
+
+        xs_v = xs[valid]
+        ys_v = ys[valid]
+        rs_v = rs[valid]
+        ts = ir_frame[ys_v, xs_v].astype(np.float32)
+        if ts.size < 15 or not np.isfinite(ts).all():
+            continue
+
+        peak_i = int(np.argmax(ts))
+        peak_t = float(ts[peak_i])
+        peak_r = float(rs_v[peak_i])
+        if peak_r < 0.64 or peak_r > 1.02:
+            continue
+
+        inner0 = max(0, peak_i - 7)
+        inner1 = max(inner0 + 1, peak_i - 2)
+        outer0 = min(ts.size - 1, peak_i + 2)
+        outer1 = min(ts.size, peak_i + 8)
+        if outer1 <= outer0 or inner1 <= inner0:
+            continue
+
+        inner_med = float(np.median(ts[inner0:inner1]))
+        outer_med = float(np.median(ts[outer0:outer1]))
+        if peak_t < inner_med or peak_t < outer_med + 1.0:
+            continue
+
+        band_tops.append(peak_t)
+        points.append((
+            float(xs_v[peak_i]), float(ys_v[peak_i]), peak_r, th,
+            peak_t, inner_med, outer_med, ai * 16 // n_angles,
+        ))
+        sectors.add(ai * 16 // n_angles)
+
+    if len(points) < min_points or len(sectors) < min_sectors:
+        return {
+            "ok": False,
+            "reason": f"hot-ring points {len(points)}, sectors {len(sectors)}",
+        }
+
+    top_thr = float(np.percentile(np.array(band_tops, dtype=np.float32), 60))
+    pts_arr = np.array([[p[0], p[1]] for p in points], dtype=np.float32)
+    r_arr = np.array([p[2] for p in points], dtype=np.float32)
+    t_arr = np.array([p[4] for p in points], dtype=np.float32)
+    sector_arr = np.array([p[7] for p in points], dtype=np.int32)
+
+    med_r = float(np.median(r_arr))
+    keep_radius = np.abs(r_arr - med_r) <= 0.14
+    keep_hot = keep_radius & (t_arr >= top_thr)
+    hot_sectors = set(sector_arr[keep_hot].tolist())
+    if keep_hot.sum() >= max(18, min_points // 2) and len(hot_sectors) >= max(5, min_sectors - 1):
+        keep = keep_hot
+        fit_mode = "hot-ring"
+    else:
+        keep = keep_radius
+        fit_mode = "hot-radius"
+
+    pts_keep = pts_arr[keep]
+    if len(pts_keep) < 5:
+        return {"ok": False, "reason": "not enough hot rim points"}
+
+    try:
+        ellipse = cv2.fitEllipse(pts_keep)
+        (fit_cx, fit_cy), (ew, eh), _ = ellipse
+    except Exception as exc:
+        return {"ok": False, "reason": f"hot fit failed: {exc}"}
+
+    fit_rx = max(float(ew), float(eh)) / 2.0
+    fit_ry = min(float(ew), float(eh)) / 2.0
+    rx_ratio = fit_rx / max(float(rx), 1.0)
+    ry_ratio = fit_ry / max(float(ry), 1.0)
+    if rx_ratio < 0.45 or rx_ratio > 1.10 or ry_ratio < 0.45 or ry_ratio > 1.10:
+        return {
+            "ok": False,
+            "reason": f"hot fit radius rx={rx_ratio:.2f} ry={ry_ratio:.2f}",
+        }
+
+    return {
+        "ok": True,
+        "cx": float(fit_cx),
+        "cy": float(fit_cy),
+        "rx": float(fit_rx),
+        "ry": float(fit_ry),
+        "points": int(len(pts_keep)),
+        "sectors": int(len(set(sector_arr[keep].tolist()))),
+        "peak": float(np.median(t_arr[keep])),
+        "fit_mode": fit_mode,
+    }
+
+
+def refine_wok_ellipse_from_rgb(frame_bgr, cx, cy, rx, ry, shrink_px=8):
+    """Refine a manually provided RGB wok ellipse from visible edge pixels."""
+    try:
+        h, w = frame_bgr.shape[:2]
+        outer_mask = np.zeros((h, w), dtype=np.uint8)
+        inner_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.ellipse(outer_mask, (int(cx), int(cy)),
+                    (int(rx * 1.15), int(ry * 1.15)), 0, 0, 360, 255, -1)
+        cv2.ellipse(inner_mask, (int(cx), int(cy)),
+                    (int(rx * 0.80), int(ry * 0.80)), 0, 0, 360, 255, -1)
+        ring_mask = (outer_mask > 0) & (inner_mask == 0)
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        gray_ring = cv2.bitwise_and(gray, gray, mask=ring_mask.astype(np.uint8))
+        blurred = cv2.GaussianBlur(gray_ring, (5, 5), 1.2)
+        edges = cv2.Canny(blurred, 30, 90)
+        edges = cv2.bitwise_and(edges, edges, mask=ring_mask.astype(np.uint8))
+
+        ys, xs = np.where(edges > 0)
+        if len(xs) < 20:
+            return cx, cy, rx, ry
+
+        pts = np.column_stack([xs, ys]).astype(np.float32)
+        ellipse = cv2.fitEllipse(pts)
+        (ecx, ecy), (ew, eh), _ = ellipse
+        if abs(ecx - cx) > rx * 0.3 or abs(ecy - cy) > ry * 0.3:
+            return cx, cy, rx, ry
+
+        new_rx = max(ew, eh) / 2.0 - shrink_px
+        new_ry = min(ew, eh) / 2.0 - shrink_px
+        if new_rx < rx * 0.5 or new_ry < ry * 0.5:
+            return cx, cy, rx, ry
+
+        print(f"[wok-rgb-refine] success "
+              f"cx={ecx:.0f}({cx:.0f}) cy={ecy:.0f}({cy:.0f}) "
+              f"rx={new_rx:.0f}({rx:.0f}) ry={new_ry:.0f}({ry:.0f})")
+        return float(ecx), float(ecy), float(new_rx), float(new_ry)
+    except Exception as exc:
+        print(f"[wok-rgb-refine] failed ({exc}), keep original ellipse")
+        return cx, cy, rx, ry
+
+
 def init_frame_shift_state(ir_wok_strategy, temp_data, wok_mask_ir, start_frame, get_ir_idx):
     state = FrameShiftState()
     if ir_wok_strategy == "frame_shift" and temp_data is not None and wok_mask_ir is not None:

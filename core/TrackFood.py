@@ -29,6 +29,7 @@ import matplotlib
 matplotlib.use("Agg")   # 无头模式，不弹窗
 import matplotlib.pyplot as plt
 import chunk_reference_debug as _chunk_ref_debug
+import debug_artifacts as _debug_artifacts
 import final_temperature as _final_temperature
 import ir_wok as _ir_wok
 import label_io as _label_io
@@ -420,327 +421,6 @@ def flow_propagate_mask(prev_gray, cur_gray, prev_mask):
     return cur_mask.astype(bool)
 
 
-def _estimate_wok_center_from_ir_edge(ir_frame, cx, cy, rx, ry,
-                                      n_angles=160,
-                                      r_min=0.72, r_max=1.32,
-                                      min_sectors=7,
-                                      min_points=35):
-    """
-    Track the IR wok by the stable temperature cliff at the wok/outside border.
-
-    The search is centered on the previous estimate, not the original label.
-    Low-temperature food inside the wok is rejected by only looking near the
-    expected rim and requiring the samples outside the candidate edge to stay
-    cooler than the samples inside it.
-    """
-    if ir_frame is None or rx <= 1 or ry <= 1:
-        return None
-
-    h, w = ir_frame.shape[:2]
-    vals = ir_frame[np.isfinite(ir_frame)]
-    if vals.size < 100:
-        return None
-
-    temp_span = float(np.percentile(vals, 95) - np.percentile(vals, 5))
-    min_drop = max(2.5, temp_span * 0.06)
-    rs = np.linspace(r_min, r_max, 64)
-    angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
-
-    points = []
-    sectors = set()
-    kernel = np.ones(5, dtype=np.float32) / 5.0
-
-    for ai, th in enumerate(angles):
-        cos_t = np.cos(th)
-        sin_t = np.sin(th)
-        xs = np.rint(cx + rs * rx * cos_t).astype(np.int32)
-        ys = np.rint(cy + rs * ry * sin_t).astype(np.int32)
-        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-        if valid.sum() < 12:
-            continue
-
-        xs_v = xs[valid]
-        ys_v = ys[valid]
-        rs_v = rs[valid]
-        ts = ir_frame[ys_v, xs_v].astype(np.float32)
-        if ts.size < 12 or not np.isfinite(ts).all():
-            continue
-
-        ts_s = np.convolve(ts, kernel, mode="same")
-        # Positive value means temperature drops when moving outward.
-        drop = ts_s[:-1] - ts_s[1:]
-        if drop.size == 0:
-            continue
-
-        bi = int(np.argmax(drop))
-        best_drop = float(drop[bi])
-        r_edge = float(rs_v[bi])
-        if best_drop < min_drop or r_edge < 0.82 or r_edge > 1.22:
-            continue
-
-        inner0 = max(0, bi - 6)
-        inner1 = max(inner0 + 1, bi - 1)
-        outer0 = min(ts_s.size - 1, bi + 2)
-        outer1 = min(ts_s.size, bi + 9)
-        if outer1 <= outer0 or inner1 <= inner0:
-            continue
-
-        inner_med = float(np.median(ts_s[inner0:inner1]))
-        outer_med = float(np.median(ts_s[outer0:outer1]))
-        if (inner_med - outer_med) < min_drop:
-            continue
-
-        _sector = ai * 16 // n_angles
-        points.append((
-            float(xs_v[bi]), float(ys_v[bi]), r_edge, th,
-            best_drop, inner_med, outer_med, _sector
-        ))
-        sectors.add(_sector)
-
-    if len(points) < min_points or len(sectors) < min_sectors:
-        return {
-            "ok": False,
-            "reason": f"edge points {len(points)}, sectors {len(sectors)}",
-        }
-
-    pts_arr = np.array([[p[0], p[1]] for p in points], dtype=np.float32)
-    r_arr = np.array([p[2] for p in points], dtype=np.float32)
-    drop_arr = np.array([p[4] for p in points], dtype=np.float32)
-    inner_arr = np.array([p[5] for p in points], dtype=np.float32)
-    sector_arr = np.array([p[7] for p in points], dtype=np.int32)
-    med_r = float(np.median(r_arr))
-    keep_radius = np.abs(r_arr - med_r) <= 0.16
-    if keep_radius.sum() < min_points:
-        return {
-            "ok": False,
-            "reason": f"rim radius unstable ({int(keep_radius.sum())}/{len(points)})",
-        }
-
-    # Prefer the clearest visible rim arc instead of trusting every weak edge.
-    _drop_thr = float(np.percentile(drop_arr[keep_radius], 65))
-    _inner_thr = float(np.percentile(inner_arr[keep_radius], 55))
-    keep_strong = keep_radius & (drop_arr >= _drop_thr) & (inner_arr >= _inner_thr)
-    strong_points_min = max(18, min_points // 2)
-    strong_sectors = set(sector_arr[keep_strong].tolist())
-    if keep_strong.sum() >= strong_points_min and len(strong_sectors) >= max(5, min_sectors - 1):
-        keep = keep_strong
-        fit_mode = "strong-rim"
-    else:
-        keep = keep_radius
-        fit_mode = "radius-rim"
-
-    pts_keep = pts_arr[keep]
-    if len(pts_keep) < 5:
-        return {"ok": False, "reason": "not enough fit points"}
-
-    try:
-        ellipse = cv2.fitEllipse(pts_keep)
-        (fit_cx, fit_cy), (ew, eh), _ = ellipse
-    except Exception as exc:
-        return {"ok": False, "reason": f"fit failed: {exc}"}
-
-    fit_rx = max(float(ew), float(eh)) / 2.0
-    fit_ry = min(float(ew), float(eh)) / 2.0
-    rx_ratio = fit_rx / max(float(rx), 1.0)
-    ry_ratio = fit_ry / max(float(ry), 1.0)
-    radius_ratio = max(fit_rx, fit_ry) / max(max(float(rx), float(ry)), 1.0)
-    if radius_ratio < 0.65 or radius_ratio > 1.45 or rx_ratio < 0.70 or rx_ratio > 1.30 or ry_ratio < 0.70 or ry_ratio > 1.30:
-        return {
-            "ok": False,
-            "reason": f"bad fit radius ratio {radius_ratio:.2f}",
-        }
-
-    return {
-        "ok": True,
-        "cx": float(fit_cx),
-        "cy": float(fit_cy),
-        "rx": float(fit_rx),
-        "ry": float(fit_ry),
-        "points": int(len(pts_keep)),
-        "sectors": int(len(set(sector_arr[keep].tolist()))),
-        "drop": float(np.median(drop_arr[keep])),
-        "fit_mode": fit_mode,
-        "radius_ratio": float(radius_ratio),
-        "rx_ratio": float(rx_ratio),
-        "ry_ratio": float(ry_ratio),
-    }
-
-
-def _estimate_wok_from_ir_hot_ring(ir_frame, cx, cy, rx, ry,
-                                   n_angles=160,
-                                   r_min=0.58, r_max=1.08,
-                                   min_sectors=7,
-                                   min_points=28):
-    """
-    Track the visible hot wok rim directly, then let the caller map it back to
-    the larger business ROI.
-    """
-    if ir_frame is None or rx <= 1 or ry <= 1:
-        return None
-
-    h, w = ir_frame.shape[:2]
-    vals = ir_frame[np.isfinite(ir_frame)]
-    if vals.size < 100:
-        return None
-
-    rs = np.linspace(r_min, r_max, 72)
-    angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
-    band_tops = []
-    points = []
-    sectors = set()
-
-    for ai, th in enumerate(angles):
-        cos_t = np.cos(th)
-        sin_t = np.sin(th)
-        xs = np.rint(cx + rs * rx * cos_t).astype(np.int32)
-        ys = np.rint(cy + rs * ry * sin_t).astype(np.int32)
-        valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
-        if valid.sum() < 15:
-            continue
-
-        xs_v = xs[valid]
-        ys_v = ys[valid]
-        rs_v = rs[valid]
-        ts = ir_frame[ys_v, xs_v].astype(np.float32)
-        if ts.size < 15 or not np.isfinite(ts).all():
-            continue
-
-        peak_i = int(np.argmax(ts))
-        peak_t = float(ts[peak_i])
-        peak_r = float(rs_v[peak_i])
-        if peak_r < 0.64 or peak_r > 1.02:
-            continue
-
-        inner0 = max(0, peak_i - 7)
-        inner1 = max(inner0 + 1, peak_i - 2)
-        outer0 = min(ts.size - 1, peak_i + 2)
-        outer1 = min(ts.size, peak_i + 8)
-        if outer1 <= outer0 or inner1 <= inner0:
-            continue
-
-        inner_med = float(np.median(ts[inner0:inner1]))
-        outer_med = float(np.median(ts[outer0:outer1]))
-        if peak_t < inner_med or peak_t < outer_med + 1.0:
-            continue
-
-        band_tops.append(peak_t)
-        points.append((
-            float(xs_v[peak_i]), float(ys_v[peak_i]), peak_r, th,
-            peak_t, inner_med, outer_med, ai * 16 // n_angles
-        ))
-        sectors.add(ai * 16 // n_angles)
-
-    if len(points) < min_points or len(sectors) < min_sectors:
-        return {
-            "ok": False,
-            "reason": f"hot-ring points {len(points)}, sectors {len(sectors)}",
-        }
-
-    top_thr = float(np.percentile(np.array(band_tops, dtype=np.float32), 60))
-    pts_arr = np.array([[p[0], p[1]] for p in points], dtype=np.float32)
-    r_arr = np.array([p[2] for p in points], dtype=np.float32)
-    t_arr = np.array([p[4] for p in points], dtype=np.float32)
-    sector_arr = np.array([p[7] for p in points], dtype=np.int32)
-
-    med_r = float(np.median(r_arr))
-    keep_radius = np.abs(r_arr - med_r) <= 0.14
-    keep_hot = keep_radius & (t_arr >= top_thr)
-    hot_sectors = set(sector_arr[keep_hot].tolist())
-    if keep_hot.sum() >= max(18, min_points // 2) and len(hot_sectors) >= max(5, min_sectors - 1):
-        keep = keep_hot
-        fit_mode = "hot-ring"
-    else:
-        keep = keep_radius
-        fit_mode = "hot-radius"
-
-    pts_keep = pts_arr[keep]
-    if len(pts_keep) < 5:
-        return {"ok": False, "reason": "not enough hot rim points"}
-
-    try:
-        ellipse = cv2.fitEllipse(pts_keep)
-        (fit_cx, fit_cy), (ew, eh), _ = ellipse
-    except Exception as exc:
-        return {"ok": False, "reason": f"hot fit failed: {exc}"}
-
-    fit_rx = max(float(ew), float(eh)) / 2.0
-    fit_ry = min(float(ew), float(eh)) / 2.0
-    rx_ratio = fit_rx / max(float(rx), 1.0)
-    ry_ratio = fit_ry / max(float(ry), 1.0)
-    if rx_ratio < 0.45 or rx_ratio > 1.10 or ry_ratio < 0.45 or ry_ratio > 1.10:
-        return {
-            "ok": False,
-            "reason": f"hot fit radius rx={rx_ratio:.2f} ry={ry_ratio:.2f}",
-        }
-
-    return {
-        "ok": True,
-        "cx": float(fit_cx),
-        "cy": float(fit_cy),
-        "rx": float(fit_rx),
-        "ry": float(fit_ry),
-        "points": int(len(pts_keep)),
-        "sectors": int(len(set(sector_arr[keep].tolist()))),
-        "peak": float(np.median(t_arr[keep])),
-        "fit_mode": fit_mode,
-    }
-
-
-def refine_wok_ellipse_from_rgb(frame_bgr, cx, cy, rx, ry, shrink_px=8):
-    """
-    从 RGB 帧的锅沿亮环中精化内圆边界椭圆。
-
-    原理：
-      1. 在手动标注椭圆的环状区域（外边±20%宽度）内做掩码
-      2. 转灰度后 Canny 边缘检测
-      3. 对边缘点做 fitEllipse，得到精确锅沿椭圆
-      4. 向内收缩 shrink_px 作为实际锅内区域边界
-
-    返回：
-      (cx_new, cy_new, rx_new, ry_new) 精化后的椭圆参数
-      失败时 fallback 返回原始参数
-    """
-    try:
-        h, w = frame_bgr.shape[:2]
-        # 环状搜索区域：外圆 = 标注椭圆 * 1.15，内圆 = 标注椭圆 * 0.80
-        outer_mask = np.zeros((h, w), dtype=np.uint8)
-        inner_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.ellipse(outer_mask, (int(cx), int(cy)),
-                    (int(rx * 1.15), int(ry * 1.15)), 0, 0, 360, 255, -1)
-        cv2.ellipse(inner_mask, (int(cx), int(cy)),
-                    (int(rx * 0.80), int(ry * 0.80)), 0, 0, 360, 255, -1)
-        ring_mask = (outer_mask > 0) & (inner_mask == 0)
-
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        # 在环状区域内做自适应亮度归一化后 Canny
-        gray_ring = cv2.bitwise_and(gray, gray, mask=ring_mask.astype(np.uint8))
-        blurred   = cv2.GaussianBlur(gray_ring, (5, 5), 1.2)
-        edges     = cv2.Canny(blurred, 30, 90)
-        edges     = cv2.bitwise_and(edges, edges, mask=ring_mask.astype(np.uint8))
-
-        ys, xs = np.where(edges > 0)
-        if len(xs) < 20:
-            return cx, cy, rx, ry   # 边缘点不足，fallback
-
-        pts = np.column_stack([xs, ys]).astype(np.float32)
-        ellipse = cv2.fitEllipse(pts)
-        (ecx, ecy), (ew, eh), angle = ellipse
-        # 拟合结果合理性检查：圆心偏移不超过标注值 15%，半径比例合理
-        if (abs(ecx - cx) > rx * 0.3 or abs(ecy - cy) > ry * 0.3):
-            return cx, cy, rx, ry
-        new_rx = max(ew, eh) / 2.0 - shrink_px
-        new_ry = min(ew, eh) / 2.0 - shrink_px
-        if new_rx < rx * 0.5 or new_ry < ry * 0.5:
-            return cx, cy, rx, ry   # 收缩过度，fallback
-        print(f"[锅沿精化] RGB椭圆检测成功: "
-              f"cx={ecx:.0f}({cx:.0f}) cy={ecy:.0f}({cy:.0f}) "
-              f"rx={new_rx:.0f}({rx:.0f}) ry={new_ry:.0f}({ry:.0f})")
-        return float(ecx), float(ecy), float(new_rx), float(new_ry)
-    except Exception as _re:
-        print(f"[锅沿精化] 失败({_re})，保留原始标注椭圆")
-        return cx, cy, rx, ry
-
-
 def main():
     runtime_cfg = _track_config.resolve_runtime_config(
         sys.argv[1:],
@@ -796,21 +476,6 @@ def main():
         token = token.strip("_")
         return token or default
 
-    def _save_violation_event_image(filename, frame_bgr, bad_mask, header, detail_lines):
-        if frame_bgr is None:
-            return
-        vis = frame_bgr.copy()
-        if bad_mask is not None and np.any(bad_mask):
-            vis[bad_mask] = (
-                vis[bad_mask].astype(float) * 0.5
-                + np.array([0, 0, 220]) * 0.5
-            ).astype(np.uint8)
-        cv2.putText(vis, header, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 0, 255), 2)
-        for idx, line in enumerate(detail_lines or []):
-            y = 78 + idx * 32
-            cv2.putText(vis, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
-        cv2.imwrite(os.path.join(violation_event_dir, filename), vis)
-
     def _read_rgb_frame_at_abs(abs_frame):
         if abs_frame is None:
             return None
@@ -823,93 +488,6 @@ def main():
         except Exception:
             return None
 
-    def _save_ir_relabel_frame_image(filename, ir_frame, wok_mask, header, detail_lines,
-                                     food_mask=None, hot_mask=None,
-                                     fg_points_ir=None, bg_points_ir=None,
-                                     axis_guard_mask=None):
-        if ir_frame is None:
-            return
-        try:
-            ir_vis = ir_frame.astype(np.float32)
-            if wok_mask is not None and np.any(wok_mask):
-                vals = ir_vis[wok_mask]
-            else:
-                vals = ir_vis.reshape(-1)
-            lo = float(np.percentile(vals, 2)) if len(vals) else float(np.min(ir_vis))
-            hi = float(np.percentile(vals, 98)) if len(vals) else float(np.max(ir_vis))
-            if hi <= lo:
-                hi = lo + 1.0
-            norm = np.clip((ir_vis - lo) / (hi - lo), 0.0, 1.0)
-            ir_u8 = (norm * 255.0).astype(np.uint8)
-            vis = cv2.applyColorMap(ir_u8, cv2.COLORMAP_TURBO)
-            vis = cv2.resize(vis, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_NEAREST)
-
-            def _draw_mask_outline(mask, color):
-                if mask is None:
-                    return
-                mask_u8 = (mask > 0).astype(np.uint8) * 255
-                cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if not cnts:
-                    return
-                scaled = [(c * 4).astype(np.int32) for c in cnts]
-                cv2.drawContours(vis, scaled, -1, color, 2)
-
-            _draw_mask_outline(wok_mask, (255, 255, 255))
-            _draw_mask_outline(food_mask, (0, 255, 255))
-            _draw_mask_outline(hot_mask, (0, 80, 255))
-            _draw_mask_outline(axis_guard_mask, (20, 20, 20))
-
-            for x_ir, y_ir in (fg_points_ir or []):
-                cx = int(round(float(x_ir) * 4.0))
-                cy = int(round(float(y_ir) * 4.0))
-                cv2.circle(vis, (cx, cy), 7, (0, 255, 80), -1)
-                cv2.circle(vis, (cx, cy), 8, (0, 0, 0), 1)
-            for x_ir, y_ir in (bg_points_ir or []):
-                cx = int(round(float(x_ir) * 4.0))
-                cy = int(round(float(y_ir) * 4.0))
-                cv2.circle(vis, (cx, cy), 7, (255, 80, 0), -1)
-                cv2.circle(vis, (cx, cy), 8, (255, 255, 255), 1)
-
-            cv2.putText(vis, header, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (255, 255, 255), 2)
-            for idx, line in enumerate(detail_lines or []):
-                y = 78 + idx * 30
-                cv2.putText(vis, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 2)
-            cv2.imwrite(os.path.join(ir_relabel_frame_dir, filename), vis)
-        except Exception:
-            pass
-
-    def _draw_action_badge(vis, action_tag, color=(0, 220, 255)):
-        if vis is None or not action_tag:
-            return vis
-        tag = str(action_tag)
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        (tw, th), _ = cv2.getTextSize(tag, font, 0.9, 2)
-        right_pad = 140
-        x1 = max(tw + 46, vis.shape[1] - right_pad)
-        x0 = max(20, x1 - tw - 26)
-        y0 = 20
-        x1 = min(vis.shape[1] - 20, x0 + tw + 26)
-        y1 = y0 + th + 20
-        cv2.rectangle(vis, (x0, y0), (x1, y1), (20, 20, 20), -1)
-        cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
-        cv2.putText(vis, tag, (x0 + 12, y1 - 10), font, 0.9, color, 2)
-        return vis
-
-    def _append_violation_event_action(filename, action_tag, action_line):
-        if not filename:
-            return
-        path = os.path.join(violation_event_dir, filename)
-        if not os.path.exists(path):
-            return
-        vis = cv2.imread(path)
-        if vis is None:
-            return
-        _draw_action_badge(vis, action_tag)
-        y0 = min(vis.shape[0] - 24, 220)
-        cv2.putText(vis, action_line, (20, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
-        cv2.imwrite(path, vis)
-
     def _merge_inject_points(frame0_injects):
         fg_pts = []
         bg_pts = []
@@ -921,7 +499,8 @@ def main():
     def _set_inverse_manual_fallback(reset_violation_name, chunk_start_s, chunk_start_abs,
                                      bottom_fg_run, bottom_bg_run, chunk_i,
                                      reset_reason, reset_msg, log_detail):
-        _append_violation_event_action(
+        _debug_artifacts.append_violation_event_action(
+            violation_event_dir,
             reset_violation_name,
             "manual_fallback",
             (f"next_chunk_action=manual_fallback  "
@@ -1058,7 +637,7 @@ def main():
     if os.path.exists(homography_path):
         homography = np.load(homography_path)
         print(f"[homography] loaded: {homography_path}  shape: {homography.shape}")
-        # wok_rgb 动态圆心由 refine_wok_ellipse_from_rgb（首帧RGB精化）或手动标注值初始化
+        # wok_rgb 动态圆心由 ir_wok.refine_wok_ellipse_from_rgb（首帧RGB精化）或手动标注值初始化
         # 不再用 IR 反投影覆盖（IR→RGB 换算有系统误差，导致圆心偏移）
         if wok_rgb_cx is not None:
             print(f"[wok_rgb初始化] 初始反向语义中心: ({_wok_rgb_cx_dyn:.0f}, {_wok_rgb_cy_dyn:.0f})")
@@ -1416,7 +995,7 @@ def main():
                 _wok_recent_drifts,
                 _wok_tilting,
                 _wok_mask_al is not None,
-                _estimate_wok_from_ir_hot_ring,
+                _ir_wok.estimate_wok_from_ir_hot_ring,
             )
             wok_mask_ir = _ir_wok_update.wok_mask_ir
             _wok_cx = _ir_wok_update.wok_cx
@@ -1608,7 +1187,8 @@ def main():
                         _hot_ir_force = None
                         if _food_ir_force is not None:
                             _hot_ir_force = ((_wok_mask_al > 0) & (_food_ir_force == 0)).astype(np.uint8) * 255
-                        _save_ir_relabel_frame_image(
+                        _debug_artifacts.save_ir_relabel_frame_image(
+                            ir_relabel_frame_dir,
                             f"forward_ir_relabel_t{chunk_start_s:.0f}s_f{chunk_start_abs}_ir{_ir_idx_force}.jpg",
                             _ir_frm_force,
                             _wok_mask_al,
@@ -1789,7 +1369,8 @@ def main():
                                     f"f{(_fail_frame_abs if _fail_frame_abs is not None else chunk_start_abs)}_"
                                     f"{_slug_reason_token(_rst_reason, 'reset')}.jpg"
                                 )
-                                _save_violation_event_image(
+                                _debug_artifacts.save_violation_event_image(
+                                    violation_event_dir,
                                     _violation_name,
                                     (_fail_rgb_frame if _fail_rgb_frame is not None else _rst_rgb_frame),
                                     _rst_fail_mask,
@@ -1803,7 +1384,8 @@ def main():
                                         f"drop={_drop_pct:.1f}%  mask_px={_mask_px}",
                                     ],
                                 )
-                            _append_violation_event_action(
+                            _debug_artifacts.append_violation_event_action(
+                                violation_event_dir,
                                 _violation_name,
                                 "IR_relabel",
                                 (f"next_chunk_action=IR_relabel  "
@@ -1854,7 +1436,8 @@ def main():
                                 _hot_ir_rst = None
                                 if _food_ir_rst is not None:
                                     _hot_ir_rst = ((_wok_mask_al > 0) & (_food_ir_rst == 0)).astype(np.uint8) * 255
-                                _save_ir_relabel_frame_image(
+                                _debug_artifacts.save_ir_relabel_frame_image(
+                                    ir_relabel_frame_dir,
                                     f"forward_ir_relabel_t{chunk_start_s:.0f}s_f{chunk_start_abs}_ir{_ir_idx_rst}.jpg",
                                     _ir_frm_rst,
                                     _wok_mask_al,
@@ -2007,7 +1590,7 @@ def main():
                                              else (146 if _fail_time_s is not None and _fail_frame_abs is not None else 112)),
                                             cv2.FONT_HERSHEY_SIMPLEX,
                                             0.72, (255, 255, 255), 2)
-                                _draw_action_badge(_vis_rst, "IR_relabel")
+                                _debug_artifacts.draw_action_badge(_vis_rst, "IR_relabel")
                                 _rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
                                 cv2.imwrite(os.path.join(relabel_preview_dir, _rst_name), _vis_rst)
                                 print(f"[重置] 预览图已保存: {_rst_name}  原因: {_rst_reason}"
@@ -2177,7 +1760,7 @@ def main():
                                                  f"decision=IR_relabel"),
                                                 (20, 146 if _fail_time_s is not None and _fail_frame_abs is not None else 112),
                                                 cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
-                                    _draw_action_badge(_vis_iou, "IR_relabel")
+                                    _debug_artifacts.draw_action_badge(_vis_iou, "IR_relabel")
                                     _iou_rst_name = f"reset_t{chunk_start_s:.0f}s_f{chunk_start_abs}_iou.jpg"
                                     cv2.imwrite(os.path.join(relabel_preview_dir, _iou_rst_name), _vis_iou)
                                     print(f"[IR-IoU] 预览图已保存: {_iou_rst_name}")
@@ -2189,7 +1772,8 @@ def main():
                             # 仅在 SAM2 跑偏（IoU<15%）或面积异常时才强制重置
                             if _pending_forward_violation is not None:
                                 _violation_name = _pending_forward_violation.get("violation_filename")
-                                _append_violation_event_action(
+                                _debug_artifacts.append_violation_event_action(
+                                    violation_event_dir,
                                     _violation_name,
                                     "reuse_carry",
                                     (f"next_chunk_action=reuse_carry  "
@@ -2230,7 +1814,7 @@ def main():
                                                     (20, 146 if _reuse_fail_time is not None and _reuse_fail_frame is not None else 112),
                                                     cv2.FONT_HERSHEY_SIMPLEX,
                                                     0.72, (255, 255, 255), 2)
-                                        _draw_action_badge(_vis_reuse, "reuse_carry", color=(80, 255, 180))
+                                        _debug_artifacts.draw_action_badge(_vis_reuse, "reuse_carry", color=(80, 255, 180))
                                         _reuse_name = f"forward_carry_reuse_t{chunk_start_s:.0f}s_f{chunk_start_abs}.jpg"
                                         cv2.imwrite(os.path.join(relabel_preview_dir, _reuse_name), _vis_reuse)
                                 except Exception:
@@ -2460,7 +2044,8 @@ def main():
                                 _bottom_ref_mask = _bc_infer
                                 _bottom_ref_fg = []
                                 _bottom_ref_bg = []
-                                _append_violation_event_action(
+                                _debug_artifacts.append_violation_event_action(
+                                    violation_event_dir,
                                     _reset_violation_name,
                                     "reuse_carry",
                                     (f"next_chunk_action=reuse_carry  "
@@ -2550,7 +2135,8 @@ def main():
                                     _hot_ir_inv = None
                                     if _food_ir_inv is not None:
                                         _hot_ir_inv = ((wok_mask_ir > 0) & (_food_ir_inv == 0)).astype(np.uint8) * 255
-                                    _save_ir_relabel_frame_image(
+                                    _debug_artifacts.save_ir_relabel_frame_image(
+                                        ir_relabel_frame_dir,
                                         f"inverse_ir_relabel_t{chunk_start_s:.0f}s_f{chunk_start_abs}_ir{_get_ir_idx(chunk_start_abs)}.jpg",
                                         _ir_b0,
                                         wok_mask_ir,
@@ -2573,7 +2159,8 @@ def main():
                                         _auto_fg_b, _auto_bg_b, _auto_ok_b
                                     )
                                     if _auto_pts_b["ok"]:
-                                        _append_violation_event_action(
+                                        _debug_artifacts.append_violation_event_action(
+                                            violation_event_dir,
                                             _reset_violation_name,
                                             "IR_relabel",
                                             (f"next_chunk_action=IR_relabel  "
@@ -2977,7 +2564,8 @@ def main():
                                         (f"upper_wok={_frame_reset_metrics['upper_wok_ratio_pct']:.1f}%  "
                                          f"upper_streak={_forward_upper_wok_stuck_streak}")
                                     )
-                                _save_violation_event_image(
+                                _debug_artifacts.save_violation_event_image(
+                                    violation_event_dir,
                                     _violation_name,
                                     frame,
                                     mask,
@@ -3102,7 +2690,8 @@ def main():
                                           f"restart_at_next_chunk=1")
                                     try:
                                         _inv_violation_name = _bottom_auto_reset.get("violation_filename")
-                                        _save_violation_event_image(
+                                        _debug_artifacts.save_violation_event_image(
+                                            violation_event_dir,
                                             _inv_violation_name,
                                             frame,
                                             _raw_inv_mask,
