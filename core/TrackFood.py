@@ -122,13 +122,6 @@ def _format_ir_seg_stats(stats):
 # contain upright-wok / flip interference segments that should output empty masks.
 ENABLE_UPRIGHT_WOK_FREEZE = False
 
-# Forward carry-mask connected-component reliability gate.
-ENABLE_FORWARD_BCHECK = False
-FORWARD_BCHECK_MAX_CC_PCT = 50.0
-FORWARD_BCHECK_MAX_VALID_COMPONENTS = 5
-FORWARD_BCHECK_MIN_CC_WOK_RATIO = 0.005
-FORWARD_BCHECK_MIN_CC_PIXELS = 100
-FORWARD_BCHECK_DISCARD_CC_PCT = 50.0
 FORWARD_AXIS_DYNAMIC_MAX_SHIFT_IR = 25.0
 FORWARD_UPPER_WOK_ENABLE = True
 FORWARD_UPPER_WOK_RATIO = 40.0
@@ -1212,7 +1205,6 @@ def main():
     #     其余帧完全用光流传播，不再调用 SAM2
     carry_mask     = None   # 上批末帧 SAM2 mask，用于跨批传递
     carry_mask_src_abs = None
-    _next_inject   = None   # IR-fix接管后延迟到下批注入的前景点（让SAM2精细化）
     global_local   = 0      # 全局相对帧计数
     flow_prev_gray = None   # 光流：上一帧灰度图
     flow_prev_mask = None   # 光流：上一帧 mask
@@ -1649,23 +1641,7 @@ def main():
                 and chunk_i > 0
             )
             if _should_check:
-                # ── IR 稳定性检查（只判断要不要补强，不采点）─────────────────
-                # recovery 模式下强制跳过方差检查，必须尝试 IR 采点
                 _do_reinforce = True
-                if False and _auto_label_func is not None and temp_data is not None:
-                    try:
-                        _ir_idx_al = _get_ir_idx(chunk_start_abs)
-                        _ir_frame_al = temp_data[_ir_idx_al]
-                        from auto_label import load_wok_cfg as _lwc, build_wok_mask as _bwm
-                        _wok_temps_chk = _ir_frame_al[_wok_mask_al]
-                        _var_chk = float(np.var(_wok_temps_chk)) if len(_wok_temps_chk) > 0 else 0
-                        if _var_chk < 200.0:
-                            _do_reinforce = False
-                            print(f"[补强] t={chunk_start_s:.1f}s  锅倾斜/翻炒(var={_var_chk:.1f})，跳过")
-                    except Exception:
-                        pass   # 检查失败则默认补强
-                if False:
-                    print(f"[recovery] t={chunk_start_s:.1f}s  recovery模式，强制IR采点（跳过方差检查）")
 
                 if _do_reinforce:
                     # ── 颜色过滤：读取当前批起始帧的灰度图，用于过滤黑色区域补强点 ──
@@ -2166,36 +2142,6 @@ def main():
                                               f"{_format_ir_seg_stats(_ir_iou_pts_stats)}")
                                 except Exception:
                                     pass
-                            if False and (temp_data is not None and homography is not None
-                                    and _wok_mask_al is not None and _H_inv_al is not None
-                                    and _rng_al is not None):
-                                try:
-                                    _ir_idx_r2 = _get_ir_idx(chunk_start_abs)
-                                    _ir_frm_r2 = temp_data[_ir_idx_r2]
-                                    _wok_t_r2  = _ir_frm_r2[_wok_mask_al]
-                                    if len(_wok_t_r2) >= 10:
-                                        _t_r2 = float(np.percentile(_wok_t_r2, 35))
-                                        _food_r2 = (_ir_frm_r2 < _t_r2) & _wok_mask_al
-                                        _ys_r2, _xs_r2 = np.where(_food_r2)
-                                        if len(_xs_r2) >= 6:
-                                            _sel_r2 = _rng_al.choice(len(_xs_r2), size=min(8, len(_xs_r2)), replace=False)
-                                            _pts_r2_h = np.stack([_xs_r2[_sel_r2].astype(float),
-                                                                   _ys_r2[_sel_r2].astype(float),
-                                                                   np.ones(len(_sel_r2))])
-                                            _pts_rgb_r2 = _H_inv_al @ _pts_r2_h
-                                            _pts_rgb_r2 = _pts_rgb_r2[:2] / _pts_rgb_r2[2]
-                                            for _xi2, _yi2 in _pts_rgb_r2.T:
-                                                _xi2, _yi2 = float(_xi2), float(_yi2)
-                                                if (_axis_cx_rgb_fg is not None
-                                                        and _FORWARD_AXIS_FG_EXCL_R is not None):
-                                                    if ((_xi2-_axis_cx_rgb_fg)**2+(_yi2-_axis_cy_rgb_fg)**2)**0.5 < _FORWARD_AXIS_FG_EXCL_R:
-                                                        continue
-                                                if 0 <= _xi2 < VW and 0 <= _yi2 < VH:
-                                                    if _rgb_ref_gray is not None and int(_rgb_ref_gray[int(_yi2), int(_xi2)]) < 40:
-                                                        continue
-                                                    _ir_fg_pts_iou.append([_xi2, _yi2])
-                                except Exception:
-                                    pass
                             if _ir_fg_pts_iou:
                                 _reinforce_inject = _rgb_forward.build_forward_ir_relabel_inject(
                                     _ir_fg_pts_iou,
@@ -2300,44 +2246,6 @@ def main():
                         # 正常路径（IoU通过，SAM2自主追踪）不保存预览图
                         # 预览图只在重置/IoU失败等异常场景下保存，降低输出噪声
 
-            # ── B-check 早检：本批开始前验证上批 carry_mask 可靠性 ──────────────
-            # 坏的 carry_mask 若直接喂给 SAM2 会进入死循环，提前拦截
-            if ENABLE_FORWARD_BCHECK and carry_mask is not None and _wok_rgb_constraint is not None:
-                _cm_u8_pre = carry_mask.astype(np.uint8) * 255
-                _cc_n_pre, _cc_lbl_pre, _cc_st_pre, _ = cv2.connectedComponentsWithStats(
-                    _cm_u8_pre, connectivity=8)
-                _fg_pre = _cc_st_pre[1:]
-                _wok_px_pre = int(_wok_rgb_constraint.sum())
-                if len(_fg_pre) > 0:
-                    _max_cc_pre  = int(_fg_pre[:, cv2.CC_STAT_AREA].max())
-                    _max_pct_pre = _max_cc_pre / max(_wok_px_pre, 1) * 100
-                    _thr_pre     = FORWARD_BCHECK_MAX_CC_PCT
-                    _min_px_pre  = max(
-                        FORWARD_BCHECK_MIN_CC_PIXELS,
-                        int(_wok_px_pre * FORWARD_BCHECK_MIN_CC_WOK_RATIO),
-                    )
-                    _valid_pre   = int((_fg_pre[:, cv2.CC_STAT_AREA] >= _min_px_pre).sum())
-                    _discard_pre = (
-                        (_max_pct_pre > _thr_pre)
-                        or (_valid_pre > FORWARD_BCHECK_MAX_VALID_COMPONENTS)
-                    )
-                    if _discard_pre:
-                        _reason_pre = (f"最大连通域={_max_pct_pre:.1f}%>{_thr_pre:.0f}%"
-                                       if _max_pct_pre > _thr_pre
-                                       else f"有效连通域={_valid_pre}>{FORWARD_BCHECK_MAX_VALID_COMPONENTS}（碎片化）")
-                        _max_idx_pre = int(_fg_pre[:, cv2.CC_STAT_AREA].argmax()) + 1
-                        _cm_cand     = (_cc_lbl_pre == _max_idx_pre)
-                        _cand_pct    = _cm_cand.sum() / max(_wok_px_pre, 1) * 100
-                        if _cand_pct > FORWARD_BCHECK_DISCARD_CC_PCT:
-                            carry_mask = None
-                            last_relabel_s = -999   # 强制本批重标点
-                            print(f"[B-check早检] 批次{chunk_i+1} {_reason_pre}，"
-                                  f"最大连通域仍={_cand_pct:.1f}%>{FORWARD_BCHECK_DISCARD_CC_PCT:.0f}%，discard+强制重标")
-                        else:
-                            carry_mask = _cm_cand
-                            print(f"[B-check早检] 批次{chunk_i+1} {_reason_pre}，"
-                                  f"保留最大单连通域({_cand_pct:.1f}%)")
-
             # ── 倾斜冻结：K-means 双峰差 < 30°C → 跳过本批 SAM2 ──────────────
             # 锅倾斜/翻炒时锅内无食材信号，强制追踪只会追到锅壁
             _skip_sam2_tilt = False
@@ -2390,13 +2298,6 @@ def main():
                 # 注入补强点（local_frame=0，和 carry_mask 同帧，追加前景点）
                 if _reinforce_inject is not None:
                     inject_this_chunk.append(_reinforce_inject)
-                # 注入 IR-fix接管 生成的精细化前景点（让SAM2精细化IR粗mask边界）
-                if _next_inject is not None:
-                    inject_this_chunk.append(_next_inject)
-                    print(f"[IR-fix精细化] 批次{chunk_i+1} 注入上批IR前景点 "
-                          f"{len(_next_inject['fg_points'])} 个，SAM2将精细化边界")
-                    _next_inject = None   # 消费后清除，避免重复注入
-
                 # carry_mask 需要缩放到推理分辨率传给下一批
                 carry_mask_infer = None
                 if carry_mask is not None and do_resize:
@@ -2503,53 +2404,6 @@ def main():
                 if carry_mask is not None and _wok_rgb_constraint is not None:
                     carry_mask = carry_mask & _wok_rgb_constraint
 
-                # ── B：carry_mask 连通域可靠性检查 ────────────────────────────
-                # 检查两个指标，任一不满足则标记 carry_mask 为不可信（置 None）：
-                #   1. 最大连通域面积 / wok 区域面积超过阈值（接近整锅）
-                #   2. 有效连通域数量 > 5 个（碎片化，SAM2 追踪失控）
-                if ENABLE_FORWARD_BCHECK and carry_mask is not None and _wok_rgb_constraint is not None:
-                    _cm_u8_b = carry_mask.astype(np.uint8) * 255
-                    _cc_n, _cc_labels, _cc_stats, _ = cv2.connectedComponentsWithStats(
-                        _cm_u8_b, connectivity=8
-                    )
-                    # _cc_stats[0] = 背景，跳过；从 1 开始是前景连通域
-                    _fg_components = _cc_stats[1:]   # 去掉背景
-                    _wok_px_b = int(_wok_rgb_constraint.sum())
-                    _carry_unreliable = False
-                    if len(_fg_components) > 0:
-                        _max_cc_area = int(_fg_components[:, cv2.CC_STAT_AREA].max())
-                        _max_cc_pct  = _max_cc_area / max(_wok_px_b, 1) * 100
-                        # 过滤掉面积 < 0.5% wok 的碎片，只数"有效"连通域
-                        _min_cc_px   = max(
-                            FORWARD_BCHECK_MIN_CC_PIXELS,
-                            int(_wok_px_b * FORWARD_BCHECK_MIN_CC_WOK_RATIO),
-                        )
-                        _valid_cc    = int((_fg_components[:, cv2.CC_STAT_AREA] >= _min_cc_px).sum())
-                        _bcheck_thr = FORWARD_BCHECK_MAX_CC_PCT
-                        if _max_cc_pct > _bcheck_thr:
-                            _carry_unreliable = True
-                            print(f"[B-check] 批次{chunk_i+1}末 carry_mask 最大连通域"
-                                  f"={_max_cc_pct:.1f}%>{_bcheck_thr:.0f}%"
-                                  f"（接近整锅），标记不可信")
-                        elif _valid_cc > FORWARD_BCHECK_MAX_VALID_COMPONENTS:
-                            _carry_unreliable = True
-                            print(f"[B-check] 批次{chunk_i+1}末 carry_mask 有效连通域"
-                                  f"={_valid_cc}>{FORWARD_BCHECK_MAX_VALID_COMPONENTS}（碎片化），标记不可信")
-                    if _carry_unreliable:
-                        # 不直接 None，而是缩小为仅保留最大连通域（减少硬重置次数）
-                        if len(_fg_components) > 0:
-                            _max_cc_idx = int(_fg_components[:, cv2.CC_STAT_AREA].argmax()) + 1
-                            carry_mask = (_cc_labels == _max_cc_idx)
-                            _new_pct = carry_mask.sum() / max(_wok_px_b, 1) * 100
-                            if _new_pct > FORWARD_BCHECK_DISCARD_CC_PCT:
-                                # 最大单连通域还是过大，才真正 discard
-                                carry_mask = None
-                                print(f"[B-check] 最大单连通域仍={_new_pct:.1f}%>{FORWARD_BCHECK_DISCARD_CC_PCT:.0f}%，"
-                                      f"discard carry_mask")
-                            else:
-                                print(f"[B-check] 保留最大单连通域({_new_pct:.1f}%)，"
-                                      f"丢弃其余碎片")
-
                 print(f"[SAM2] 批次 {chunk_i+1} 追踪完成，{len(chunk_masks)} 帧")
 
                 # ── 锅底第二次 SAM2 追踪（反向语义）────────────────────────────
@@ -2573,49 +2427,6 @@ def main():
                         _bottom_ref_mask = None
                         _bottom_ref_fg = list(_bottom_fg_run or [])
                         _bottom_ref_bg = list(_bottom_bg_run or [])
-                        if (False and temp_data is not None and homography is not None
-                                and wok_mask_ir is not None
-                                and _wok_rgb_constraint is not None):
-                            try:
-                                _rgb_b0 = cv2.imread(os.path.join(tmp_dir, frame_names[0]))
-                                _ir_b0 = temp_data[_get_ir_idx(chunk_start_abs)]
-                                _H_inv_bottom = (_H_inv_al if _H_inv_al is not None
-                                                 else np.linalg.inv(homography))
-                                _prev_btm = _rgb_inverse.build_inverse_autopoints_preview_path(
-                                    relabel_preview_dir,
-                                    f"{chunk_start_s:.0f}",
-                                    chunk_start_abs,
-                                )
-                                _auto_fg_b, _auto_bg_b, _auto_ok_b, _auto_dbg_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
-                                    _rgb_b0, _ir_b0, wok_mask_ir, _H_inv_bottom,
-                                    _wok_rgb_constraint,
-                                    n_fg=INVERSE_IR_RELABEL_N_FG,
-                                    n_bg=INVERSE_IR_RELABEL_N_BG,
-                                    rng=_rng_al,
-                                    preview_path=_prev_btm,
-                                    bg_min_gray=INVERSE_IR_RELABEL_BG_MIN_GRAY,
-                                    fg_max_gray=INVERSE_IR_RELABEL_FG_MAX_GRAY,
-                                    axis_cx=_axis_cx_rgb_dyn,
-                                    axis_cy=_axis_cy_rgb_dyn,
-                                    axis_excl_r=_AXIS_EXCL_R,
-                                    axis_ir_cx=_wok_cx,
-                                    axis_ir_cy=_wok_cy,
-                                    axis_ir_excl_r=_AXIS_IR_EXCL_R,
-                                    seg_mode=IR_FOOD_SEG_MODE,
-                                    seg_percentile=IR_FOOD_SEG_PERCENTILE,
-                                    return_debug=True,
-                                )
-                                _auto_pts_b = _rgb_inverse.build_inverse_point_result(
-                                    _auto_fg_b, _auto_bg_b, _auto_ok_b
-                                )
-                                if _auto_pts_b["ok"]:
-                                    _bottom_fg_run = _auto_pts_b["fg_points"]
-                                    _bottom_bg_run = _auto_pts_b["bg_points"]
-                                    print(f"[Inv自动补点] 批次{chunk_i+1} "
-                                          f"FG-hot={len(_auto_pts_b['fg_points'])} BG-food={len(_auto_pts_b['bg_points'])} "
-                                          f"preview={os.path.basename(_prev_btm)}")
-                            except Exception as _bae:
-                                print(f"[Inv自动补点] 批次{chunk_i+1} 失败: {_bae}")
                         if _bottom_auto_reset is not None:
                             _bottom_reset_run = _rgb_inverse.apply_inverse_auto_reset(_bottom_auto_reset)
                             _bc_infer = None
@@ -2931,7 +2742,7 @@ def main():
             cap = cv2.VideoCapture(video_path)
             cap.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
 
-            # ── IR-fix 批次统计：命中率 > 50% 时覆盖 carry_mask ────────────
+            # ── IR-fix 批内临时校正统计（当前关闭，仅作为后续高精度方向保留）──
             _irfix_count     = 0    # 本批被 IR-fix 成功修正的帧数
             _irfix_last_mask = None # 最后一次 IR-fix 成功的 mask
 
@@ -2952,9 +2763,9 @@ def main():
                 if _wok_rgb_constraint is not None:
                     mask = mask & _wok_rgb_constraint
 
-                # ── 逐帧实时 IR 校正：mask 超过 wok 30% 时立即用 IR 重生成 ──
-                # 手进入、语义反转等情况下 SAM2 mask 瞬间暴涨，
-                # 不等批次结束，每帧即时用 IR K-means 重新圈选食材
+                # ── 逐帧 IR-fix 临时校正（当前关闭）──────────────────────────
+                # 当 RGB 正向 mask 触发 evaluate_forward_reset() 异常判定时，
+                # 可立即用当前 IR 食材分割结果重建本帧 mask，不等到下一批开头。
                 _frame_corrected = False
                 if (False and _wok_rgb_constraint is not None
                         and temp_data is not None
@@ -3190,27 +3001,6 @@ def main():
                 # ── ROI 温度统计 ──────────────────────────────────────────────
                 roi_temp_mean = _temp_fusion.measure_roi_temperature(
                     temp_data, homography, _get_ir_idx(abs_idx), roi_cfg)
-                if False:
-                    try:
-                        ir_h, ir_w = temp_data.shape[1], temp_data.shape[2]
-                        ir_idx_roi = _get_ir_idx(abs_idx)
-                        if ir_idx_roi < temp_data.shape[0]:
-                            # RGB 圆心 → IR 坐标
-                            rgb_pt = np.array([[[float(roi_cfg["rgb_cx"]),
-                                                 float(roi_cfg["rgb_cy"])]]], dtype=np.float32)
-                            ir_pt  = cv2.perspectiveTransform(rgb_pt, homography)[0][0]
-                            ir_cx_roi = int(round(ir_pt[0]))
-                            ir_cy_roi = int(round(ir_pt[1]))
-                            # RGB 半径 → IR 半径（按 IR/RGB 宽度比缩放）
-                            ir_r = max(1, int(roi_cfg["rgb_radius"] * ir_w / roi_cfg["rgb_w"]))
-                            # 生成圆形 mask
-                            roi_mask_ir = np.zeros((ir_h, ir_w), dtype=np.uint8)
-                            cv2.circle(roi_mask_ir, (ir_cx_roi, ir_cy_roi), ir_r, 255, -1)
-                            roi_temps = temp_data[ir_idx_roi][roi_mask_ir > 0]
-                            if len(roi_temps) > 0:
-                                roi_temp_mean = float(np.mean(roi_temps))
-                    except Exception:
-                        pass
                 if not np.isnan(roi_temp_mean):
                     roi_history.append((time_s, roi_temp_mean))
 
@@ -3385,31 +3175,6 @@ def main():
                             )
                     except Exception as _inv_e:
                         pass  # 计算失败不影响主流程
-                # ── 反向语义面积门控：inv_mask > 60% wok椭圆时视为锅直立/异常，清空 ──
-                _inv_area_ok = True
-                if has_bottom and bottom_chunk_masks:
-                    _bm_raw_chk = bottom_chunk_masks.get(local_in_chunk)
-                    if _bm_raw_chk is not None:
-                        _bm_full_chk = upscale_mask(_bm_raw_chk, orig_wh) if do_resize else _bm_raw_chk
-                        if _wok_rgb_constraint is not None:
-                            _dyn_wok_bool_chk = _wok_rgb_constraint
-                        else:
-                            _dyn_wok_chk = np.zeros((VH, VW), dtype=np.uint8)
-                            cv2.ellipse(_dyn_wok_chk,
-                                        (int(round(wok_rgb_cx)), int(round(wok_rgb_cy))),
-                                        (int(round(wok_rgb_rx)), int(round(wok_rgb_ry))),
-                                        0, 0, 360, 255, -1)
-                            _dyn_wok_bool_chk = _dyn_wok_chk > 0
-                        _inv_mask_chk = _dyn_wok_bool_chk & ~_bm_full_chk
-                        _wok_px_chk2  = int(_dyn_wok_bool_chk.sum())
-                        _inv_px_chk   = int(_inv_mask_chk.sum())
-                        _inv_ratio    = _inv_px_chk / max(_wok_px_chk2, 1) * 100
-                        if False and _inv_ratio > 60.0:
-                            _inv_area_ok = False
-                            inverse_temp_mean = float("nan")
-                            print(f"[Inv门控] frame={abs_idx}  inv_ratio={_inv_ratio:.1f}%>60%，"
-                                  f"跳过该帧反向语义温度")
-
                 if not np.isnan(inverse_temp_mean):
                     inverse_history.append((time_s, inverse_temp_mean))
                 inverse_rows.append([abs_idx, local_idx, time_s, inverse_temp_mean])
@@ -3462,7 +3227,7 @@ def main():
 
                 # ── 写 inverse 叠加帧（锅底反向 RGB 视频）────────────────────
                 if writer_inv is not None:
-                    if _inv_area_ok and has_bottom and bottom_chunk_masks:
+                    if has_bottom and bottom_chunk_masks:
                         _bm_r2 = bottom_chunk_masks.get(local_in_chunk)
                         if _bm_r2 is not None:
                             _bm_f2 = upscale_mask(_bm_r2, orig_wh) if do_resize else _bm_r2
@@ -3508,48 +3273,6 @@ def main():
                 if local_in_chunk % 50 == 0:
                     print(f"  写帧: {local_in_chunk+1}/{actual}  "
                           f"mask={mask_ratio:.1f}%  temp={temp_mean:.1f}°C", end="\r")
-
-            # ── IR-fix 批次命中率检查：>50% 时生成前景点注入下批 SAM2 精细化 ──
-            # 改进前：直接用 IR 粗糙 mask 替换 carry_mask，SAM2 边界能力浪费
-            # 改进后：IR 只做"粗定位"，从 IR mask 内采样前景点存入 _next_inject，
-            #         下批 SAM2 接收这些点 + carry_mask 一起精细化边界
-            if False and _irfix_count > actual * 0.5 and _irfix_last_mask is not None:
-                # carry_mask 仍用 IR 末帧 mask 覆盖（确保跨批位置正确）
-                carry_mask = _irfix_last_mask.copy()
-                carry_mask_src_abs = chunk_start_abs + max(actual - 1, 0)
-                _wok_px_ni = int(_wok_rgb_constraint.sum()) if _wok_rgb_constraint is not None else 1
-                _new_mask_pct = carry_mask.sum() / max(_wok_px_ni, 1) * 100
-                print(f"[IR-fix接管] 批次{chunk_i+1} 命中率={_irfix_count}/{actual}"
-                      f"={_irfix_count/actual*100:.0f}%>50%，"
-                      f"carry_mask更新为IR末帧({_new_mask_pct:.1f}%wok)")
-                # 从 IR 末帧 mask 内部采样前景点 → 存入 _next_inject，下批 SAM2 精细化
-                if (_H_inv_al is not None and _rng_al is not None
-                        and _wok_rgb_constraint is not None):
-                    try:
-                        _ys_ni, _xs_ni = np.where(_irfix_last_mask)
-                        if len(_xs_ni) >= 4:
-                            _sel_ni = _rng_al.choice(len(_xs_ni),
-                                                     size=min(6, len(_xs_ni)),
-                                                     replace=False)
-                            _fg_ni = []
-                            for _xi_ni, _yi_ni in zip(_xs_ni[_sel_ni], _ys_ni[_sel_ni]):
-                                _xi_ni, _yi_ni = float(_xi_ni), float(_yi_ni)
-                                if _axis_cx_rgb_fg is not None:
-                                    _d = ((_xi_ni-_axis_cx_rgb_fg)**2+(_yi_ni-_axis_cy_rgb_fg)**2)**0.5
-                                    if _FORWARD_AXIS_FG_EXCL_R is not None and _d < _FORWARD_AXIS_FG_EXCL_R:
-                                        continue
-                                _fg_ni.append([_xi_ni, _yi_ni])
-                            if _fg_ni:
-                                _next_inject = _rgb_forward.build_forward_ir_inject(
-                                    _fg_ni,
-                                    _axis_cx_rgb_fg,
-                                    _axis_cy_rgb_fg,
-                                    label="IR-fix-next",
-                                )
-                                print(f"[IR-fix接管] 已生成下批注入前景点 {len(_fg_ni)} 个"
-                                      f"，下批SAM2将精细化IR粗mask")
-                    except Exception as _ni_e:
-                        print(f"[IR-fix接管] 前景点采样失败({_ni_e})，跳过")
 
             cap.release()
             print()
