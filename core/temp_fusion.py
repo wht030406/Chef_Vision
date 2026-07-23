@@ -5,41 +5,13 @@ from ir_food_seg import SEG_TWO_CLUSTER, segment_ir_food
 from projection_utils import map_mask_to_ir
 
 
-def _kmeans_food_temperature(wok_temps, min_cluster_gap=30.0):
-    """Estimate food temperature from the low-temperature cluster inside the wok."""
-    vals = wok_temps.astype(np.float32).flatten()
-    if len(vals) < 10:
-        return float("nan")
-
-    c_low = float(np.percentile(vals, 10))
-    c_high = float(np.percentile(vals, 90))
-
-    for _ in range(20):
-        dist_low = np.abs(vals - c_low)
-        dist_high = np.abs(vals - c_high)
-        label_low = dist_low <= dist_high
-
-        new_low = float(np.mean(vals[label_low])) if label_low.any() else c_low
-        new_high = float(np.mean(vals[~label_low])) if (~label_low).any() else c_high
-
-        if abs(new_low - c_low) < 0.1 and abs(new_high - c_high) < 0.1:
-            break
-        c_low, c_high = new_low, new_high
-
-    if (c_high - c_low) < min_cluster_gap:
-        return float("nan")
-
-    dist_low = np.abs(vals - c_low)
-    dist_high = np.abs(vals - c_high)
-    food_mask = dist_low <= dist_high
-    return float(np.mean(vals[food_mask])) if food_mask.any() else float("nan")
-
-
 def estimate_ir_wok_food_temperature(
     temp_data,
     ir_frame_idx,
     wok_mask_ir,
     min_cluster_gap=30.0,
+    seg_mode=SEG_TWO_CLUSTER,
+    seg_percentile=40,
 ):
     """Estimate food temperature inside the current IR wok mask."""
     if temp_data is None or wok_mask_ir is None:
@@ -48,10 +20,19 @@ def estimate_ir_wok_food_temperature(
         return float("nan")
 
     t_frame = temp_data[ir_frame_idx]
-    wok_temps = t_frame[wok_mask_ir]
-    if len(wok_temps) < 10:
+    seg_result = segment_ir_food(
+        t_frame,
+        wok_mask_ir,
+        mode=seg_mode,
+        percentile=seg_percentile,
+        min_cluster_gap=min_cluster_gap,
+    )
+    if not seg_result.ok:
         return float("nan")
-    return _kmeans_food_temperature(wok_temps, min_cluster_gap=min_cluster_gap)
+    food_temps = t_frame[seg_result.food_mask]
+    if len(food_temps) == 0:
+        return float("nan")
+    return float(np.mean(food_temps))
 
 
 def build_ir_food_mask_by_temperature(

@@ -19,13 +19,13 @@ except ImportError:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir, inverse_rows=None):
+def _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir, inverse_rows=None, final_rows=None):
     """Save the tracked temperature series into separate xlsx files."""
     if not _HAS_OPENPYXL:
         print("[Excel] openpyxl not installed; skip xlsx export")
         return
 
-    def _make_wb(headers, rows, fill_color):
+    def _make_wb(headers, rows, fill_color, temp_col=-1):
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "frame_data"
@@ -53,8 +53,8 @@ def _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir, inverse_rows=None):
             valid_rows.append(clean)
 
         ws2 = wb.create_sheet("summary")
-        temps = [r[-1] for r in valid_rows if r[-1] is not None]
-        times = [r[2] for r in valid_rows if r[-1] is not None]
+        temps = [r[temp_col] for r in valid_rows if r[temp_col] is not None]
+        times = [r[2] for r in valid_rows if r[temp_col] is not None]
         if temps:
             stats = [
                 ("total_frames", len(rows)),
@@ -118,8 +118,19 @@ def _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir, inverse_rows=None):
         wb.save(path)
         print(f"[Excel] Inv   saved: {path}  ({row_count} rows)")
 
+    if final_rows:
+        wb, row_count = _make_wb(
+            ["frame_abs", "frame_rel", "time_s", "final_temp_c", "source", "reason"],
+            final_rows,
+            "C00000",
+            temp_col=3,
+        )
+        path = os.path.join(out_dir, "temp_final.xlsx")
+        wb.save(path)
+        print(f"[Excel] Final saved: {path}  ({row_count} rows)")
 
-def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path, inverse_rows=None):
+
+def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path, inverse_rows=None, final_rows=None):
     """Plot the exported temperature curves into one comparison image."""
     def _extract(rows, value_col):
         xs, ys = [], []
@@ -130,7 +141,13 @@ def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path, inverse_rows=None
                 ys.append(float(value))
         return xs, ys
 
-    fig, ax = plt.subplots(figsize=(14, 4))
+    if final_rows:
+        fig, (ax, ax_final) = plt.subplots(
+            2, 1, figsize=(14, 6), sharex=True, gridspec_kw={"height_ratios": [2, 1]}
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(14, 4))
+        ax_final = None
 
     t_sam2, v_sam2 = _extract(sam2_rows, 5)
     t_roi, v_roi = _extract(roi_rows, 3)
@@ -150,13 +167,25 @@ def _plot_three_curves(sam2_rows, roi_rows, ir_rows, out_path, inverse_rows=None
         t_inv, v_inv = _extract(inverse_rows, 3)
         if t_inv:
             ax.plot(t_inv, v_inv, color="#9B59B6", lw=1.5, label="Inverse (Wok-Bottom)")
+    if final_rows and ax_final is not None:
+        t_final, v_final = _extract(final_rows, 3)
+        if t_final:
+            ax_final.plot(t_final, v_final, color="#D62728", lw=1.8, label="Final Output")
+            ax_final.set_ylabel("Final (C)")
+            ax_final.legend(loc="upper left")
+            ax_final.grid(True, alpha=0.3)
 
-    ax.set_xlabel("Time (s)")
+    if ax_final is None:
+        ax.set_xlabel("Time (s)")
+    else:
+        ax_final.set_xlabel("Time (s)")
     ax.set_ylabel("Temperature (C)")
     ax.set_title(
-        "Food Temperature - Four Strategies Comparison"
-        if inverse_rows else
-        "Food Temperature - Three Strategies Comparison"
+        "Food Temperature - Strategy Comparison + Final Output"
+        if final_rows else
+        ("Food Temperature - Four Strategies Comparison"
+         if inverse_rows else
+         "Food Temperature - Three Strategies Comparison")
     )
     ax.legend()
     ax.grid(True, alpha=0.3)

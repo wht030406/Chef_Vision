@@ -208,9 +208,23 @@ def _dedupe_point_list(points):
     return unique
 
 
-def _pick_sector_spread_points(candidates, n, rng, max_dist):
+def _dedupe_point_pairs(rgb_points, ir_points):
+    unique_rgb = []
+    unique_ir = []
+    seen = set()
+    for rgb_pt, ir_pt in zip(rgb_points, ir_points):
+        key = (int(round(float(rgb_pt[0]))), int(round(float(rgb_pt[1]))))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rgb.append([float(rgb_pt[0]), float(rgb_pt[1])])
+        unique_ir.append([float(ir_pt[0]), float(ir_pt[1])])
+    return unique_rgb, unique_ir
+
+
+def _pick_sector_spread_points(candidates, n, rng, max_dist, return_ir_points=False):
     if not candidates or n <= 0:
-        return []
+        return ([], []) if return_ir_points else []
 
     scores = np.array([cand["score"] for cand in candidates], dtype=float)
     jitter = rng.random(len(candidates)) * 1e-3
@@ -220,6 +234,7 @@ def _pick_sector_spread_points(candidates, n, rng, max_dist):
     def _collect_with_spacing(min_spacing):
         pts_ir = []
         pts_rgb = []
+        pts_ir_selected = []
         sector_counts = {}
         sector_cap = max(1, int(np.ceil(float(n) / 4.0)))
 
@@ -232,6 +247,7 @@ def _pick_sector_spread_points(candidates, n, rng, max_dist):
                 return False
             pts_ir.append((x_ir, y_ir))
             pts_rgb.append(cand["rgb"])
+            pts_ir_selected.append([float(x_ir), float(y_ir)])
             sector_counts[sector] = sector_counts.get(sector, 0) + 1
             return True
 
@@ -246,7 +262,7 @@ def _pick_sector_spread_points(candidates, n, rng, max_dist):
                 _try_pick(cand, False)
                 if len(pts_rgb) >= n:
                     break
-        return pts_rgb
+        return pts_rgb, pts_ir_selected
 
     spacing_levels = [
         max(3.0, max_dist * 0.55),
@@ -256,13 +272,17 @@ def _pick_sector_spread_points(candidates, n, rng, max_dist):
         0.0,
     ]
     best_pts = []
+    best_ir_pts = []
     for spacing in spacing_levels:
-        pts = _collect_with_spacing(spacing)
+        pts, pts_ir_selected = _collect_with_spacing(spacing)
         if len(pts) > len(best_pts):
             best_pts = pts
+            best_ir_pts = pts_ir_selected
         if len(best_pts) >= n:
             break
 
+    if return_ir_points:
+        return best_pts, best_ir_pts
     return best_pts
 
 
@@ -278,9 +298,10 @@ def _select_spread_points(
     axis_cx=None,
     axis_cy=None,
     axis_excl_r=None,
+    return_ir_points=False,
 ):
     if mask_ir is None or not np.any(mask_ir) or n <= 0:
-        return []
+        return ([], []) if return_ir_points else []
 
     candidates, max_dist = _build_point_candidates(
         mask_ir,
@@ -293,7 +314,9 @@ def _select_spread_points(
         axis_cy=axis_cy,
         axis_excl_r=axis_excl_r,
     )
-    return _pick_sector_spread_points(candidates, n, rng, max_dist)
+    return _pick_sector_spread_points(
+        candidates, n, rng, max_dist, return_ir_points=return_ir_points
+    )
 
 
 def _dilate_bool_mask(mask_bool, ksize):
@@ -321,12 +344,14 @@ def _sample_food_bg_points(
     axis_cx=None,
     axis_cy=None,
     axis_excl_r=None,
+    return_ir_points=False,
 ):
     """Sample BG-food points conservatively from the food core only."""
     if food_mask is None or not np.any(food_mask) or n <= 0:
-        return []
+        return ([], []) if return_ir_points else []
 
     pts = []
+    pts_ir = []
     core_masks = []
     for ksize in (21, 17, 13, 9, 5):
         core_mask = _erode_bool_mask(food_mask, ksize)
@@ -338,7 +363,7 @@ def _sample_food_bg_points(
         core_masks.append(food_mask)
 
     for core_mask in core_masks:
-        fill_pts = _select_spread_points(
+        fill_pts, fill_ir_pts = _select_spread_points(
             core_mask,
             homography_inv,
             wok_rgb_constraint,
@@ -349,10 +374,13 @@ def _sample_food_bg_points(
             axis_cx=axis_cx,
             axis_cy=axis_cy,
             axis_excl_r=axis_excl_r,
+            return_ir_points=True,
         )
-        pts = _dedupe_point_list(pts + fill_pts)
+        pts, pts_ir = _dedupe_point_pairs(pts + fill_pts, pts_ir + fill_ir_pts)
         if len(pts) >= n:
             break
+    if return_ir_points:
+        return pts[:n], pts_ir[:n]
     return pts[:n]
 
 
@@ -400,11 +428,12 @@ def _sample_directional_ring_points(
     axis_cx=None,
     axis_cy=None,
     axis_excl_r=None,
+    return_ir_points=False,
 ):
     """Force FG-bottom-near points to wrap around the food contour by angle."""
     if (food_mask is None or near_ring_mask is None or n <= 0
             or not np.any(food_mask) or not np.any(near_ring_mask)):
-        return []
+        return ([], []) if return_ir_points else []
 
     food_u8 = (food_mask.astype(np.uint8) * 255)
     edge_mask = food_mask & (~_erode_bool_mask(food_mask, 3))
@@ -412,7 +441,7 @@ def _sample_directional_ring_points(
     if len(xs_e) == 0:
         ys_e, xs_e = np.where(food_mask)
         if len(xs_e) == 0:
-            return []
+            return ([], []) if return_ir_points else []
 
     cx = float(np.mean(xs_e))
     cy = float(np.mean(ys_e))
@@ -426,12 +455,13 @@ def _sample_directional_ring_points(
         radius = float(np.hypot(dx, dy))
         boundary_samples.append((angle, radius, int(x), int(y)))
     if not boundary_samples:
-        return []
+        return ([], []) if return_ir_points else []
 
     n_sectors = max(8, min(12, n))
     sector_angles = np.linspace(-np.pi, np.pi, n_sectors, endpoint=False)
     used_ir = set()
     forced_pts = []
+    forced_ir_pts = []
 
     for target_angle in sector_angles:
         best_edge = None
@@ -479,13 +509,14 @@ def _sample_directional_ring_points(
         if hit is None:
             continue
         used_ir.add(hit[0])
+        forced_ir_pts.append([float(hit[0][0]), float(hit[0][1])])
         forced_pts.append(hit[1])
         if len(forced_pts) >= n:
             break
 
-    forced_pts = _dedupe_point_list(forced_pts)
+    forced_pts, forced_ir_pts = _dedupe_point_pairs(forced_pts, forced_ir_pts)
     if len(forced_pts) < n:
-        extra_pts = _select_spread_points(
+        extra_pts, extra_ir_pts = _select_spread_points(
             near_ring_mask,
             homography_inv,
             wok_rgb_constraint,
@@ -497,8 +528,14 @@ def _sample_directional_ring_points(
             axis_cx=axis_cx,
             axis_cy=axis_cy,
             axis_excl_r=axis_excl_r,
+            return_ir_points=True,
         )
-        forced_pts = _dedupe_point_list(forced_pts + extra_pts)
+        forced_pts, forced_ir_pts = _dedupe_point_pairs(
+            forced_pts + extra_pts,
+            forced_ir_pts + extra_ir_pts,
+        )
+    if return_ir_points:
+        return forced_pts[:n], forced_ir_pts[:n]
     return forced_pts[:n]
 
 
@@ -580,15 +617,24 @@ def generate_inverse_bottom_points_from_ir(
     axis_cx=None,
     axis_cy=None,
     axis_excl_r=None,
+    axis_ir_cx=None,
+    axis_ir_cy=None,
+    axis_ir_excl_r=None,
     detail_lines=None,
     action_tag=None,
     seg_mode=SEG_TWO_CLUSTER,
     seg_percentile=40,
+    return_debug=False,
 ):
     """Generate inverse-SAM2 points from current IR: food interior=BG, other wok area=FG."""
+    def _empty_inverse_result():
+        if return_debug:
+            return [], [], False, {"fg_ir_points": [], "bg_ir_points": [], "axis_guard_ir": None}
+        return [], [], False
+
     if (rgb_frame is None or ir_frame is None or wok_mask_ir is None
             or homography_inv is None or wok_rgb_constraint is None):
-        return [], [], False
+        return _empty_inverse_result()
 
     rng = rng or np.random.default_rng(0)
     seg_result = segment_ir_food(
@@ -599,9 +645,9 @@ def generate_inverse_bottom_points_from_ir(
         min_cluster_gap=25.0,
     )
     if seg_result.reason == "too_few_wok_pixels":
-        return [], [], False
+        return _empty_inverse_result()
     if not seg_result.ok:
-        return [], [], False
+        return _empty_inverse_result()
 
     c_low = seg_result.food_center
     c_high = seg_result.hot_center
@@ -613,14 +659,15 @@ def generate_inverse_bottom_points_from_ir(
     food_components = _extract_top_components(food_ir, max_components=2)
     food_ir = (food_ir > 0)
     if not food_components:
-        return [], [], False
+        return _empty_inverse_result()
 
     if gray_frame is None and rgb_frame is not None:
         gray_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2GRAY)
 
     bg_pts = []
+    bg_pts_ir = []
     if len(food_components) == 1:
-        bg_pts = _sample_food_bg_points(
+        bg_pts, bg_pts_ir = _sample_food_bg_points(
             food_components[0],
             homography_inv,
             wok_rgb_constraint,
@@ -631,6 +678,7 @@ def generate_inverse_bottom_points_from_ir(
             axis_cx=axis_cx,
             axis_cy=axis_cy,
             axis_excl_r=axis_excl_r,
+            return_ir_points=True,
         )
     else:
         area1 = float(np.count_nonzero(food_components[0]))
@@ -638,7 +686,7 @@ def generate_inverse_bottom_points_from_ir(
         secondary_n = int(round(n_bg * area2 / max(area1 + area2, 1.0)))
         secondary_n = max(2, min(secondary_n, max(2, n_bg // 2)))
         primary_n = max(4, n_bg - secondary_n)
-        primary_pts = _sample_food_bg_points(
+        primary_pts, primary_ir_pts = _sample_food_bg_points(
             food_components[0],
             homography_inv,
             wok_rgb_constraint,
@@ -649,8 +697,9 @@ def generate_inverse_bottom_points_from_ir(
             axis_cx=axis_cx,
             axis_cy=axis_cy,
             axis_excl_r=axis_excl_r,
+            return_ir_points=True,
         )
-        secondary_pts = _sample_food_bg_points(
+        secondary_pts, secondary_ir_pts = _sample_food_bg_points(
             food_components[1],
             homography_inv,
             wok_rgb_constraint,
@@ -661,11 +710,15 @@ def generate_inverse_bottom_points_from_ir(
             axis_cx=axis_cx,
             axis_cy=axis_cy,
             axis_excl_r=axis_excl_r,
+            return_ir_points=True,
         )
-        bg_pts = _dedupe_point_list(primary_pts + secondary_pts)
+        bg_pts, bg_pts_ir = _dedupe_point_pairs(
+            primary_pts + secondary_pts,
+            primary_ir_pts + secondary_ir_pts,
+        )
         if len(bg_pts) < n_bg:
             merged_food = (food_components[0] | food_components[1])
-            fill_pts = _sample_food_bg_points(
+            fill_pts, fill_ir_pts = _sample_food_bg_points(
                 merged_food,
                 homography_inv,
                 wok_rgb_constraint,
@@ -676,8 +729,14 @@ def generate_inverse_bottom_points_from_ir(
                 axis_cx=axis_cx,
                 axis_cy=axis_cy,
                 axis_excl_r=axis_excl_r,
+                return_ir_points=True,
             )
-            bg_pts = _dedupe_point_list(bg_pts + fill_pts)[:n_bg]
+            bg_pts, bg_pts_ir = _dedupe_point_pairs(
+                bg_pts + fill_pts,
+                bg_pts_ir + fill_ir_pts,
+            )
+            bg_pts = bg_pts[:n_bg]
+            bg_pts_ir = bg_pts_ir[:n_bg]
 
     merged_food = np.zeros_like(wok_mask_ir, dtype=bool)
     for comp in food_components:
@@ -701,9 +760,19 @@ def generate_inverse_bottom_points_from_ir(
     # arbitrary far-region wok pixels.
     outer_outer = _dilate_bool_mask(near_outer, 24)
     outer_ring = outer_outer & wok_mask_ir & (~near_outer) & (~merged_food)
-    if axis_cx is not None and axis_cy is not None and axis_excl_r is not None:
+    axis_guard_ir = None
+    if axis_ir_cx is not None and axis_ir_cy is not None and axis_ir_excl_r is not None:
         yy, xx = np.indices(wok_mask_ir.shape)
-        axis_ir = np.zeros_like(wok_mask_ir, dtype=bool)
+        axis_guard_ir = (
+            ((xx - float(axis_ir_cx)) ** 2 + (yy - float(axis_ir_cy)) ** 2)
+            <= float(axis_ir_excl_r) ** 2
+        )
+        near_ring &= ~axis_guard_ir
+        outer_ring &= ~axis_guard_ir
+        food_inner &= ~axis_guard_ir
+        fg_core &= ~axis_guard_ir
+    elif axis_cx is not None and axis_cy is not None and axis_excl_r is not None:
+        yy, xx = np.indices(wok_mask_ir.shape)
         axis_rgb_pts = np.array(
             [[[float(axis_cx), float(axis_cy)]]], dtype=np.float32
         )
@@ -712,17 +781,17 @@ def generate_inverse_bottom_points_from_ir(
             axis_ir_cx = float(axis_ir_pt[0])
             axis_ir_cy = float(axis_ir_pt[1])
             axis_ir_r = max(6.0, float(axis_excl_r) / 6.0)
-            axis_ir = (((xx - axis_ir_cx) ** 2 + (yy - axis_ir_cy) ** 2) <= axis_ir_r ** 2)
-            near_ring &= ~axis_ir
-            outer_ring &= ~axis_ir
-            food_inner &= ~axis_ir
-            fg_core &= ~axis_ir
+            axis_guard_ir = (((xx - axis_ir_cx) ** 2 + (yy - axis_ir_cy) ** 2) <= axis_ir_r ** 2)
+            near_ring &= ~axis_guard_ir
+            outer_ring &= ~axis_guard_ir
+            food_inner &= ~axis_guard_ir
+            fg_core &= ~axis_guard_ir
         except Exception:
             pass
 
     fg_near_n = min(12, max(8, int(round(n_fg * 0.6))))
     fg_far_n = max(0, n_fg - fg_near_n)
-    fg_near_pts = _sample_directional_ring_points(
+    fg_near_pts, fg_near_ir_pts = _sample_directional_ring_points(
         fg_core,
         near_ring,
         homography_inv,
@@ -734,8 +803,9 @@ def generate_inverse_bottom_points_from_ir(
         axis_cx=axis_cx,
         axis_cy=axis_cy,
         axis_excl_r=axis_excl_r,
+        return_ir_points=True,
     )
-    fg_far_pts = _select_spread_points(
+    fg_far_pts, fg_far_ir_pts = _select_spread_points(
         outer_ring,
         homography_inv,
         wok_rgb_constraint,
@@ -746,11 +816,15 @@ def generate_inverse_bottom_points_from_ir(
         axis_cx=axis_cx,
         axis_cy=axis_cy,
         axis_excl_r=axis_excl_r,
+        return_ir_points=True,
     )
-    fg_pts = _dedupe_point_list(fg_near_pts + fg_far_pts)
+    fg_pts, fg_pts_ir = _dedupe_point_pairs(
+        fg_near_pts + fg_far_pts,
+        fg_near_ir_pts + fg_far_ir_pts,
+    )
     if len(fg_pts) < n_fg:
         fg_fill_region = wok_mask_ir & (~food_inner)
-        fg_fill_pts = _select_spread_points(
+        fg_fill_pts, fg_fill_ir_pts = _select_spread_points(
             fg_fill_region,
             homography_inv,
             wok_rgb_constraint,
@@ -761,8 +835,14 @@ def generate_inverse_bottom_points_from_ir(
             axis_cx=axis_cx,
             axis_cy=axis_cy,
             axis_excl_r=axis_excl_r,
+            return_ir_points=True,
         )
-        fg_pts = _dedupe_point_list(fg_pts + fg_fill_pts)[:n_fg]
+        fg_pts, fg_pts_ir = _dedupe_point_pairs(
+            fg_pts + fg_fill_pts,
+            fg_pts_ir + fg_fill_ir_pts,
+        )
+        fg_pts = fg_pts[:n_fg]
+        fg_pts_ir = fg_pts_ir[:n_fg]
     ok = len(fg_pts) >= 4 and len(bg_pts) >= 4
 
     if ok and preview_path:
@@ -787,4 +867,11 @@ def generate_inverse_bottom_points_from_ir(
             action_tag=action_tag,
         )
 
+    debug_info = {
+        "fg_ir_points": fg_pts_ir,
+        "bg_ir_points": bg_pts_ir,
+        "axis_guard_ir": axis_guard_ir,
+    }
+    if return_debug:
+        return fg_pts, bg_pts, ok, debug_info
     return fg_pts, bg_pts, ok

@@ -28,6 +28,8 @@ import torch
 import matplotlib
 matplotlib.use("Agg")   # 无头模式，不弹窗
 import matplotlib.pyplot as plt
+import chunk_reference_debug as _chunk_ref_debug
+import final_temperature as _final_temperature
 import ir_wok as _ir_wok
 import label_io as _label_io
 import output_utils as _output_utils
@@ -90,6 +92,13 @@ CURVE_WIN_S     = 60              # 曲线滑动窗口（秒），只显示最�
 # 每隔 N 秒自动重新生成前景点并重置 SAM2，解决长时间追踪漂移问题
 # 0 = 关闭（使用 food_labels.json 中的关键帧）
 RELABEL_INTERVAL_S = 4
+
+# Unified IR food segmentation switch:
+# - IR temperature statistic
+# - IR display food mask
+# - RGB forward IR relabel sampling
+# - RGB inverse IR relabel sampling
+# Use "percentile" with IR_FOOD_SEG_PERCENTILE, or "two_cluster".
 IR_FOOD_SEG_MODE = "percentile"
 IR_FOOD_SEG_PERCENTILE = 40
 IR_PANEL_SEG_MODE = IR_FOOD_SEG_MODE
@@ -112,6 +121,26 @@ def _format_ir_seg_stats(stats):
 # Disabled by default for trimmed datasets. Enable only when raw videos still
 # contain upright-wok / flip interference segments that should output empty masks.
 ENABLE_UPRIGHT_WOK_FREEZE = False
+
+# Forward carry-mask connected-component reliability gate.
+ENABLE_FORWARD_BCHECK = False
+FORWARD_BCHECK_MAX_CC_PCT = 50.0
+FORWARD_BCHECK_MAX_VALID_COMPONENTS = 5
+FORWARD_BCHECK_MIN_CC_WOK_RATIO = 0.005
+FORWARD_BCHECK_MIN_CC_PIXELS = 100
+FORWARD_BCHECK_DISCARD_CC_PCT = 50.0
+FORWARD_AXIS_DYNAMIC_MAX_SHIFT_IR = 25.0
+FORWARD_UPPER_WOK_ENABLE = True
+FORWARD_UPPER_WOK_RATIO = 40.0
+FORWARD_UPPER_WOK_STUCK_FRAMES = 25
+FORWARD_UPPER_WOK_MIN_MASK_PCT = 5.0
+FORWARD_UPPER_WOK_MAX_MASK_PCT = 25.0
+INVERSE_RESET_MIN_RATIO = 5.0
+INVERSE_RESET_MAX_RATIO = 60.0
+INVERSE_IR_RELABEL_N_FG = 20
+INVERSE_IR_RELABEL_N_BG = 8
+INVERSE_IR_RELABEL_BG_MIN_GRAY = 45
+INVERSE_IR_RELABEL_FG_MAX_GRAY = 210
 
 # 临时帧目录（放在 core/ 下）
 TMP_BASE        = os.path.join(_HERE, "tmp_sam2_frames")
@@ -229,6 +258,28 @@ def upscale_mask(mask, dst_wh):
     m_u8 = mask.astype(np.uint8) * 255
     m_up = cv2.resize(m_u8, dst_wh, interpolation=cv2.INTER_NEAREST)
     return m_up > 127
+
+
+def project_ir_radius_to_rgb_radius(homography_inv, axis_ir_cx, axis_ir_cy, radius_ir, fallback=None):
+    """Estimate the local RGB radius that corresponds to a manual IR radius."""
+    if (homography_inv is None or axis_ir_cx is None or axis_ir_cy is None
+            or radius_ir is None):
+        return fallback
+    try:
+        pts_ir = np.array([
+            [[float(axis_ir_cx), float(axis_ir_cy)]],
+            [[float(axis_ir_cx) + float(radius_ir), float(axis_ir_cy)]],
+            [[float(axis_ir_cx), float(axis_ir_cy) + float(radius_ir)]],
+        ], dtype=np.float32)
+        pts_rgb = cv2.perspectiveTransform(pts_ir, homography_inv).reshape(-1, 2)
+        radius_x = float(np.linalg.norm(pts_rgb[1] - pts_rgb[0]))
+        radius_y = float(np.linalg.norm(pts_rgb[2] - pts_rgb[0]))
+        radius = max(radius_x, radius_y)
+        if not np.isfinite(radius) or radius <= 1.0:
+            return fallback
+        return radius
+    except Exception:
+        return fallback
 
 
 def track_chunk(predictor, tmp_dir, frame_names,
@@ -724,9 +775,15 @@ def main():
     relabel_preview_dir = os.path.join(out_dir, "relabel_previews")
     violation_event_dir = os.path.join(out_dir, "violation_events")
     ir_relabel_frame_dir = os.path.join(out_dir, "ir_relabel_frames")
+    ir_fix_compare_dir = os.path.join(out_dir, "ir_fix_mask_compare")
+    forward_chunk_ref_dir = os.path.join(out_dir, "forward_chunk_references")
+    inverse_chunk_ref_dir = os.path.join(out_dir, "inverse_chunk_references")
     os.makedirs(relabel_preview_dir, exist_ok=True)
     os.makedirs(violation_event_dir, exist_ok=True)
     os.makedirs(ir_relabel_frame_dir, exist_ok=True)
+    os.makedirs(ir_fix_compare_dir, exist_ok=True)
+    os.makedirs(forward_chunk_ref_dir, exist_ok=True)
+    os.makedirs(inverse_chunk_ref_dir, exist_ok=True)
     out_video_viz = os.path.join(out_dir, "track_result_viz.mp4")
     out_csv       = os.path.join(out_dir, "food_temp_log.csv")      # noqa (reserved)
     out_xlsx      = os.path.join(out_dir, "food_temp_log.xlsx")     # noqa (reserved)
@@ -774,7 +831,9 @@ def main():
             return None
 
     def _save_ir_relabel_frame_image(filename, ir_frame, wok_mask, header, detail_lines,
-                                     food_mask=None, hot_mask=None):
+                                     food_mask=None, hot_mask=None,
+                                     fg_points_ir=None, bg_points_ir=None,
+                                     axis_guard_mask=None):
         if ir_frame is None:
             return
         try:
@@ -805,6 +864,18 @@ def main():
             _draw_mask_outline(wok_mask, (255, 255, 255))
             _draw_mask_outline(food_mask, (0, 255, 255))
             _draw_mask_outline(hot_mask, (0, 80, 255))
+            _draw_mask_outline(axis_guard_mask, (20, 20, 20))
+
+            for x_ir, y_ir in (fg_points_ir or []):
+                cx = int(round(float(x_ir) * 4.0))
+                cy = int(round(float(y_ir) * 4.0))
+                cv2.circle(vis, (cx, cy), 7, (0, 255, 80), -1)
+                cv2.circle(vis, (cx, cy), 8, (0, 0, 0), 1)
+            for x_ir, y_ir in (bg_points_ir or []):
+                cx = int(round(float(x_ir) * 4.0))
+                cy = int(round(float(y_ir) * 4.0))
+                cv2.circle(vis, (cx, cy), 7, (255, 80, 0), -1)
+                cv2.circle(vis, (cx, cy), 8, (255, 255, 255), 1)
 
             cv2.putText(vis, header, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (255, 255, 255), 2)
             for idx, line in enumerate(detail_lines or []):
@@ -846,6 +917,33 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
         cv2.imwrite(path, vis)
 
+    def _merge_inject_points(frame0_injects):
+        fg_pts = []
+        bg_pts = []
+        for _inject in frame0_injects or []:
+            fg_pts.extend(_inject.get("fg_points", []) or [])
+            bg_pts.extend(_inject.get("bg_points", []) or [])
+        return fg_pts, bg_pts
+
+    def _set_inverse_manual_fallback(reset_violation_name, chunk_start_s, chunk_start_abs,
+                                     bottom_fg_run, bottom_bg_run, chunk_i,
+                                     reset_reason, reset_msg, log_detail):
+        _append_violation_event_action(
+            reset_violation_name,
+            "manual_fallback",
+            (f"next_chunk_action=manual_fallback  "
+             f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
+        )
+        print(f"[InvAutoRestart] chunk={chunk_i+1} "
+              f"start_frame={chunk_start_abs} {reset_reason}"
+              f"{reset_msg} {log_detail}")
+        return (
+            "manual_fallback",
+            None,
+            list(bottom_fg_run or []),
+            list(bottom_bg_run or []),
+        )
+
     # ── 检查依赖文件 ──────────────────────────────────────────────────────────
     if not os.path.exists(labels_json):
         print(f"[error] labels file not found: {labels_json}")
@@ -873,7 +971,14 @@ def main():
     # 锅底关键帧（用于反向追踪）
     has_bottom = len(bottom_keyframes) > 0
     if has_bottom:
-        bottom_first_kf  = bottom_keyframes[0]
+        _bottom_initial_candidates = [
+            kf for kf in bottom_keyframes
+            if int(kf.get("frame", -1)) >= int(start_frame)
+        ]
+        bottom_first_kf = (
+            _bottom_initial_candidates[0]
+            if _bottom_initial_candidates else bottom_keyframes[0]
+        )
         bottom_fg_points = bottom_first_kf["fg_points"]
         bottom_bg_points = bottom_first_kf["bg_points"]
         bottom_start_frame = bottom_first_kf["frame"]
@@ -922,7 +1027,7 @@ def main():
     _bottom_carry = None
     _bottom_fail_streak = 0
     _bottom_auto_reset = None
-    _bottom_inject_map = {kf["frame"]: kf for kf in bottom_keyframes[1:]}
+    _bottom_inject_map = {}
     if "wok_rgb_region" in _wok_rgb_json:
         _wr = _wok_rgb_json["wok_rgb_region"]
         wok_rgb_cx = float(_wr["cx"])
@@ -1044,10 +1149,13 @@ def main():
     roi_rows         = []   # [frame_abs, frame_rel, time_s, roi_temp_mean]
     ir_rows          = []   # [frame_abs, frame_rel, time_s, ir_mask_temp]
     inverse_rows     = []   # [frame_abs, frame_rel, time_s, inverse_temp_mean]  锅底反向语义
+    final_rows       = []   # [frame_abs, frame_rel, time_s, final_temp, source, reason]
     temp_history     = []   # list of (time_s, temp_mean)，SAM2 mask 温度历史
     roi_history      = []   # list of (time_s, roi_temp)，ROI 区域温度历史
     ir_mask_history  = []   # list of (time_s, ir_mask_temp)，IR 自动分割温度历史
     inverse_history  = []   # list of (time_s, temp_mean)，锅底反向语义温度历史
+    final_history    = []   # list of (time_s, final_temp)
+    _last_final_temp = float("nan")
 
     # ── 加载 ROI 配置 ─────────────────────────────────────────────────────────
     roi_cfg = None
@@ -1146,6 +1254,9 @@ def main():
     _wok_mask_al     = None
     _H_inv_al        = None
     _rng_al          = None
+    _AXIS_CX_RGB = _AXIS_CY_RGB = _AXIS_EXCL_R = None
+    _AXIS_IR_CX = _AXIS_IR_CY = _AXIS_FG_EXCL_R = _AXIS_IR_EXCL_R = None
+    _FORWARD_AXIS_EXCL_R = _FORWARD_AXIS_FG_EXCL_R = _FORWARD_AXIS_IR_EXCL_R = None
     if RELABEL_INTERVAL_S > 0:
         try:
             import sys as _sys
@@ -1164,7 +1275,7 @@ def main():
                 _H_inv_al    = np.linalg.inv(homography)
                 _rng_al      = np.random.default_rng(42)
                 _auto_label_func = _al_ir_mask
-                print(f"[自动重标点] 已加载，每 {RELABEL_INTERVAL_S}s 重新标点并重置SAM2")
+                print(f"[批次开头参考重检] 已加载，按批次开头检查并在需要时重标SAM2")
                 # 用 IR 动态锅中心驱动 RGB 反向语义圈，并用首帧人工中心补偿 IR->RGB 系统偏差。
                 if _USE_IR_FOR_INV_WOK and _wok_rgb_cx_dyn is not None:
                     _ir_wok0 = np.array([[[_wok_cx, _wok_cy]]], dtype=np.float32)
@@ -1190,11 +1301,44 @@ def main():
                     _rgb_center = cv2.perspectiveTransform(_ir_axis, _H_inv_al)[0][0]
                     _AXIS_CX_RGB = float(_rgb_center[0])
                     _AXIS_CY_RGB = float(_rgb_center[1])
-                    _AXIS_EXCL_R = 90   # 旋转轴排除半径（RGB px）
+                    _AXIS_IR_CX = float(_ir_axis[0][0][0])
+                    _AXIS_IR_CY = float(_ir_axis[0][0][1])
+                    _AXIS_EXCL_R = 90      # 轴心驻留检测半径（RGB px）
+                    _AXIS_FG_EXCL_R = 90   # 正向 IR 自动前景点安全半径（RGB px）
                     print(f"[旋转轴] RGB坐标: ({_AXIS_CX_RGB:.0f}, {_AXIS_CY_RGB:.0f})"
-                          f"  排除半径={_AXIS_EXCL_R}px  来源={_axis_src}")
+                          f"  检测={_AXIS_EXCL_R}px  FG排除={_AXIS_FG_EXCL_R}px"
+                          f"  来源={_axis_src}")
+                    _AXIS_IR_EXCL_R = float(_wok_cfg_al.get("axis_excl_r_ir", 0.0) or 0.0)
+                    _axis_rgb_radius = project_ir_radius_to_rgb_radius(
+                        _H_inv_al,
+                        _AXIS_IR_CX,
+                        _AXIS_IR_CY,
+                        _AXIS_IR_EXCL_R if _AXIS_IR_EXCL_R > 0 else None,
+                        fallback=float(_AXIS_EXCL_R),
+                    )
+                    if _axis_rgb_radius is not None:
+                        _AXIS_EXCL_R = float(_axis_rgb_radius)
+                        _AXIS_FG_EXCL_R = float(_axis_rgb_radius)
+                    print(f"[axis radius] IR={_AXIS_IR_EXCL_R:.1f}px  RGB={_AXIS_EXCL_R:.1f}px")
+                    if _AXIS_IR_EXCL_R is not None and _AXIS_IR_EXCL_R > 0:
+                        _FORWARD_AXIS_IR_EXCL_R = float(_AXIS_IR_EXCL_R)
+                    _forward_axis_rgb_radius = project_ir_radius_to_rgb_radius(
+                        _H_inv_al,
+                        _AXIS_IR_CX,
+                        _AXIS_IR_CY,
+                        _FORWARD_AXIS_IR_EXCL_R,
+                        fallback=(float(_AXIS_EXCL_R) if _AXIS_EXCL_R is not None else None),
+                    )
+                    if _forward_axis_rgb_radius is not None:
+                        _FORWARD_AXIS_EXCL_R = float(_forward_axis_rgb_radius)
+                        _FORWARD_AXIS_FG_EXCL_R = float(_forward_axis_rgb_radius)
+                    print(f"[forward axis guard] "
+                          f"IR={_FORWARD_AXIS_IR_EXCL_R if _FORWARD_AXIS_IR_EXCL_R is not None else 0.0:.1f}px "
+                          f"RGB={_FORWARD_AXIS_EXCL_R if _FORWARD_AXIS_EXCL_R is not None else 0.0:.1f}px")
                 except Exception as _axe:
                     _AXIS_CX_RGB = _AXIS_CY_RGB = _AXIS_EXCL_R = None
+                    _AXIS_IR_CX = _AXIS_IR_CY = _AXIS_FG_EXCL_R = _AXIS_IR_EXCL_R = None
+                    _FORWARD_AXIS_EXCL_R = _FORWARD_AXIS_FG_EXCL_R = _FORWARD_AXIS_IR_EXCL_R = None
                     print(f"[旋转轴] 坐标计算失败({_axe})，跳过排除")
             else:
                 print(f"[自动重标点] 无温度数据或单应矩阵，禁用")
@@ -1204,9 +1348,10 @@ def main():
     last_relabel_s = start_frame / fps   # 上次重标点的时间（秒）
     prev_mask_ratio = 0.0                # 上批末帧 mask 面积占比（%），用于异常检测
     last_reinforce_wok_pct = 0.0         # 上次补强时 mask 占 wok 区域的%（骤降检测用）
-    _in_recovery = False                 # 重置后进入 recovery 模式，每批强制检查直到恢复
+    _in_recovery = False                 # 兼容旧逻辑的空壳状态；当前不再参与开头重检决策
     _forward_axis_stuck_streak = 0
     _FORWARD_AXIS_STUCK_FRAMES = 15
+    _forward_upper_wok_stuck_streak = 0
 
     # ── 预计算 wok RGB mask（用于每帧后处理约束，避免循环内重复计算）────────
     _wok_rgb_constraint = None   # (VH, VW) bool
@@ -1304,9 +1449,8 @@ def main():
             print(f"[批次 {chunk_i+1}/{n_chunks}] 帧 {chunk_start_abs} ~ {chunk_end_abs-1}"
                   f"  ({chunk_len} 帧)")
 
-            # ── 每批动态更新旋转轴 RGB 坐标（用当前 _wok_cx/_wok_cy 反投影）────────
-            # 手持拍摄时锅帧帧移动，不能用启动时算的固定坐标排除旋转轴
-            # 每批用最新的 _wok_cx/_wok_cy（IR 坐标）实时反投影到 RGB
+            # ── 动态锅区中心：供锅区约束和反向方案使用 ──
+            # legacy 热环的中心受温度分布影响，不能直接作为正向 FG 采点的机械轴心。
             _axis_cx_rgb_dyn = _AXIS_CX_RGB   # 默认 fallback 到初始静态值
             _axis_cy_rgb_dyn = _AXIS_CY_RGB
             if _H_inv_al is not None:
@@ -1329,6 +1473,46 @@ def main():
                                   f"drift={_inv_drift:.1f}px")
                 except Exception:
                     pass   # 失败时保留静态值
+
+            # ── 正向轴心排除圈：手工轴心为基准，跟随动态锅心的相对位移 ──
+            _axis_cx_rgb_fg = _AXIS_CX_RGB
+            _axis_cy_rgb_fg = _AXIS_CY_RGB
+            _axis_ir_cx_fg = _AXIS_IR_CX
+            _axis_ir_cy_fg = _AXIS_IR_CY
+            _axis_fg_source = "manual"
+            if (_H_inv_al is not None
+                    and _AXIS_IR_CX is not None and _AXIS_IR_CY is not None
+                    and _wok_cfg_al is not None
+                    and _wok_cx is not None and _wok_cy is not None):
+                try:
+                    _axis_base_wok_cx = float(_wok_cfg_al.get("cx", _wok_cx))
+                    _axis_base_wok_cy = float(_wok_cfg_al.get("cy", _wok_cy))
+                    _axis_shift_dx_ir = float(_wok_cx) - _axis_base_wok_cx
+                    _axis_shift_dy_ir = float(_wok_cy) - _axis_base_wok_cy
+                    _axis_shift_norm_ir = (
+                        _axis_shift_dx_ir ** 2 + _axis_shift_dy_ir ** 2
+                    ) ** 0.5
+                    if _axis_shift_norm_ir <= FORWARD_AXIS_DYNAMIC_MAX_SHIFT_IR:
+                        _axis_ir_cx_fg = float(_AXIS_IR_CX + _axis_shift_dx_ir)
+                        _axis_ir_cy_fg = float(_AXIS_IR_CY + _axis_shift_dy_ir)
+                        _ir_axis_fg = np.array([[[
+                            _axis_ir_cx_fg,
+                            _axis_ir_cy_fg,
+                        ]]], dtype=np.float32)
+                        _rgb_axis_fg = cv2.perspectiveTransform(_ir_axis_fg, _H_inv_al)[0][0]
+                        _axis_cx_rgb_fg = float(_rgb_axis_fg[0])
+                        _axis_cy_rgb_fg = float(_rgb_axis_fg[1])
+                        _axis_cx_rgb_dyn = _axis_cx_rgb_fg
+                        _axis_cy_rgb_dyn = _axis_cy_rgb_fg
+                        _axis_fg_source = f"wok_shift({_axis_shift_dx_ir:.1f},{_axis_shift_dy_ir:.1f})"
+                    else:
+                        _axis_cx_rgb_dyn = _AXIS_CX_RGB
+                        _axis_cy_rgb_dyn = _AXIS_CY_RGB
+                        _axis_fg_source = f"manual_shift_clamped({_axis_shift_norm_ir:.1f}px)"
+                except Exception:
+                    _axis_cx_rgb_dyn = _AXIS_CX_RGB
+                    _axis_cy_rgb_dyn = _AXIS_CY_RGB
+                    pass
 
             # ── 检查是否需要自动补强（每 N 秒从 carry_mask 内部采点注入第一帧）────
             # 新策略：carry_mask 始终保留（不置 None），只用 SAM2 自己的末帧 mask 定位，
@@ -1368,17 +1552,107 @@ def main():
                     pass   # 检测失败不影响主流程
 
             # recovery 模式下：每批都检查（不等 RELABEL_INTERVAL_S）；正常模式下按间隔检查
+            if (not _scene_frozen
+                    and carry_mask is None
+                    and chunk_i > 0
+                    and _reinforce_inject is None
+                    and _auto_label_func is not None
+                    and temp_data is not None
+                    and homography is not None
+                    and _wok_mask_al is not None
+                    and _H_inv_al is not None
+                    and _rng_al is not None):
+                _rgb_ref = None
+                _rgb_ref_gray = None
+                try:
+                    _cap_ref = cv2.VideoCapture(video_path)
+                    _cap_ref.set(cv2.CAP_PROP_POS_FRAMES, chunk_start_abs)
+                    _ret_ref, _rgb_ref = _cap_ref.read()
+                    _cap_ref.release()
+                    if _ret_ref:
+                        _rgb_ref_gray = cv2.cvtColor(_rgb_ref, cv2.COLOR_BGR2GRAY)
+                except Exception:
+                    pass
+
+                _force_fg_pts = []
+                _force_bg_pts = []
+                try:
+                    _ir_idx_force = _get_ir_idx(chunk_start_abs)
+                    _ir_frm_force = temp_data[_ir_idx_force]
+                    (_force_fg_pts, _force_bg_pts,
+                     _force_pts_ok, _force_pts_stats) = (
+                        _rgb_forward.generate_forward_relabel_points_from_ir(
+                            _ir_frm_force,
+                            _wok_mask_al,
+                            _H_inv_al,
+                            (VH, VW),
+                            rng=_rng_al,
+                            wok_rgb_constraint=_wok_rgb_constraint,
+                            gray_frame=_rgb_ref_gray,
+                            axis_cx=_axis_cx_rgb_fg,
+                            axis_cy=_axis_cy_rgb_fg,
+                            axis_excl_r=_FORWARD_AXIS_FG_EXCL_R,
+                            axis_ir_cx=_axis_ir_cx_fg,
+                            axis_ir_cy=_axis_ir_cy_fg,
+                            axis_ir_excl_r=_FORWARD_AXIS_IR_EXCL_R,
+                            seg_mode=IR_FOOD_SEG_MODE,
+                            seg_percentile=IR_FOOD_SEG_PERCENTILE,
+                        )
+                    )
+                    if _force_pts_ok:
+                        _reinforce_inject = _rgb_forward.build_forward_ir_relabel_inject(
+                            _force_fg_pts,
+                            _force_bg_pts,
+                            label="IR-reset-missing-carry",
+                        )
+                        last_relabel_s = chunk_start_s
+                        _in_recovery = True
+                        _forward_axis_stuck_streak = 0
+                        _forward_upper_wok_stuck_streak = 0
+                        _food_ir_force = _temp_fusion.build_ir_food_mask_by_temperature(
+                            _ir_frm_force, _wok_mask_al, min_cluster_gap=30.0,
+                            seg_mode=IR_FOOD_SEG_MODE,
+                            seg_percentile=IR_FOOD_SEG_PERCENTILE)
+                        _hot_ir_force = None
+                        if _food_ir_force is not None:
+                            _hot_ir_force = ((_wok_mask_al > 0) & (_food_ir_force == 0)).astype(np.uint8) * 255
+                        _save_ir_relabel_frame_image(
+                            f"forward_ir_relabel_t{chunk_start_s:.0f}s_f{chunk_start_abs}_ir{_ir_idx_force}.jpg",
+                            _ir_frm_force,
+                            _wok_mask_al,
+                            "FORWARD IR relabel frame",
+                            [
+                                "fail_t=NA  fail_frame=NA",
+                                f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
+                                f"ir_idx={_ir_idx_force}",
+                                f"decision=IR_relabel  reason=missing_carry  FG={len(_force_fg_pts)} BG={len(_force_bg_pts)}",
+                            ],
+                            food_mask=_food_ir_force,
+                            hot_mask=_hot_ir_force,
+                            fg_points_ir=(_force_pts_stats or {}).get("fg_ir_points"),
+                            bg_points_ir=(_force_pts_stats or {}).get("bg_ir_points"),
+                            axis_guard_mask=(_force_pts_stats or {}).get("axis_guard_ir"),
+                        )
+                        print(f"[批次开头参考重检] t={chunk_start_s:.1f}s  "
+                              f"carry_mask unavailable -> IR relabel FG={len(_force_fg_pts)} BG={len(_force_bg_pts)}  "
+                              f"{_format_ir_seg_stats(_force_pts_stats)}")
+                    else:
+                        print(f"[批次开头参考重检] t={chunk_start_s:.1f}s  "
+                              f"carry_mask unavailable but IR relabel points unavailable, fallback=manual")
+                except Exception as _force_e:
+                    print(f"[批次开头参考重检] t={chunk_start_s:.1f}s  "
+                          f"carry_mask unavailable and IR relabel failed: {_force_e}")
+
             _should_check = (
                 not _scene_frozen
                 and carry_mask is not None
                 and chunk_i > 0
-                and (_in_recovery or (chunk_start_s - last_relabel_s) >= RELABEL_INTERVAL_S)
             )
             if _should_check:
                 # ── IR 稳定性检查（只判断要不要补强，不采点）─────────────────
                 # recovery 模式下强制跳过方差检查，必须尝试 IR 采点
                 _do_reinforce = True
-                if not _in_recovery and _auto_label_func is not None and temp_data is not None:
+                if False and _auto_label_func is not None and temp_data is not None:
                     try:
                         _ir_idx_al = _get_ir_idx(chunk_start_abs)
                         _ir_frame_al = temp_data[_ir_idx_al]
@@ -1390,11 +1664,12 @@ def main():
                             print(f"[补强] t={chunk_start_s:.1f}s  锅倾斜/翻炒(var={_var_chk:.1f})，跳过")
                     except Exception:
                         pass   # 检查失败则默认补强
-                if _in_recovery:
+                if False:
                     print(f"[recovery] t={chunk_start_s:.1f}s  recovery模式，强制IR采点（跳过方差检查）")
 
                 if _do_reinforce:
                     # ── 颜色过滤：读取当前批起始帧的灰度图，用于过滤黑色区域补强点 ──
+                    _rgb_ref = None
                     _rgb_ref_gray = None
                     try:
                         _cap_ref = cv2.VideoCapture(video_path)
@@ -1416,7 +1691,7 @@ def main():
                         last_reinforce_wok_pct,
                         axis_cx=_axis_cx_rgb_dyn,
                         axis_cy=_axis_cy_rgb_dyn,
-                        axis_excl_r=_AXIS_EXCL_R,
+                        axis_excl_r=_FORWARD_AXIS_EXCL_R,
                     )
                     _mask_px = _reset_metrics["mask_px"]
                     _reset_decision = _rgb_forward.evaluate_forward_reset(
@@ -1424,7 +1699,14 @@ def main():
                         last_reinforce_wok_pct,
                         axis_stuck_streak=_forward_axis_stuck_streak,
                         axis_stuck_min_frames=_FORWARD_AXIS_STUCK_FRAMES,
-                        axis_excl_r=_AXIS_EXCL_R,
+                        axis_excl_r=_FORWARD_AXIS_EXCL_R,
+                        upper_wok_stuck_streak=(
+                            _forward_upper_wok_stuck_streak if FORWARD_UPPER_WOK_ENABLE else 0
+                        ),
+                        upper_wok_stuck_min_frames=FORWARD_UPPER_WOK_STUCK_FRAMES,
+                        upper_wok_min_ratio_pct=FORWARD_UPPER_WOK_RATIO,
+                        upper_wok_min_mask_vs_wok=FORWARD_UPPER_WOK_MIN_MASK_PCT,
+                        upper_wok_max_mask_vs_wok=FORWARD_UPPER_WOK_MAX_MASK_PCT,
                     )
                     _need_reset = _reset_decision["need_reset"]
                     _reset_kind = _reset_decision["reason"]
@@ -1436,22 +1718,22 @@ def main():
                             print(f"[补强] t={chunk_start_s:.1f}s  "
                                   f"mask偏离锅内(overlap={_overlap_pct:.0f}%<60%)，"
                                   f"重置SAM2→初始标注点")
-                    # 也保留面积检查：mask 超过 wok 区域 35% 同样重置（整锅漂移/锅底漂移）
-                    # 食材正常情况下占锅内面积 < 35%，超过说明 SAM2 追踪到了锅底/空白区域
+                    # 也保留面积检查：mask 超过 wok 区域 60% 同样重置（整锅漂移/锅底漂移）
+                    # 食材正常情况下占锅内面积应低于该阈值，超过说明 SAM2 追踪到了锅底/空白区域
                     _wok_px_chk = _reset_metrics["wok_px"]
                     _mask_vs_wok = _reset_metrics["mask_vs_wok"]
                     _drop_pct = _reset_metrics["drop_pct"]
                     if _reset_kind == "oversize":
                             print(f"[补强] t={chunk_start_s:.1f}s  "
-                                  f"mask过大({_mask_vs_wok:.0f}%>wok35%)，"
+                                  f"mask过大({_mask_vs_wok:.0f}%>wok60%)，"
                                   f"重置SAM2→IR定位新前景点")
                     # ── 第三级：面积骤降检测（漂移到旋转轴/小碎片）────────────
                     # last_reinforce_wok_pct = 上次补强时 mask 占 wok% （不是批次均值）
-                    # 骤降 > 70% 或绝对值 < 2% → 重置
+                    # 骤降 > 70% 或绝对值 < 5% → 重置
                     if _wok_px_chk > 0:
                         if _reset_kind == "undersize":
                             print(f"[补强] t={chunk_start_s:.1f}s  "
-                                  f"mask过小({_mask_vs_wok:.1f}%<2%，可能是旋转轴碎片)，"
+                                  f"mask过小({_mask_vs_wok:.1f}%<5%，可能是旋转轴碎片)，"
                                   f"重置SAM2→初始标注点")
                         elif _reset_kind == "drop":
                             print(f"[补强] t={chunk_start_s:.1f}s  "
@@ -1462,6 +1744,12 @@ def main():
                               f"axis_overlap={(_axis_overlap_pct if _axis_overlap_pct is not None else float('nan')):.0f}%  "
                               f"centroid={(_centroid_dist_px if _centroid_dist_px is not None else float('nan')):.0f}px  "
                               f"streak={_forward_axis_stuck_streak}  reset next chunk")
+                    if _reset_kind == "upper_wok_stuck":
+                        _upper_ratio_pct = _reset_metrics.get("upper_wok_ratio_pct")
+                        print(f"[forward-upper-wok] t={chunk_start_s:.1f}s  "
+                              f"upper={(_upper_ratio_pct if _upper_ratio_pct is not None else float('nan')):.0f}%  "
+                              f"mask={_mask_vs_wok:.1f}%  "
+                              f"streak={_forward_upper_wok_stuck_streak}  reset next chunk")
                     if _need_reset:
                         # ── 记录重置原因（预览图在 IR 采点完成后保存）─────────
                         _rst_reason = _rgb_forward.resolve_forward_reset_reason(
@@ -1473,6 +1761,14 @@ def main():
                             centroid_dist_px=_centroid_dist_px,
                             axis_stuck_streak=_forward_axis_stuck_streak,
                             axis_stuck_min_frames=_FORWARD_AXIS_STUCK_FRAMES,
+                            upper_wok_ratio_pct=(
+                                _reset_metrics.get("upper_wok_ratio_pct")
+                                if FORWARD_UPPER_WOK_ENABLE else None
+                            ),
+                            upper_wok_stuck_streak=(
+                                _forward_upper_wok_stuck_streak if FORWARD_UPPER_WOK_ENABLE else 0
+                            ),
+                            upper_wok_stuck_min_frames=FORWARD_UPPER_WOK_STUCK_FRAMES,
                         )
                         # 保留跑偏时的帧和 mask，供稍后保存预览图
                         _rst_carry_mask = carry_mask   # 跑偏的旧 mask（可能是 None）
@@ -1482,10 +1778,19 @@ def main():
                         _fail_time_s = (_fail_frame_abs / fps) if _fail_frame_abs is not None else None
                         _fail_rgb_frame = _read_rgb_frame_at_abs(_fail_frame_abs)
                         _rst_rgb_frame = _read_rgb_frame_at_abs(chunk_start_abs)
+                        _rst_preview_carry_mask = (
+                            _rst_carry_mask.copy() if _rst_carry_mask is not None else None
+                        )
+                        _rst_preview_carry_frame_abs = carry_mask_src_abs
+                        _rst_preview_carry_time_s = (
+                            (_rst_preview_carry_frame_abs / fps)
+                            if _rst_preview_carry_frame_abs is not None else None
+                        )
+                        _rst_fail_mask = _rst_preview_carry_mask
                         if _pending_forward_violation is not None:
                             _pv = _pending_forward_violation
                             _rst_reason = _pv.get("reason", _rst_reason)
-                            _rst_carry_mask = _pv.get("mask", _rst_carry_mask)
+                            _rst_fail_mask = _pv.get("mask", _rst_fail_mask)
                             _fail_frame_abs = _pv.get("frame", _fail_frame_abs)
                             _fail_time_s = _pv.get("time_s", _fail_time_s)
                             _fail_rgb_frame = _pv.get("frame_bgr", _fail_rgb_frame)
@@ -1511,7 +1816,7 @@ def main():
                                 _save_violation_event_image(
                                     _violation_name,
                                     (_fail_rgb_frame if _fail_rgb_frame is not None else _rst_rgb_frame),
-                                    _rst_carry_mask,
+                                    _rst_fail_mask,
                                     "FORWARD violation",
                                     [
                                         _rst_reason,
@@ -1534,6 +1839,7 @@ def main():
 
                         carry_mask = None
                         _forward_axis_stuck_streak = 0
+                        _forward_upper_wok_stuck_streak = 0
                         last_relabel_s = chunk_start_s
                         _in_recovery = True   # 进入 recovery 模式，下批立即检查
                         # ── 尝试用 IR 当前帧低温区定位食材，生成新前景点 ────────
@@ -1555,9 +1861,12 @@ def main():
                                         rng=_rng_al,
                                         wok_rgb_constraint=_wok_rgb_constraint,
                                         gray_frame=_rgb_ref_gray,
-                                        axis_cx=_AXIS_CX_RGB,
-                                        axis_cy=_AXIS_CY_RGB,
-                                        axis_excl_r=_AXIS_EXCL_R,
+                                        axis_cx=_axis_cx_rgb_fg,
+                                        axis_cy=_axis_cy_rgb_fg,
+                                        axis_excl_r=_FORWARD_AXIS_FG_EXCL_R,
+                                        axis_ir_cx=_axis_ir_cx_fg,
+                                        axis_ir_cy=_axis_ir_cy_fg,
+                                        axis_ir_excl_r=_FORWARD_AXIS_IR_EXCL_R,
                                         seg_mode=IR_FOOD_SEG_MODE,
                                         seg_percentile=IR_FOOD_SEG_PERCENTILE,
                                     )
@@ -1584,6 +1893,9 @@ def main():
                                     ],
                                     food_mask=_food_ir_rst,
                                     hot_mask=_hot_ir_rst,
+                                    fg_points_ir=(_ir_pts_stats or {}).get("fg_ir_points"),
+                                    bg_points_ir=(_ir_pts_stats or {}).get("bg_ir_points"),
+                                    axis_guard_mask=(_ir_pts_stats or {}).get("axis_guard_ir"),
                                 )
                                 if _ir_pts_ok:
                                     print(f"[琛ュ己] t={chunk_start_s:.1f}s  "
@@ -1644,9 +1956,9 @@ def main():
                                             _pts_rgb_h = _pts_rgb_h[:2] / _pts_rgb_h[2]
                                             for _xi, _yi in _pts_rgb_h.T:
                                                 _xi, _yi = float(_xi), float(_yi)
-                                                if _AXIS_CX_RGB is not None:
-                                                    _d = ((_xi - _AXIS_CX_RGB)**2 + (_yi - _AXIS_CY_RGB)**2)**0.5
-                                                    if _d < _AXIS_EXCL_R:
+                                                if _axis_cx_rgb_fg is not None:
+                                                    _d = ((_xi - _axis_cx_rgb_fg)**2 + (_yi - _axis_cy_rgb_fg)**2)**0.5
+                                                    if _FORWARD_AXIS_FG_EXCL_R is not None and _d < _FORWARD_AXIS_FG_EXCL_R:
                                                         continue
                                                 if 0 <= _xi < VW and 0 <= _yi < VH:
                                                     if _rgb_ref_gray is not None:
@@ -1674,9 +1986,9 @@ def main():
                             if _rst_rgb_frame is not None:
                                 _vis_rst = _rst_rgb_frame.copy()
                                 # 蓝色半透明显示跑偏的旧 mask（如果有）
-                                if _rst_carry_mask is not None and _rst_carry_mask.any():
-                                    _vis_rst[_rst_carry_mask] = (
-                                        _vis_rst[_rst_carry_mask].astype(float) * 0.5
+                                if _rst_preview_carry_mask is not None and _rst_preview_carry_mask.any():
+                                    _vis_rst[_rst_preview_carry_mask] = (
+                                        _vis_rst[_rst_preview_carry_mask].astype(float) * 0.5
                                         + np.array([0, 0, 220]) * 0.5
                                     ).astype(np.uint8)
                                 # 青色圆点显示 IR 新前景点
@@ -1699,15 +2011,24 @@ def main():
                                                 f"fail_t={_fail_time_s:.1f}s  fail_frame={_fail_frame_abs}",
                                                 (20, 76), cv2.FONT_HERSHEY_SIMPLEX,
                                                 0.72, (255, 255, 255), 2)
+                                if (_rst_preview_carry_time_s is not None
+                                        and _rst_preview_carry_frame_abs is not None):
+                                    cv2.putText(_vis_rst,
+                                                f"carry_t={_rst_preview_carry_time_s:.1f}s  carry_frame={_rst_preview_carry_frame_abs}",
+                                                (20, 112 if _fail_time_s is not None and _fail_frame_abs is not None else 80),
+                                                cv2.FONT_HERSHEY_SIMPLEX,
+                                                0.72, (255, 255, 255), 2)
                                 cv2.putText(_vis_rst,
                                             f"restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
-                                            (20, 112 if _fail_time_s is not None and _fail_frame_abs is not None else 80),
+                                            (20, 148 if _rst_preview_carry_time_s is not None and _rst_preview_carry_frame_abs is not None
+                                             else (112 if _fail_time_s is not None and _fail_frame_abs is not None else 80)),
                                             cv2.FONT_HERSHEY_SIMPLEX,
                                             0.75, (0, 255, 255), 2)
                                 cv2.putText(_vis_rst,
-                                            (f"[red=old bad mask | yellow=FG({n_fg_pts}) | blue=BG({n_bg_pts})]  "
+                                            (f"[red=prev carry_mask | yellow=FG({n_fg_pts}) | blue=BG({n_bg_pts})]  "
                                              f"decision=IR_relabel"),
-                                            (20, 146 if _fail_time_s is not None and _fail_frame_abs is not None else 112),
+                                            (20, 182 if _rst_preview_carry_time_s is not None and _rst_preview_carry_frame_abs is not None
+                                             else (146 if _fail_time_s is not None and _fail_frame_abs is not None else 112)),
                                             cv2.FONT_HERSHEY_SIMPLEX,
                                             0.72, (255, 255, 255), 2)
                                 _draw_action_badge(_vis_rst, "IR_relabel")
@@ -1829,9 +2150,12 @@ def main():
                                             rng=_rng_al,
                                             wok_rgb_constraint=_wok_rgb_constraint,
                                             gray_frame=_rgb_ref_gray,
-                                            axis_cx=_AXIS_CX_RGB,
-                                            axis_cy=_AXIS_CY_RGB,
-                                            axis_excl_r=_AXIS_EXCL_R,
+                                            axis_cx=_axis_cx_rgb_fg,
+                                            axis_cy=_axis_cy_rgb_fg,
+                                            axis_excl_r=_FORWARD_AXIS_FG_EXCL_R,
+                                            axis_ir_cx=_axis_ir_cx_fg,
+                                            axis_ir_cy=_axis_ir_cy_fg,
+                                            axis_ir_excl_r=_FORWARD_AXIS_IR_EXCL_R,
                                             seg_mode=IR_FOOD_SEG_MODE,
                                             seg_percentile=IR_FOOD_SEG_PERCENTILE,
                                         )
@@ -1862,8 +2186,9 @@ def main():
                                             _pts_rgb_r2 = _pts_rgb_r2[:2] / _pts_rgb_r2[2]
                                             for _xi2, _yi2 in _pts_rgb_r2.T:
                                                 _xi2, _yi2 = float(_xi2), float(_yi2)
-                                                if _AXIS_CX_RGB is not None:
-                                                    if ((_xi2-_AXIS_CX_RGB)**2+(_yi2-_AXIS_CY_RGB)**2)**0.5 < _AXIS_EXCL_R:
+                                                if (_axis_cx_rgb_fg is not None
+                                                        and _FORWARD_AXIS_FG_EXCL_R is not None):
+                                                    if ((_xi2-_axis_cx_rgb_fg)**2+(_yi2-_axis_cy_rgb_fg)**2)**0.5 < _FORWARD_AXIS_FG_EXCL_R:
                                                         continue
                                                 if 0 <= _xi2 < VW and 0 <= _yi2 < VH:
                                                     if _rgb_ref_gray is not None and int(_rgb_ref_gray[int(_yi2), int(_xi2)]) < 40:
@@ -1968,6 +2293,7 @@ def main():
                             last_relabel_s = chunk_start_s
                             last_reinforce_wok_pct = _mask_vs_wok
                             _forward_axis_stuck_streak = 0
+                            _forward_upper_wok_stuck_streak = 0
                             _in_recovery = False
                             print(f"[补强] t={chunk_start_s:.1f}s  mask正常({_mask_vs_wok:.0f}%)"
                                   f"  SAM2自主追踪(IoU通过，无IR注入)")
@@ -1976,7 +2302,7 @@ def main():
 
             # ── B-check 早检：本批开始前验证上批 carry_mask 可靠性 ──────────────
             # 坏的 carry_mask 若直接喂给 SAM2 会进入死循环，提前拦截
-            if carry_mask is not None and _wok_rgb_constraint is not None:
+            if ENABLE_FORWARD_BCHECK and carry_mask is not None and _wok_rgb_constraint is not None:
                 _cm_u8_pre = carry_mask.astype(np.uint8) * 255
                 _cc_n_pre, _cc_lbl_pre, _cc_st_pre, _ = cv2.connectedComponentsWithStats(
                     _cm_u8_pre, connectivity=8)
@@ -1985,22 +2311,28 @@ def main():
                 if len(_fg_pre) > 0:
                     _max_cc_pre  = int(_fg_pre[:, cv2.CC_STAT_AREA].max())
                     _max_pct_pre = _max_cc_pre / max(_wok_px_pre, 1) * 100
-                    _thr_pre     = 30.0 if _wok_tilting else 50.0
-                    _min_px_pre  = max(100, int(_wok_px_pre * 0.005))
+                    _thr_pre     = FORWARD_BCHECK_MAX_CC_PCT
+                    _min_px_pre  = max(
+                        FORWARD_BCHECK_MIN_CC_PIXELS,
+                        int(_wok_px_pre * FORWARD_BCHECK_MIN_CC_WOK_RATIO),
+                    )
                     _valid_pre   = int((_fg_pre[:, cv2.CC_STAT_AREA] >= _min_px_pre).sum())
-                    _discard_pre = (_max_pct_pre > _thr_pre) or (_valid_pre > 5)
+                    _discard_pre = (
+                        (_max_pct_pre > _thr_pre)
+                        or (_valid_pre > FORWARD_BCHECK_MAX_VALID_COMPONENTS)
+                    )
                     if _discard_pre:
                         _reason_pre = (f"最大连通域={_max_pct_pre:.1f}%>{_thr_pre:.0f}%"
                                        if _max_pct_pre > _thr_pre
-                                       else f"有效连通域={_valid_pre}>5（碎片化）")
+                                       else f"有效连通域={_valid_pre}>{FORWARD_BCHECK_MAX_VALID_COMPONENTS}（碎片化）")
                         _max_idx_pre = int(_fg_pre[:, cv2.CC_STAT_AREA].argmax()) + 1
                         _cm_cand     = (_cc_lbl_pre == _max_idx_pre)
                         _cand_pct    = _cm_cand.sum() / max(_wok_px_pre, 1) * 100
-                        if _cand_pct > 25.0:
+                        if _cand_pct > FORWARD_BCHECK_DISCARD_CC_PCT:
                             carry_mask = None
                             last_relabel_s = -999   # 强制本批重标点
                             print(f"[B-check早检] 批次{chunk_i+1} {_reason_pre}，"
-                                  f"最大连通域仍={_cand_pct:.1f}%>25%，discard+强制重标")
+                                  f"最大连通域仍={_cand_pct:.1f}%>{FORWARD_BCHECK_DISCARD_CC_PCT:.0f}%，discard+强制重标")
                         else:
                             carry_mask = _cm_cand
                             print(f"[B-check早检] 批次{chunk_i+1} {_reason_pre}，"
@@ -2080,6 +2412,74 @@ def main():
                     bg_run = []
                     print(f"[forward-reset] chunk {chunk_i+1} starts from current IR relabel points only")
 
+                if not _skip_sam2_tilt:
+                    try:
+                        _chunk_rgb0 = cv2.imread(os.path.join(tmp_dir, frame_names[0]))
+                        _frame0_injects = [
+                            _inject for _inject in inject_this_chunk
+                            if int(_inject.get("local_frame", -1)) == 0
+                            and ((_inject.get("fg_points") or []) or (_inject.get("bg_points") or []))
+                        ]
+                        _frame0_fg_pts, _frame0_bg_pts = _merge_inject_points(_frame0_injects)
+                        _inject_labels = [
+                            str(_inject.get("label", "")).strip()
+                            for _inject in _frame0_injects
+                            if str(_inject.get("label", "")).strip()
+                        ]
+                        _forward_ref_source = "manual_initial" if chunk_i == 0 else "manual_fallback"
+                        _forward_ref_mask = None
+                        _forward_ref_fg = list(fg_run or [])
+                        _forward_ref_bg = list(bg_run or [])
+                        if carry_mask_infer is not None and np.any(carry_mask_infer):
+                            _forward_ref_source = "reuse_carry"
+                            _forward_ref_mask = carry_mask_infer
+                            _forward_ref_fg = list(_frame0_fg_pts)
+                            _forward_ref_bg = list(_frame0_bg_pts)
+                            if _frame0_injects:
+                                _forward_ref_source = "reuse_carry_plus_inject"
+                        elif _reinforce_inject is not None:
+                            _forward_ref_source = "IR_relabel"
+                            _forward_ref_fg = list(_reinforce_inject.get("fg_points", []) or [])
+                            _forward_ref_bg = list(_reinforce_inject.get("bg_points", []) or [])
+                        elif _frame0_injects:
+                            _forward_ref_source = "frame0_inject"
+                            _forward_ref_fg = list(_frame0_fg_pts)
+                            _forward_ref_bg = list(_frame0_bg_pts)
+
+                        _forward_ref_lines = [
+                            f"chunk={chunk_i+1}  restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
+                            f"source={_forward_ref_source}  carry={'1' if _forward_ref_mask is not None and np.any(_forward_ref_mask) else '0'}",
+                            f"FG={len(_forward_ref_fg)}  BG={len(_forward_ref_bg)}  frame0_injects={len(_frame0_injects)}",
+                        ]
+                        if _inject_labels:
+                            _forward_ref_lines.append(
+                                "frame0_labels=" + ",".join(_inject_labels[:3])
+                            )
+                        _forward_ref_path = _chunk_ref_debug.build_chunk_reference_path(
+                            forward_chunk_ref_dir,
+                            "forward",
+                            chunk_i + 1,
+                            chunk_start_s,
+                            chunk_start_abs,
+                            _forward_ref_source,
+                        )
+                        _chunk_ref_debug.save_rgb_chunk_reference(
+                            _forward_ref_path,
+                            _chunk_rgb0,
+                            "FORWARD chunk reference",
+                            detail_lines=_forward_ref_lines,
+                            wok_rgb_constraint=_wok_rgb_constraint,
+                            carry_mask=_forward_ref_mask,
+                            fg_points=_forward_ref_fg,
+                            bg_points=_forward_ref_bg,
+                            action_tag=_forward_ref_source,
+                            fg_color=(0, 255, 255),
+                            bg_color=(255, 80, 0),
+                            legend_line="[red=carry mask | yellow=FG | blue=BG]",
+                        )
+                    except Exception:
+                        pass
+
                 if _skip_sam2_tilt:
                     # 倾斜冻结：SAM2 跳过，本批所有帧输出空 mask（锅直立期无食材）
                     # 清零 carry_mask，避免漂移碎片遗留在锅外侧
@@ -2105,9 +2505,9 @@ def main():
 
                 # ── B：carry_mask 连通域可靠性检查 ────────────────────────────
                 # 检查两个指标，任一不满足则标记 carry_mask 为不可信（置 None）：
-                #   1. 最大连通域面积 / wok 区域面积 > 25%（接近整锅）
+                #   1. 最大连通域面积 / wok 区域面积超过阈值（接近整锅）
                 #   2. 有效连通域数量 > 5 个（碎片化，SAM2 追踪失控）
-                if carry_mask is not None and _wok_rgb_constraint is not None:
+                if ENABLE_FORWARD_BCHECK and carry_mask is not None and _wok_rgb_constraint is not None:
                     _cm_u8_b = carry_mask.astype(np.uint8) * 255
                     _cc_n, _cc_labels, _cc_stats, _ = cv2.connectedComponentsWithStats(
                         _cm_u8_b, connectivity=8
@@ -2120,29 +2520,31 @@ def main():
                         _max_cc_area = int(_fg_components[:, cv2.CC_STAT_AREA].max())
                         _max_cc_pct  = _max_cc_area / max(_wok_px_b, 1) * 100
                         # 过滤掉面积 < 0.5% wok 的碎片，只数"有效"连通域
-                        _min_cc_px   = max(100, int(_wok_px_b * 0.005))
+                        _min_cc_px   = max(
+                            FORWARD_BCHECK_MIN_CC_PIXELS,
+                            int(_wok_px_b * FORWARD_BCHECK_MIN_CC_WOK_RATIO),
+                        )
                         _valid_cc    = int((_fg_components[:, cv2.CC_STAT_AREA] >= _min_cc_px).sum())
-                        # 倾斜期间锅内食材快速位移，提前检测语义反转（30% < 50%）
-                        _bcheck_thr = 30.0 if _wok_tilting else 50.0
+                        _bcheck_thr = FORWARD_BCHECK_MAX_CC_PCT
                         if _max_cc_pct > _bcheck_thr:
                             _carry_unreliable = True
                             print(f"[B-check] 批次{chunk_i+1}末 carry_mask 最大连通域"
-                                  f"={_max_cc_pct:.1f}%>{'30(倾斜)' if _wok_tilting else '50'}%"
+                                  f"={_max_cc_pct:.1f}%>{_bcheck_thr:.0f}%"
                                   f"（接近整锅），标记不可信")
-                        elif _valid_cc > 5:
+                        elif _valid_cc > FORWARD_BCHECK_MAX_VALID_COMPONENTS:
                             _carry_unreliable = True
                             print(f"[B-check] 批次{chunk_i+1}末 carry_mask 有效连通域"
-                                  f"={_valid_cc}>5（碎片化），标记不可信")
+                                  f"={_valid_cc}>{FORWARD_BCHECK_MAX_VALID_COMPONENTS}（碎片化），标记不可信")
                     if _carry_unreliable:
                         # 不直接 None，而是缩小为仅保留最大连通域（减少硬重置次数）
                         if len(_fg_components) > 0:
                             _max_cc_idx = int(_fg_components[:, cv2.CC_STAT_AREA].argmax()) + 1
                             carry_mask = (_cc_labels == _max_cc_idx)
                             _new_pct = carry_mask.sum() / max(_wok_px_b, 1) * 100
-                            if _new_pct > 25.0:
+                            if _new_pct > FORWARD_BCHECK_DISCARD_CC_PCT:
                                 # 最大单连通域还是过大，才真正 discard
                                 carry_mask = None
-                                print(f"[B-check] 最大单连通域仍={_new_pct:.1f}%>25%，"
+                                print(f"[B-check] 最大单连通域仍={_new_pct:.1f}%>{FORWARD_BCHECK_DISCARD_CC_PCT:.0f}%，"
                                       f"discard carry_mask")
                             else:
                                 print(f"[B-check] 保留最大单连通域({_new_pct:.1f}%)，"
@@ -2167,6 +2569,10 @@ def main():
                         )
                         _bottom_fg_run = bottom_fg_points
                         _bottom_bg_run = bottom_bg_points
+                        _bottom_ref_source = "manual_initial"
+                        _bottom_ref_mask = None
+                        _bottom_ref_fg = list(_bottom_fg_run or [])
+                        _bottom_ref_bg = list(_bottom_bg_run or [])
                         if (False and temp_data is not None and homography is not None
                                 and wok_mask_ir is not None
                                 and _wok_rgb_constraint is not None):
@@ -2180,13 +2586,24 @@ def main():
                                     f"{chunk_start_s:.0f}",
                                     chunk_start_abs,
                                 )
-                                _auto_fg_b, _auto_bg_b, _auto_ok_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
+                                _auto_fg_b, _auto_bg_b, _auto_ok_b, _auto_dbg_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
                                     _rgb_b0, _ir_b0, wok_mask_ir, _H_inv_bottom,
                                     _wok_rgb_constraint,
+                                    n_fg=INVERSE_IR_RELABEL_N_FG,
+                                    n_bg=INVERSE_IR_RELABEL_N_BG,
                                     rng=_rng_al,
                                     preview_path=_prev_btm,
+                                    bg_min_gray=INVERSE_IR_RELABEL_BG_MIN_GRAY,
+                                    fg_max_gray=INVERSE_IR_RELABEL_FG_MAX_GRAY,
+                                    axis_cx=_axis_cx_rgb_dyn,
+                                    axis_cy=_axis_cy_rgb_dyn,
+                                    axis_excl_r=_AXIS_EXCL_R,
+                                    axis_ir_cx=_wok_cx,
+                                    axis_ir_cy=_wok_cy,
+                                    axis_ir_excl_r=_AXIS_IR_EXCL_R,
                                     seg_mode=IR_FOOD_SEG_MODE,
                                     seg_percentile=IR_FOOD_SEG_PERCENTILE,
+                                    return_debug=True,
                                 )
                                 _auto_pts_b = _rgb_inverse.build_inverse_point_result(
                                     _auto_fg_b, _auto_bg_b, _auto_ok_b
@@ -2218,12 +2635,20 @@ def main():
                                     / max(int(_wok_rgb_constraint.sum()), 1)
                                     * 100.0
                                 )
-                                _carry_inv_reset = _rgb_inverse.evaluate_inverse_reset(_carry_inv_ratio)
+                                _carry_inv_reset = _rgb_inverse.evaluate_inverse_reset(
+                                    _carry_inv_ratio,
+                                    min_ratio=INVERSE_RESET_MIN_RATIO,
+                                    max_ratio=INVERSE_RESET_MAX_RATIO,
+                                )
                             if _carry_inv_reset is not None and not _carry_inv_reset["need_reset"]:
                                 if _bottom_carry is not None and do_resize:
                                     _bc_infer = upscale_mask(_bottom_carry, infer_wh)
                                 else:
                                     _bc_infer = _bottom_carry
+                                _bottom_ref_source = "reuse_carry"
+                                _bottom_ref_mask = _bc_infer
+                                _bottom_ref_fg = []
+                                _bottom_ref_bg = []
                                 _append_violation_event_action(
                                     _reset_violation_name,
                                     "reuse_carry",
@@ -2275,9 +2700,11 @@ def main():
                                     )
                                     if _old_inv_mask_btm is None and _bottom_reset_run.get("old_mask") is not None:
                                         _old_inv_mask_btm = _bottom_reset_run.get("old_mask")
-                                    _auto_fg_b, _auto_bg_b, _auto_ok_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
+                                    _auto_fg_b, _auto_bg_b, _auto_ok_b, _auto_dbg_b = _rgb_inverse.generate_inverse_bottom_points_from_ir(
                                         _rgb_b0, _ir_b0, wok_mask_ir, _H_inv_bottom,
                                         _wok_rgb_constraint,
+                                        n_fg=INVERSE_IR_RELABEL_N_FG,
+                                        n_bg=INVERSE_IR_RELABEL_N_BG,
                                         rng=_rng_al,
                                         preview_path=_prev_btm,
                                         old_mask=_old_inv_mask_btm,
@@ -2288,6 +2715,11 @@ def main():
                                         axis_cx=_axis_cx_rgb_dyn,
                                         axis_cy=_axis_cy_rgb_dyn,
                                         axis_excl_r=_AXIS_EXCL_R,
+                                        bg_min_gray=INVERSE_IR_RELABEL_BG_MIN_GRAY,
+                                        fg_max_gray=INVERSE_IR_RELABEL_FG_MAX_GRAY,
+                                        axis_ir_cx=_wok_cx,
+                                        axis_ir_cy=_wok_cy,
+                                        axis_ir_excl_r=_AXIS_IR_EXCL_R,
                                         seg_mode=IR_FOOD_SEG_MODE,
                                         seg_percentile=IR_FOOD_SEG_PERCENTILE,
                                         detail_lines=[
@@ -2298,6 +2730,7 @@ def main():
                                             "decision=IR_relabel",
                                         ],
                                         action_tag="IR_relabel",
+                                        return_debug=True,
                                     )
                                     _food_ir_inv = _temp_fusion.build_ir_food_mask_by_temperature(
                                         _ir_b0, wok_mask_ir, min_cluster_gap=30.0,
@@ -2321,6 +2754,9 @@ def main():
                                         ],
                                         food_mask=_food_ir_inv,
                                         hot_mask=_hot_ir_inv,
+                                        fg_points_ir=(_auto_dbg_b or {}).get("fg_ir_points"),
+                                        bg_points_ir=(_auto_dbg_b or {}).get("bg_ir_points"),
+                                        axis_guard_mask=(_auto_dbg_b or {}).get("axis_guard_ir"),
                                     )
                                     _auto_pts_b = _rgb_inverse.build_inverse_point_result(
                                         _auto_fg_b, _auto_bg_b, _auto_ok_b
@@ -2334,47 +2770,131 @@ def main():
                                         )
                                         _bottom_fg_run = _auto_pts_b["fg_points"]
                                         _bottom_bg_run = _auto_pts_b["bg_points"]
+                                        _bottom_ref_source = "IR_relabel"
+                                        _bottom_ref_mask = None
+                                        _bottom_ref_fg = list(_bottom_fg_run)
+                                        _bottom_ref_bg = list(_bottom_bg_run)
                                         print(f"[InvAutoRestart] chunk={chunk_i+1} "
                                               f"start_frame={chunk_start_abs} {_reset_reason}"
                                               f"{_reset_msg} FG-hot={len(_bottom_fg_run)} "
                                               f"BG-food={len(_bottom_bg_run)} "
                                               f"preview={os.path.basename(_prev_btm)}")
                                     else:
-                                        _append_violation_event_action(
-                                            _reset_violation_name,
-                                            "manual_fallback",
-                                            (f"next_chunk_action=manual_fallback  "
-                                             f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
+                                        (_bottom_ref_source, _bottom_ref_mask,
+                                         _bottom_ref_fg, _bottom_ref_bg) = (
+                                            _set_inverse_manual_fallback(
+                                                _reset_violation_name,
+                                                chunk_start_s,
+                                                chunk_start_abs,
+                                                _bottom_fg_run,
+                                                _bottom_bg_run,
+                                                chunk_i,
+                                                _reset_reason,
+                                                _reset_msg,
+                                                "IR_points_unavailable fallback=manual",
+                                            )
                                         )
-                                        print(f"[InvAutoRestart] chunk={chunk_i+1} "
-                                              f"start_frame={chunk_start_abs} {_reset_reason}"
-                                              f"{_reset_msg} IR_points_unavailable fallback=manual")
                                 except Exception as _bae:
-                                    _append_violation_event_action(
-                                        _reset_violation_name,
-                                        "manual_fallback",
-                                        (f"next_chunk_action=manual_fallback  "
-                                         f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
+                                    (_bottom_ref_source, _bottom_ref_mask,
+                                     _bottom_ref_fg, _bottom_ref_bg) = (
+                                        _set_inverse_manual_fallback(
+                                            _reset_violation_name,
+                                            chunk_start_s,
+                                            chunk_start_abs,
+                                            _bottom_fg_run,
+                                            _bottom_bg_run,
+                                            chunk_i,
+                                            _reset_reason,
+                                            _reset_msg,
+                                            f"failed: {_bae}",
+                                        )
                                     )
-                                    print(f"[InvAutoRestart] chunk={chunk_i+1} "
-                                          f"start_frame={chunk_start_abs} {_reset_reason}"
-                                          f"{_reset_msg} failed: {_bae}")
                             else:
                                 if _bottom_auto_reset is not None:
-                                    _append_violation_event_action(
-                                        _reset_violation_name,
-                                        "manual_fallback",
-                                        (f"next_chunk_action=manual_fallback  "
-                                         f"restart_t={chunk_start_s:.1f}s  frame={chunk_start_abs}"),
+                                    (_bottom_ref_source, _bottom_ref_mask,
+                                     _bottom_ref_fg, _bottom_ref_bg) = (
+                                        _set_inverse_manual_fallback(
+                                            _reset_violation_name,
+                                            chunk_start_s,
+                                            chunk_start_abs,
+                                            _bottom_fg_run,
+                                            _bottom_bg_run,
+                                            chunk_i,
+                                            _reset_reason,
+                                            _reset_msg,
+                                            "missing_ir_context fallback=manual",
+                                        )
                                     )
-                                    print(f"[InvAutoRestart] chunk={chunk_i+1} "
-                                          f"start_frame={chunk_start_abs} {_reset_reason}"
-                                          f"{_reset_msg} missing_ir_context fallback=manual")
                             _bottom_auto_reset = None
                         elif _bottom_carry is not None and do_resize:
                             _bc_infer = upscale_mask(_bottom_carry, infer_wh)
+                            _bottom_ref_source = "reuse_carry"
+                            _bottom_ref_mask = _bc_infer
+                            _bottom_ref_fg = []
+                            _bottom_ref_bg = []
                         else:
                             _bc_infer = _bottom_carry
+                            if _bc_infer is not None:
+                                _bottom_ref_source = "reuse_carry"
+                                _bottom_ref_mask = _bc_infer
+                                _bottom_ref_fg = []
+                                _bottom_ref_bg = []
+                        try:
+                            _inv_rgb0 = cv2.imread(os.path.join(tmp_dir, frame_names[0]))
+                            _inv_frame0_injects = [
+                                _inject for _inject in (_bottom_inject or [])
+                                if int(_inject.get("local_frame", -1)) == 0
+                                and ((_inject.get("fg_points") or []) or (_inject.get("bg_points") or []))
+                            ]
+                            _inv_inject_fg, _inv_inject_bg = _merge_inject_points(_inv_frame0_injects)
+                            _inv_labels = [
+                                str(_inject.get("label", "")).strip()
+                                for _inject in _inv_frame0_injects
+                                if str(_inject.get("label", "")).strip()
+                            ]
+                            _inv_ref_fg = list(_bottom_ref_fg)
+                            _inv_ref_bg = list(_bottom_ref_bg)
+                            _inv_ref_source_show = _bottom_ref_source
+                            if _bottom_ref_mask is not None and np.any(_bottom_ref_mask):
+                                _inv_ref_fg = list(_inv_inject_fg)
+                                _inv_ref_bg = list(_inv_inject_bg)
+                                if _inv_frame0_injects:
+                                    _inv_ref_source_show = f"{_bottom_ref_source}_plus_inject"
+                            elif _inv_frame0_injects and _bottom_ref_source == "manual_initial":
+                                _inv_ref_source_show = "manual_initial_plus_inject"
+                                _inv_ref_fg = list(_inv_inject_fg)
+                                _inv_ref_bg = list(_inv_inject_bg)
+                            _inv_ref_lines = [
+                                f"chunk={chunk_i+1}  restart_t={chunk_start_s:.1f}s  restart_frame={chunk_start_abs}",
+                                f"source={_inv_ref_source_show}  carry={'1' if _bottom_ref_mask is not None and np.any(_bottom_ref_mask) else '0'}",
+                                f"FG={len(_inv_ref_fg)}  BG={len(_inv_ref_bg)}  frame0_injects={len(_inv_frame0_injects)}",
+                            ]
+                            if _inv_labels:
+                                _inv_ref_lines.append("frame0_labels=" + ",".join(_inv_labels[:3]))
+                            _inv_ref_path = _chunk_ref_debug.build_chunk_reference_path(
+                                inverse_chunk_ref_dir,
+                                "inverse",
+                                chunk_i + 1,
+                                chunk_start_s,
+                                chunk_start_abs,
+                                _inv_ref_source_show,
+                            )
+                            _chunk_ref_debug.save_rgb_chunk_reference(
+                                _inv_ref_path,
+                                _inv_rgb0,
+                                "INVERSE chunk reference",
+                                detail_lines=_inv_ref_lines,
+                                wok_rgb_constraint=_wok_rgb_constraint,
+                                carry_mask=_bottom_ref_mask,
+                                fg_points=_inv_ref_fg,
+                                bg_points=_inv_ref_bg,
+                                action_tag=_inv_ref_source_show,
+                                fg_color=(0, 255, 80),
+                                bg_color=(255, 80, 0),
+                                legend_line="[red=bottom carry mask | green=FG-hot | blue=BG-food]",
+                            )
+                        except Exception:
+                            pass
                         bottom_chunk_masks, _bottom_carry_raw = track_chunk(
                             predictor, tmp_dir, frame_names,
                             _bottom_fg_run, _bottom_bg_run,
@@ -2436,15 +2956,38 @@ def main():
                 # 手进入、语义反转等情况下 SAM2 mask 瞬间暴涨，
                 # 不等批次结束，每帧即时用 IR K-means 重新圈选食材
                 _frame_corrected = False
-                if (_wok_rgb_constraint is not None
+                if (False and _wok_rgb_constraint is not None
                         and temp_data is not None
                         and _wok_mask_al is not None
                         and _H_inv_al is not None):
                     _wok_px_fr = int(_wok_rgb_constraint.sum())
                     _mask_px_fr = int(mask.sum())
                     _ratio_fr = _mask_px_fr / max(_wok_px_fr, 1) * 100
-                    if _ratio_fr > 50.0:
-                        print(f"[IR-fix触发] t={abs_idx/fps:.1f}s  mask={_ratio_fr:.1f}%>50%，尝试IR校正")
+                    _irfix_metrics = _rgb_forward.compute_forward_reset_metrics(
+                        mask,
+                        _wok_rgb_constraint,
+                        VW * VH,
+                        last_reinforce_wok_pct,
+                        axis_cx=_axis_cx_rgb_dyn,
+                        axis_cy=_axis_cy_rgb_dyn,
+                        axis_excl_r=_FORWARD_AXIS_EXCL_R,
+                    )
+                    _irfix_axis_now = _rgb_forward.is_forward_axis_stuck_frame(
+                        _irfix_metrics,
+                        _FORWARD_AXIS_EXCL_R,
+                    )
+                    _irfix_axis_streak = (
+                        _forward_axis_stuck_streak + 1 if _irfix_axis_now else 0
+                    )
+                    _irfix_decision = _rgb_forward.evaluate_forward_reset(
+                        _irfix_metrics,
+                        last_reinforce_wok_pct,
+                        axis_stuck_streak=_irfix_axis_streak,
+                        axis_stuck_min_frames=_FORWARD_AXIS_STUCK_FRAMES,
+                        axis_excl_r=_FORWARD_AXIS_EXCL_R,
+                    )
+                    if _irfix_decision["need_reset"]:
+                        print(f"[IR-fix触发] t={abs_idx/fps:.1f}s  reason={_irfix_decision['reason']}  mask_vs_wok={_irfix_metrics['mask_vs_wok']:.1f}%，尝试IR校正")
                         try:
                             _ir_idx_fr = _get_ir_idx(abs_idx)
                             _ir_frm_fr = temp_data[_ir_idx_fr]
@@ -2455,6 +2998,7 @@ def main():
                             if _food_ir is not None:
                                     _ys_f, _xs_f = np.where(_food_ir > 0)
                                     if len(_xs_f) >= 6:
+                                        _old_mask_irfix = mask.copy()
                                         _pts_h = np.stack([_xs_f.astype(float),
                                                            _ys_f.astype(float),
                                                            np.ones(len(_xs_f))])
@@ -2485,6 +3029,31 @@ def main():
                                             _frame_corrected = True
                                             _irfix_count += 1
                                             _irfix_last_mask = _new_mask
+                                            try:
+                                                _irfix_compare_path = os.path.join(
+                                                    ir_fix_compare_dir,
+                                                    (
+                                                        f"irfix_t{abs_idx/fps:06.1f}s_f{abs_idx}_"
+                                                        f"ir{_ir_idx_fr}_reason_{_irfix_decision['reason']}.jpg"
+                                                    ),
+                                                )
+                                                _chunk_ref_debug.save_irfix_mask_comparison(
+                                                    _irfix_compare_path,
+                                                    frame,
+                                                    "IR-fix mask comparison",
+                                                    detail_lines=[
+                                                        f"time={abs_idx/fps:.1f}s  frame={abs_idx}  ir_idx={_ir_idx_fr}",
+                                                        f"reason={_irfix_decision['reason']}",
+                                                        f"old_mask_vs_wok={_irfix_metrics['mask_vs_wok']:.1f}%",
+                                                        f"new_mask_vs_wok={_new_ratio:.1f}%",
+                                                    ],
+                                                    wok_rgb_constraint=_wok_rgb_constraint,
+                                                    original_mask=_old_mask_irfix,
+                                                    fixed_mask=_new_mask,
+                                                    action_tag="IR-fix",
+                                                )
+                                            except Exception:
+                                                pass
                                             print(f"[IR-fix成功] t={abs_idx/fps:.1f}s  新mask={_new_ratio:.1f}%")
                                         else:
                                             print(f"[IR-fix拒绝] 新mask={_new_ratio:.1f}%>50%，保留原mask")
@@ -2497,6 +3066,7 @@ def main():
 
                 time_s     = abs_idx / fps
                 mask_ratio = mask.sum() / mask.size * 100
+                forward_temp_valid = not np.isnan(temp_mean)
                 # Forward violation logging is event-based:
                 # once one bad frame opens a pending reset event, we keep only that
                 # first failing frame and wait for the next chunk-start decision
@@ -2510,25 +3080,49 @@ def main():
                             last_reinforce_wok_pct,
                             axis_cx=_axis_cx_rgb_dyn,
                             axis_cy=_axis_cy_rgb_dyn,
-                            axis_excl_r=_AXIS_EXCL_R,
+                            axis_excl_r=_FORWARD_AXIS_EXCL_R,
                         )
                         _axis_stuck_now = _rgb_forward.is_forward_axis_stuck_frame(
                             _frame_reset_metrics,
-                            _AXIS_EXCL_R,
+                            _FORWARD_AXIS_EXCL_R,
+                        )
+                        _upper_wok_stuck_now = (
+                            FORWARD_UPPER_WOK_ENABLE
+                            and _rgb_forward.is_forward_upper_wok_stuck_frame(
+                                _frame_reset_metrics,
+                                min_upper_ratio_pct=FORWARD_UPPER_WOK_RATIO,
+                                min_mask_vs_wok=FORWARD_UPPER_WOK_MIN_MASK_PCT,
+                                max_mask_vs_wok=FORWARD_UPPER_WOK_MAX_MASK_PCT,
+                            )
                         )
                         _forward_axis_stuck_streak = (
                             _forward_axis_stuck_streak + 1 if _axis_stuck_now else 0
                         )
+                        _forward_upper_wok_stuck_streak = (
+                            _forward_upper_wok_stuck_streak + 1 if _upper_wok_stuck_now else 0
+                        )
+                        _forward_final_decision = _rgb_forward.evaluate_forward_reset(
+                            _frame_reset_metrics,
+                            last_reinforce_wok_pct,
+                            axis_stuck_streak=_forward_axis_stuck_streak,
+                            axis_stuck_min_frames=_FORWARD_AXIS_STUCK_FRAMES,
+                            axis_excl_r=_FORWARD_AXIS_EXCL_R,
+                            upper_wok_stuck_streak=(
+                                _forward_upper_wok_stuck_streak if FORWARD_UPPER_WOK_ENABLE else 0
+                            ),
+                            upper_wok_stuck_min_frames=FORWARD_UPPER_WOK_STUCK_FRAMES,
+                            upper_wok_min_ratio_pct=FORWARD_UPPER_WOK_RATIO,
+                            upper_wok_min_mask_vs_wok=FORWARD_UPPER_WOK_MIN_MASK_PCT,
+                            upper_wok_max_mask_vs_wok=FORWARD_UPPER_WOK_MAX_MASK_PCT,
+                        )
+                        if _forward_final_decision["need_reset"]:
+                            forward_temp_valid = False
                         if _pending_forward_violation is None:
-                            _frame_reset_decision = _rgb_forward.evaluate_forward_reset(
-                                _frame_reset_metrics,
-                                last_reinforce_wok_pct,
-                                axis_stuck_streak=_forward_axis_stuck_streak,
-                                axis_stuck_min_frames=_FORWARD_AXIS_STUCK_FRAMES,
-                                axis_excl_r=_AXIS_EXCL_R,
-                            )
+                            _frame_reset_decision = _forward_final_decision
                             if _frame_reset_decision["need_reset"]:
                                 _frame_reset_metrics["axis_stuck_streak"] = _forward_axis_stuck_streak
+                                if FORWARD_UPPER_WOK_ENABLE:
+                                    _frame_reset_metrics["upper_wok_stuck_streak"] = _forward_upper_wok_stuck_streak
                                 _frame_reason = _rgb_forward.resolve_forward_reset_reason(
                                     _frame_reset_metrics["mask_vs_wok"],
                                     _frame_reset_metrics["overlap_pct"],
@@ -2538,6 +3132,14 @@ def main():
                                     centroid_dist_px=_frame_reset_metrics.get("centroid_dist_px"),
                                     axis_stuck_streak=_forward_axis_stuck_streak,
                                     axis_stuck_min_frames=_FORWARD_AXIS_STUCK_FRAMES,
+                                    upper_wok_ratio_pct=(
+                                        _frame_reset_metrics.get("upper_wok_ratio_pct")
+                                        if FORWARD_UPPER_WOK_ENABLE else None
+                                    ),
+                                    upper_wok_stuck_streak=(
+                                        _forward_upper_wok_stuck_streak if FORWARD_UPPER_WOK_ENABLE else 0
+                                    ),
+                                    upper_wok_stuck_min_frames=FORWARD_UPPER_WOK_STUCK_FRAMES,
                                 )
                                 _violation_name = (
                                     f"forward_t{time_s:.0f}s_f{abs_idx}_"
@@ -2557,6 +3159,12 @@ def main():
                                         (f"axis_overlap={_frame_reset_metrics['axis_overlap_pct']:.1f}%  "
                                          f"centroid={_frame_reset_metrics['centroid_dist_px']:.1f}px  "
                                          f"streak={_forward_axis_stuck_streak}")
+                                    )
+                                if (FORWARD_UPPER_WOK_ENABLE
+                                        and _frame_reset_metrics.get("upper_wok_ratio_pct") is not None):
+                                    _detail_lines.append(
+                                        (f"upper_wok={_frame_reset_metrics['upper_wok_ratio_pct']:.1f}%  "
+                                         f"upper_streak={_forward_upper_wok_stuck_streak}")
                                     )
                                 _save_violation_event_image(
                                     _violation_name,
@@ -2628,7 +3236,12 @@ def main():
                 if wok_mask_ir is not None and temp_data is not None:
                     ir_idx_wok = _get_ir_idx(abs_idx)
                     ir_mask_temp = _temp_fusion.estimate_ir_wok_food_temperature(
-                        temp_data, ir_idx_wok, wok_mask_ir)
+                        temp_data,
+                        ir_idx_wok,
+                        wok_mask_ir,
+                        seg_mode=IR_FOOD_SEG_MODE,
+                        seg_percentile=IR_FOOD_SEG_PERCENTILE,
+                    )
                 if not np.isnan(ir_mask_temp):
                     ir_mask_history.append((time_s, ir_mask_temp))
 
@@ -2671,7 +3284,11 @@ def main():
                             _wok_px_inv = int(_dyn_wok_bool.sum())
                             _raw_inv_ratio = int(_raw_inv_mask.sum()) / max(_wok_px_inv, 1) * 100
                             _inv_mask_override = None
-                            _inv_reset = _rgb_inverse.evaluate_inverse_reset(_raw_inv_ratio)
+                            _inv_reset = _rgb_inverse.evaluate_inverse_reset(
+                                _raw_inv_ratio,
+                                min_ratio=INVERSE_RESET_MIN_RATIO,
+                                max_ratio=INVERSE_RESET_MAX_RATIO,
+                            )
                             _inv_too_large = _inv_reset["too_large"]
                             _inv_too_small = _inv_reset["too_small"]
                             if _inv_reset["need_reset"]:
@@ -2751,7 +3368,11 @@ def main():
                                     print(f"[Inv兜底] frame={abs_idx}  {_inv_fail_desc} "
                                           f"inv_ratio={_raw_inv_ratio:.1f}%  "
                                           f"使用上一帧有效bottom_mask  streak={_bottom_fail_streak}")
-                            elif _rgb_inverse.is_inverse_ratio_stable(_raw_inv_ratio):
+                            elif _rgb_inverse.is_inverse_ratio_stable(
+                                _raw_inv_ratio,
+                                min_ratio=INVERSE_RESET_MIN_RATIO,
+                                max_ratio=INVERSE_RESET_MAX_RATIO,
+                            ):
                                 _bottom_fail_streak = 0
                             _inv_mask = (_inv_mask_override
                                          if _inv_mask_override is not None
@@ -2792,12 +3413,36 @@ def main():
                 if not np.isnan(inverse_temp_mean):
                     inverse_history.append((time_s, inverse_temp_mean))
                 inverse_rows.append([abs_idx, local_idx, time_s, inverse_temp_mean])
+                final_decision = _final_temperature.select_final_temperature(
+                    temp_mean,
+                    ir_mask_temp,
+                    inverse_temp_mean,
+                    roi_temp_mean,
+                    forward_valid=forward_temp_valid,
+                    previous_final_temp=_last_final_temp,
+                )
+                final_temp = final_decision["final_temp"]
+                final_source = final_decision["source"]
+                final_reason = final_decision["reason"]
+                if not np.isnan(final_temp):
+                    final_history.append((time_s, final_temp))
+                    _last_final_temp = final_temp
+                final_rows.append([
+                    abs_idx,
+                    local_idx,
+                    time_s,
+                    final_temp,
+                    final_source,
+                    final_reason,
+                ])
 
                 # ── info_bar 第二行：IR + Inv 温度追加（已算完后写入）────────
                 if not np.isnan(ir_mask_temp):
                     parts.append(f"IR:{ir_mask_temp:.1f}C")
                 if not np.isnan(inverse_temp_mean):
                     parts.append(f"Inv:{inverse_temp_mean:.1f}C")
+                if not np.isnan(final_temp):
+                    parts.append(f"Final:{final_temp:.1f}C[{final_source}]")
                 cv2.putText(info_bar, "  ".join(parts),
                             (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (100, 255, 200), 1)
 
@@ -2805,7 +3450,8 @@ def main():
                     temp_history, time_s, VW, CHART_H, CURVE_WIN_S,
                     roi_history=roi_history,
                     ir_mask_history=ir_mask_history,
-                    inverse_history=inverse_history if has_bottom else None)
+                    inverse_history=inverse_history if has_bottom else None,
+                    final_history=final_history)
                 writer.write(np.vstack([vis, info_bar, chart_bar]))
                 # 三策略数据分别记录
                 sam2_rows.append([abs_idx, local_idx, time_s,
@@ -2867,7 +3513,7 @@ def main():
             # 改进前：直接用 IR 粗糙 mask 替换 carry_mask，SAM2 边界能力浪费
             # 改进后：IR 只做"粗定位"，从 IR mask 内采样前景点存入 _next_inject，
             #         下批 SAM2 接收这些点 + carry_mask 一起精细化边界
-            if _irfix_count > actual * 0.5 and _irfix_last_mask is not None:
+            if False and _irfix_count > actual * 0.5 and _irfix_last_mask is not None:
                 # carry_mask 仍用 IR 末帧 mask 覆盖（确保跨批位置正确）
                 carry_mask = _irfix_last_mask.copy()
                 carry_mask_src_abs = chunk_start_abs + max(actual - 1, 0)
@@ -2888,16 +3534,16 @@ def main():
                             _fg_ni = []
                             for _xi_ni, _yi_ni in zip(_xs_ni[_sel_ni], _ys_ni[_sel_ni]):
                                 _xi_ni, _yi_ni = float(_xi_ni), float(_yi_ni)
-                                if _AXIS_CX_RGB is not None:
-                                    _d = ((_xi_ni-_AXIS_CX_RGB)**2+(_yi_ni-_AXIS_CY_RGB)**2)**0.5
-                                    if _d < _AXIS_EXCL_R:
+                                if _axis_cx_rgb_fg is not None:
+                                    _d = ((_xi_ni-_axis_cx_rgb_fg)**2+(_yi_ni-_axis_cy_rgb_fg)**2)**0.5
+                                    if _FORWARD_AXIS_FG_EXCL_R is not None and _d < _FORWARD_AXIS_FG_EXCL_R:
                                         continue
                                 _fg_ni.append([_xi_ni, _yi_ni])
                             if _fg_ni:
                                 _next_inject = _rgb_forward.build_forward_ir_inject(
                                     _fg_ni,
-                                    _AXIS_CX_RGB,
-                                    _AXIS_CY_RGB,
+                                    _axis_cx_rgb_fg,
+                                    _axis_cy_rgb_fg,
                                     label="IR-fix-next",
                                 )
                                 print(f"[IR-fix接管] 已生成下批注入前景点 {len(_fg_ni)} 个"
@@ -3017,12 +3663,14 @@ def main():
     # ── 保存三策略独立 Excel（含 inverse）────────────────────────────────────
     _output_utils._save_three_xlsx(
         sam2_rows, roi_rows, ir_rows, out_dir,
-        inverse_rows=inverse_rows if has_bottom else None)
+        inverse_rows=inverse_rows if has_bottom else None,
+        final_rows=final_rows)
 
     # ── 绘制三策略温度曲线 PNG（含 inverse）──────────────────────────────────
     _output_utils._plot_three_curves(
         sam2_rows, roi_rows, ir_rows, out_curve,
-        inverse_rows=inverse_rows if has_bottom else None)
+        inverse_rows=inverse_rows if has_bottom else None,
+        final_rows=final_rows)
 
     # ── 拼合 RGB + IR 视频 ────────────────────────────────────────────────────
     if temp_data is not None and wok_cfg is not None:

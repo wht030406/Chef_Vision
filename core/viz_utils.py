@@ -13,9 +13,91 @@ def render_overlay(frame_bgr, mask, color_bgr, alpha):
     return vis
 
 
+def _draw_final_temp_chart(final_history, cur_time_s, w, h, curve_win_s):
+    bar = np.zeros((h, w, 3), dtype=np.uint8)
+    pts = [(t, v) for t, v in (final_history or []) if not np.isnan(v)]
+    if len(pts) < 2:
+        cv2.putText(bar, "Final Temp (waiting for data...)",
+                    (10, max(18, h // 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (170, 170, 170), 1)
+        return bar
+
+    t0 = max(0.0, cur_time_s - curve_win_s)
+    pts = [(t, v) for t, v in pts if t >= t0]
+    if len(pts) < 2:
+        pts = final_history[-2:]
+
+    times = [p[0] for p in pts]
+    vals = [float(p[1]) for p in pts]
+    t_min = t0
+    t_max = max(cur_time_s, t0 + 1.0)
+    lo = float(np.percentile(vals, 5)) if len(vals) >= 8 else float(min(vals))
+    hi = float(np.percentile(vals, 95)) if len(vals) >= 8 else float(max(vals))
+    if hi <= lo:
+        hi = lo + 1.0
+    pad_v = max(2.0, (hi - lo) * 0.12)
+    v_min = max(0.0, float(np.floor((lo - pad_v) / 10.0) * 10.0))
+    v_max = float(np.ceil((hi + pad_v) / 10.0) * 10.0)
+    if v_max - v_min < 20.0:
+        mid = 0.5 * (v_min + v_max)
+        v_min = max(0.0, mid - 10.0)
+        v_max = mid + 10.0
+
+    pad_l, pad_r, pad_t, pad_b = 48, 12, 8, 18
+
+    def tx(t):
+        return pad_l + int((t - t_min) / (t_max - t_min) * (w - pad_l - pad_r))
+
+    def ty(v):
+        return pad_t + int((1.0 - (v - v_min) / (v_max - v_min)) * (h - pad_t - pad_b))
+
+    for v in np.arange(v_min, v_max + 0.1, 10.0):
+        yy = ty(v)
+        cv2.line(bar, (pad_l, yy), (w - pad_r, yy), (42, 42, 42), 1)
+        cv2.putText(bar, f"{v:.0f}", (2, yy + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (180, 180, 180), 1)
+
+    cv2.line(bar, (pad_l, pad_t), (pad_l, h - pad_b), (150, 150, 150), 1)
+    cv2.line(bar, (pad_l, h - pad_b), (w - pad_r, h - pad_b), (150, 150, 150), 1)
+    cv2.putText(bar, "[Final Output]", (pad_l + 4, pad_t + 11),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (40, 80, 255), 1)
+
+    screen_pts = [(tx(t), ty(v)) for t, v in zip(times, vals)]
+    for i in range(1, len(screen_pts)):
+        p1, p2 = screen_pts[i - 1], screen_pts[i]
+        if all(0 <= c < dim for c, dim in [(p1[0], w), (p1[1], h), (p2[0], w), (p2[1], h)]):
+            cv2.line(bar, p1, p2, (40, 80, 255), 2)
+
+    cx, cy = screen_pts[-1]
+    if 0 <= cx < w and 0 <= cy < h:
+        cv2.circle(bar, (cx, cy), 4, (40, 80, 255), -1)
+        cv2.putText(bar, f"Final:{vals[-1]:.1f}C", (cx + 6, cy + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (60, 120, 255), 1)
+    return bar
+
+
 def draw_temp_chart(temp_history, cur_time_s, w, h, curve_win_s=60,
-                    roi_history=None, ir_mask_history=None, inverse_history=None):
+                    roi_history=None, ir_mask_history=None, inverse_history=None,
+                    final_history=None):
     """Render the rolling temperature chart used in tracking videos."""
+    if final_history:
+        compare_h = max(72, int(h * 0.62))
+        final_h = max(40, h - compare_h)
+        compare_h = h - final_h
+        top = draw_temp_chart(
+            temp_history,
+            cur_time_s,
+            w,
+            compare_h,
+            curve_win_s,
+            roi_history=roi_history,
+            ir_mask_history=ir_mask_history,
+            inverse_history=inverse_history,
+            final_history=None,
+        )
+        bottom = _draw_final_temp_chart(final_history, cur_time_s, w, final_h, curve_win_s)
+        return np.vstack([top, bottom])
+
     bar = np.zeros((h, w, 3), dtype=np.uint8)
     if len(temp_history) < 2:
         cv2.putText(bar, "Mask Avg Temp (waiting for data...)",
