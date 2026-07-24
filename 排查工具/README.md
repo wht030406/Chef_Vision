@@ -16,4 +16,11 @@
 - `run_track_short.ps1`：快速运行短测流程的 PowerShell 脚本。
 - `relabel_test1_1.ps1`：针对 `test1_1` 的重新标注与运行辅助脚本。
 
+验证类（原在 `tools/`，2026-07-24 移入）：
+
+- `VerifyData.py`：检查采集温度 `.npy` 的形状、温度范围，并可视化第一帧热力图与全帧趋势。默认读 `data/temp_20260428_121546.npy`，可在脚本顶部改文件名。
+- `SegmentFood.py`：用 SAM2.1 对单帧预览图做自动分割验证，确认模型/权重工作正常。
+- `TempFilter.py`：温度过滤算法验证（Homography 对齐 RGB→IR + HSV 分割 + 四联可视化）。
+- `_check_syntax.py`：检查 `core/TrackFood.py` 语法是否正确的一次性小脚本。
+
 备注：这些工具主要服务于调试和阶段性验证，后续如果某个工具长期稳定使用，可以再从这里移回 `tools/` 或重构成正式模块。`ir_mask_viz.py` 因为会被合并视频输出调用，已放回 `core/ir_mask_viz.py`。

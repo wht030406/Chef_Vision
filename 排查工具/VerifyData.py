@@ -12,11 +12,12 @@ import os
 # ============================================================
 # 1. 加载数据
 # ============================================================
+# 默认验证主追踪温度数据；如需验证其它 .npy，改这里的文件名即可
 _HERE    = os.path.dirname(os.path.abspath(__file__))
-npy_path = os.path.join(_HERE, "..", "data", "temp_20260427_114341.npy")
+npy_path = os.path.join(_HERE, "..", "data", "temp_20260428_121546.npy")
 if not os.path.exists(npy_path):
     print(f"[错误] 文件不存在: {npy_path}")
-    print("请先运行 DataLogger.py 采集数据")
+    print("请先用 field/FieldCapture.py 采集数据，或修改本脚本顶部的 npy_path")
     exit(1)
 
 data = np.load(npy_path)

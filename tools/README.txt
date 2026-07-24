@@ -1,47 +1,44 @@
-tools/ — 分析与调试工具集
+tools/ — 数据准备工具集
 ==============================
 
-这些脚本用于数据分析、标定和调试，不是主流程的一部分。
+本目录收纳的是为主流程「准备输入数据」的工具，它们生成主程序
+(core/TrackFood.py) 运行所需的配置或干净数据集。它们不是主流程的
+一部分，按需手动运行一次即可。
 
-标定工具：
-  Calibrate.py          RGB / IR 像素对齐标定。
-                        手动点击对应角点，计算 Homography 矩阵。
-                        输出：data/homography.npy
-                              output/calibration_verify.png
+（原先混在这里的验证/调试脚本 SegmentFood / TempFilter / VerifyData /
+ _check_syntax 已于 2026-07-24 移入 排查工具/。）
 
-  VerifyData.py         验证采集数据的质量。
-                        检查 .npy 文件的形状和温度范围，输出热力图。
-                        输出：output/temp_verify.png
 
-分析工具：
-  TempFilter.py         温度过滤算法验证。
-                        用 Homography 对齐 RGB 到 IR，用 HSV 分割食材区域，
-                        输出四联可视化图（原图/对齐/Mask/热图）。
-                        输出：output/filter_result.png
+工具说明
+--------
 
-  analyze_ir_temp.py    红外温度数据分布分析。
-                        输出帧均值曲线、关键帧热图和直方图，
-                        辅助判断锅壁 vs 食材温差是否足够分割。
-                        输出：output/ir_analysis/
+  Calibrate.py              【RGB/IR 标定】
+                            多帧手动点选对应点，计算 RGB→IR 单应矩阵。
+                            输出：data/homography.npy
+                            主程序追踪时用它把 mask 映射到红外坐标。
 
-  analyze_result.py     追踪结果质量分析。
-                        读取 food_temp_log.csv，统计 mask 丢失率、
-                        扩张率、温度范围，打印批次交接处的连续性。
+  auto_wok_detect.py        【锅区自动检测】
+                            从 IR 温度数据自动检测锅的椭圆区域
+                            （锅壁高温圆环 → 温度阈值分割 + 椭圆拟合）。
+                            输出：data/wok_region.json
+                            主程序追踪时读它定位锅区与旋转轴排除圆。
+                            用法示例：
+                              python tools/auto_wok_detect.py \
+                                --temp data/temp_20260428_121546.npy \
+                                --start_sec 5 --out data/wok_region.json
 
-视频查看工具：
-  browse_video.py       交互式视频浏览器。
-                        键盘跳帧，Space 记录帧号，用于找到关键帧号
-                        再交给 LabelFirstFrame.py 追加标注。
+  trim_dataset_segments.py  【数据集片段裁剪】
+                            按指定时间段（秒）从 RGB 视频 + IR + 温度数据
+                            中同步剪掉片段（如锅直立、空锅等无效时段），
+                            生成对齐的新数据集目录。
+                            用法示例：
+                              python tools/trim_dataset_segments.py \
+                                --src-dir data --dst-dir data_trimmed \
+                                --rgb rgb_xxx.mp4 --ir ir_xxx.mp4 \
+                                --temp temp_xxx.npy --segments 33-38 40-46
 
-  extract_frames.py     快速提取视频预览帧（6个关键位置）。
-                        输出：output/preview_frame_*.jpg
 
-  inspect_frames.py     从追踪结果中提取关键帧截图。
-                        诊断 mask 异常扩张的原因。
-                        输出：output/inspect_frames/
-
-分割验证：
-  SegmentFood.py        SAM2 单帧分割验证。
-                        对 preview_frame_0.jpg 做点提示分割，
-                        确认模型和权重工作正常。
-                        输出：output/segment_result.png
+说明
+----
+  这三个工具生成的 homography.npy / wok_region.json 是主程序的必需
+  配置，存放在 data/ 目录（主程序以 ../data 相对路径读取）。
