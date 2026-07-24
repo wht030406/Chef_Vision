@@ -4,7 +4,7 @@ $labels = "core\food_labels.json"
 
 Write-Host ""
 Write-Host "Step 1/4: IR wok inner region. Draw one strict in-wok ellipse, then save."
-python tools\ir_mask_viz.py --setup --npy $temp
+python core\ir_mask_viz.py --setup --npy $temp
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host ""

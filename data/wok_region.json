@@ -1,10 +1,11 @@
 {
-  "cx": 114,
+  "cx": 113,
   "cy": 108,
-  "rx": 52,
+  "rx": 56,
   "ry": 55,
-  "axis_cx": 114,
-  "axis_cy": 107,
+  "axis_cx": 108,
+  "axis_cy": 106,
+  "axis_excl_r_ir": 16,
   "ir_h": 192,
   "ir_w": 256
 }

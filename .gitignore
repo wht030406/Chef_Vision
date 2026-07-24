@@ -18,6 +18,9 @@ sdk/*.dll
 sdk/*.h
 sdk/*.lib
 
+# field/ 里为"整个文件夹拷走即用"复制的 SDK 二进制（约 90MB，不入库）
+field/*.dll
+
 # 测试数据（视频/温度矩阵太大）
 test_data/
 

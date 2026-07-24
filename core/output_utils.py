@@ -211,9 +211,6 @@ def stitch_rgb_ir(
     ir_seg_mode="percentile",
 ):
     """Build the combined RGB/IR output video."""
-    tools_dir = os.path.join(_HERE, "..", "tools")
-    if tools_dir not in sys.path:
-        sys.path.insert(0, tools_dir)
     from ir_mask_viz import render_ir_frame
 
     cap = cv2.VideoCapture(rgb_viz_path)

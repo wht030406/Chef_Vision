@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_CORE_DIR = os.path.abspath(os.path.join(_HERE, "..", "core"))
+_CORE_DIR = _HERE
 if _CORE_DIR not in sys.path:
     sys.path.insert(0, _CORE_DIR)
 

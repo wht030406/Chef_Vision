@@ -79,7 +79,7 @@ def find_video_and_npy(video_path=None, npy_path=None):
 def load_wok_cfg():
     if not os.path.exists(WOK_CFG_PATH):
         print(f"[错误] 找不到 wok_region.json: {WOK_CFG_PATH}")
-        print("  请先运行: python tools/ir_mask_viz.py --setup")
+        print("  请先运行: python core/ir_mask_viz.py --setup")
         sys.exit(1)
     with open(WOK_CFG_PATH) as f:
         return json.load(f)
