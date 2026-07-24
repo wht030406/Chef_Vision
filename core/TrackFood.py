@@ -18,24 +18,22 @@ import os
 import sys
 import json
 import shutil
-import glob
-import re
 from datetime import datetime
 
 import cv2
 import numpy as np
 import torch
-import matplotlib
-matplotlib.use("Agg")   # 无头模式，不弹窗
-import matplotlib.pyplot as plt
 import chunk_reference_debug as _chunk_ref_debug
 import debug_artifacts as _debug_artifacts
 import final_temperature as _final_temperature
+import ir_timeline as _ir_timeline
 import ir_wok as _ir_wok
 import label_io as _label_io
 import output_utils as _output_utils
+import projection_utils as _projection_utils
 import rgb_forward as _rgb_forward
 import rgb_inverse as _rgb_inverse
+import sam2_tracking as _sam2_tracking
 import temp_fusion as _temp_fusion
 import track_config as _track_config
 import viz_utils as _viz_utils
@@ -139,287 +137,6 @@ INVERSE_IR_RELABEL_FG_MAX_GRAY = 210
 # 临时帧目录（放在 core/ 下）
 TMP_BASE        = os.path.join(_HERE, "tmp_sam2_frames")
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
-
-def find_temp_npy(video_path):
-    """
-    自动匹配温度 npy 文件。
-    策略：
-    1. 先找与视频同名的（rgb_ → temp_）
-    2. 再扫描目录找所有 temp_*.npy，选时间戳最近的
-    """
-    base      = os.path.splitext(os.path.basename(video_path))[0]
-    video_dir = os.path.dirname(os.path.abspath(video_path))
-
-    # 策略 1：同名替换
-    candidate = base.replace("rgb_", "temp_") + ".npy"
-    candidate_path = os.path.join(video_dir, candidate)
-    if os.path.exists(candidate_path):
-        print(f"[温度] 找到同名温度文件: {candidate}")
-        return candidate_path
-
-    # 策略 2：提取视频时间戳，找最近的 temp_*.npy
-    m = re.search(r"(\d{8}_\d{6})", base)
-    if m:
-        vid_ts = m.group(1)
-        all_npy = glob.glob(os.path.join(video_dir, "temp_*.npy"))
-        best_path, best_diff = None, float("inf")
-        for p in all_npy:
-            mn = re.search(r"(\d{8}_\d{6})", os.path.basename(p))
-            if mn:
-                diff = abs(int(mn.group(1).replace("_", "")) - int(vid_ts.replace("_", "")))
-                if diff < best_diff:
-                    best_diff, best_path = diff, p
-        if best_path:
-            print(f"[温度] 自动匹配到最近温度文件: {os.path.basename(best_path)}"
-                  f"  (时间差 {best_diff})")
-            return best_path
-
-    print(f"[温度] 未找到匹配的温度文件，跳过温度统计")
-    return None
-
-
-def load_temp_data(npy_path):
-    """
-    加载完整温度矩阵，不做帧号切片。
-    帧对齐由调用方根据 IR/RGB 帧率比例动态计算。
-    返回 (data, ir_total_frames)
-    """
-    if npy_path is None or not os.path.exists(npy_path):
-        return None, 0
-    data = np.load(npy_path)
-    print(f"[温度] 加载 {os.path.basename(npy_path)}，shape: {data.shape}，dtype: {data.dtype}")
-    if data.ndim == 2:
-        data = data[np.newaxis, ...]
-    t_min_val = float(np.min(data))
-    t_max_val = float(np.max(data))
-    print(f"[温度] 总帧数: {data.shape[0]}  温度范围: {t_min_val:.1f}°C ~ {t_max_val:.1f}°C")
-    return data, data.shape[0]
-
-
-def build_sam2_predictor(device):
-    from sam2.build_sam import build_sam2_video_predictor
-    print(f"\n[SAM2] 加载模型: {CHECKPOINT_PATH}")
-    predictor = build_sam2_video_predictor(MODEL_CFG, CHECKPOINT_PATH, device=device)
-    print("[SAM2] 模型加载完成")
-    return predictor
-
-
-def extract_chunk_to_dir(video_path, start_abs, end_abs, infer_size=None):
-    """
-    将视频 [start_abs, end_abs) 帧抽到临时目录。
-    infer_size: (W, H) 缩放尺寸，None 则不缩放。
-    返回 (tmp_dir, frame_names, actual_count)
-    """
-    os.makedirs(TMP_BASE, exist_ok=True)
-    import tempfile
-    tmp_dir = tempfile.mkdtemp(prefix="chunk_", dir=TMP_BASE)
-
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_abs)
-
-    frame_names = []
-    local_idx   = 0
-    for _ in range(end_abs - start_abs):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if infer_size is not None:
-            frame = cv2.resize(frame, infer_size, interpolation=cv2.INTER_AREA)
-        fname = f"{local_idx:06d}.jpg"
-        cv2.imwrite(os.path.join(tmp_dir, fname),
-                    frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        frame_names.append(fname)
-        local_idx += 1
-
-    cap.release()
-    return tmp_dir, frame_names, local_idx
-
-
-def scale_points(points, src_wh, dst_wh):
-    """将标注点从 src_wh 坐标系缩放到 dst_wh 坐标系"""
-    if not points or src_wh == dst_wh:
-        return points
-    sx = dst_wh[0] / src_wh[0]
-    sy = dst_wh[1] / src_wh[1]
-    return [[p[0] * sx, p[1] * sy] for p in points]
-
-
-def upscale_mask(mask, dst_wh):
-    """将 mask 放大到 dst_wh (W, H) 大小"""
-    mh, mw = mask.shape
-    if (mw, mh) == dst_wh:
-        return mask
-    m_u8 = mask.astype(np.uint8) * 255
-    m_up = cv2.resize(m_u8, dst_wh, interpolation=cv2.INTER_NEAREST)
-    return m_up > 127
-
-
-def project_ir_radius_to_rgb_radius(homography_inv, axis_ir_cx, axis_ir_cy, radius_ir, fallback=None):
-    """Estimate the local RGB radius that corresponds to a manual IR radius."""
-    if (homography_inv is None or axis_ir_cx is None or axis_ir_cy is None
-            or radius_ir is None):
-        return fallback
-    try:
-        pts_ir = np.array([
-            [[float(axis_ir_cx), float(axis_ir_cy)]],
-            [[float(axis_ir_cx) + float(radius_ir), float(axis_ir_cy)]],
-            [[float(axis_ir_cx), float(axis_ir_cy) + float(radius_ir)]],
-        ], dtype=np.float32)
-        pts_rgb = cv2.perspectiveTransform(pts_ir, homography_inv).reshape(-1, 2)
-        radius_x = float(np.linalg.norm(pts_rgb[1] - pts_rgb[0]))
-        radius_y = float(np.linalg.norm(pts_rgb[2] - pts_rgb[0]))
-        radius = max(radius_x, radius_y)
-        if not np.isfinite(radius) or radius <= 1.0:
-            return fallback
-        return radius
-    except Exception:
-        return fallback
-
-
-def track_chunk(predictor, tmp_dir, frame_names,
-                fg_points, bg_points,
-                carry_mask=None,
-                inject_keyframes=None):
-    """
-    对一批帧进行 SAM2 追踪，支持在批内指定帧号注入新前景点。
-
-    参数：
-      fg_points / bg_points : 第一批（或无 carry_mask 时）使用的标注点
-      carry_mask            : 上批末帧 mask (H,W bool)；None 表示第一批
-      inject_keyframes      : list[dict]，本批内需要注入的额外关键帧，格式：
-                              [{"local_frame": int, "fg_points": [...], "bg_points": [...]}]
-                              local_frame 是在本批帧序列中的局部帧号（0-based）
-
-    返回：
-      masks    : {local_idx: mask (H,W bool)}
-      last_mask: 本批末帧 mask（传给下一批）
-    """
-    inject_keyframes = inject_keyframes or []
-
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-        inference_state = predictor.init_state(video_path=tmp_dir)
-
-        if carry_mask is not None and carry_mask.any():
-            # ── 后续批：用上批末帧 mask 传递边界（add_new_mask 与 points 在同帧互斥）
-            predictor.add_new_mask(
-                inference_state=inference_state,
-                frame_idx=0,
-                obj_id=1,
-                mask=carry_mask,
-            )
-        elif fg_points or bg_points:
-            # ── 第一批：用用户标注点 ────────────────────────────────────────
-            points = np.array(fg_points + bg_points, dtype=np.float32)
-            labels = np.array(
-                [1] * len(fg_points) + [0] * len(bg_points),
-                dtype=np.int32
-            )
-            predictor.add_new_points_or_box(
-                inference_state=inference_state,
-                frame_idx=0,
-                obj_id=1,
-                points=points,
-                labels=labels,
-            )
-        else:
-            has_frame0_inject = any(
-                int(kf.get("local_frame", -1)) == 0 and kf.get("fg_points")
-                for kf in inject_keyframes
-            )
-            if not has_frame0_inject:
-                raise ValueError(
-                    "track_chunk requires carry_mask, base points, or a frame-0 inject keyframe"
-                )
-
-        # ── 注入额外关键帧的前景点 ───────────────────────────────────────────
-        # local_frame=0：补强点追加到第0帧（与 carry_mask 同帧，SAM2 会合并两者）
-        # local_frame>0：食材入锅等关键帧，在对应帧注入
-        for kf_inject in inject_keyframes:
-            local_f  = kf_inject["local_frame"]
-            kf_fg    = kf_inject["fg_points"]
-            kf_bg    = kf_inject.get("bg_points", [])
-            if not kf_fg:
-                continue
-            if 0 <= local_f < len(frame_names):
-                pts    = np.array(kf_fg + kf_bg, dtype=np.float32)
-                lbls   = np.array([1]*len(kf_fg) + [0]*len(kf_bg), dtype=np.int32)
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=local_f,
-                    obj_id=1,
-                    points=pts,
-                    labels=lbls,
-                )
-                print(f"  [注入] 局部帧 {local_f}：FG={len(kf_fg)} BG={len(kf_bg)}"
-                      f"  标签={kf_inject.get('label','')}")
-
-        masks = {}
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-            inference_state
-        ):
-            mask = (out_mask_logits[0] > 0.0).cpu().numpy().squeeze().astype(bool)
-            masks[out_frame_idx] = mask
-
-        predictor.reset_state(inference_state)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    last_mask = masks.get(len(frame_names) - 1, None)
-    return masks, last_mask
-
-
-def flow_propagate_mask(prev_gray, cur_gray, prev_mask):
-    """
-    用 Farneback 稠密光流将上一帧 mask 传播到当前帧。
-
-    原理：
-      1. 计算 prev→cur 的稠密光流场 (dx, dy)
-      2. 对 prev_mask 中每个前景像素，按光流偏移映射到 cur 坐标
-      3. 对结果做形态学闭运算填补空洞
-
-    参数：
-      prev_gray : (H,W) uint8 灰度图（上一帧）
-      cur_gray  : (H,W) uint8 灰度图（当前帧）
-      prev_mask : (H,W) bool  上一帧 mask
-
-    返回：
-      cur_mask  : (H,W) bool  传播后的 mask
-    """
-    if not prev_mask.any():
-        return prev_mask.copy()
-
-    # Farneback 光流（CPU，速度快）
-    flow = cv2.calcOpticalFlowFarneback(
-        prev_gray, cur_gray,
-        None,
-        pyr_scale=0.5, levels=3, winsize=15,
-        iterations=3, poly_n=5, poly_sigma=1.2,
-        flags=0
-    )  # shape: (H, W, 2)
-
-    H, W = prev_mask.shape
-    ys, xs = np.where(prev_mask)
-
-    # 按光流偏移计算新坐标
-    dx = flow[ys, xs, 0]
-    dy = flow[ys, xs, 1]
-    new_xs = np.round(xs + dx).astype(int)
-    new_ys = np.round(ys + dy).astype(int)
-
-    # 过滤越界坐标
-    valid = (new_xs >= 0) & (new_xs < W) & (new_ys >= 0) & (new_ys < H)
-    new_xs = new_xs[valid]
-    new_ys = new_ys[valid]
-
-    cur_mask = np.zeros((H, W), dtype=np.uint8)
-    cur_mask[new_ys, new_xs] = 255
-
-    # 形态学闭运算：填补光流稀疏导致的空洞
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    cur_mask = cv2.morphologyEx(cur_mask, cv2.MORPH_CLOSE, kernel)
-
-    return cur_mask.astype(bool)
-
 
 def main():
     runtime_cfg = _track_config.resolve_runtime_config(
@@ -646,60 +363,22 @@ def main():
 
     # ── 自动匹配温度文件 ──────────────────────────────────────────────────────
     global TEMP_NPY_PATH
-    if temp_override is not None:
-        TEMP_NPY_PATH = temp_override
-    if TEMP_NPY_PATH is None:
-        TEMP_NPY_PATH = find_temp_npy(video_path)
-    temp_data, ir_total_frames = load_temp_data(TEMP_NPY_PATH)
+    TEMP_NPY_PATH = _ir_timeline.resolve_temp_path(
+        video_path,
+        temp_override=temp_override,
+        current_temp_path=TEMP_NPY_PATH,
+    )
+    ir_timeline = _ir_timeline.load_ir_timeline(
+        video_path,
+        TEMP_NPY_PATH,
+        total_frames,
+        fps,
+    )
+    temp_data = ir_timeline.temp_data
+    ir_total_frames = ir_timeline.ir_total_frames
+    _get_ir_idx = ir_timeline.get_ir_idx
 
-    # ── 加载逐帧时间戳文件（用于精确帧对齐）────────────────────────────────
-    # 新录制数据会有 rgb_YYYYMMDD_HHMMSS_ts.npy 和 temp_YYYYMMDD_HHMMSS_ts.npy
-    # 老录制数据没有时间戳文件，fallback 到帧率比例估算
-    _rgb_ts = None   # shape (N_rgb,) float64 Unix 时间戳
-    _ir_ts  = None   # shape (N_ir,)  float64 Unix 时间戳
-
-    if temp_data is not None:
-        _ir_ts_path = TEMP_NPY_PATH.replace(".npy", "_ts.npy") if TEMP_NPY_PATH else None
-        if _ir_ts_path and os.path.exists(_ir_ts_path):
-            _ir_ts = np.load(_ir_ts_path)
-            print(f"[时间戳] IR 时间戳已加载: {os.path.basename(_ir_ts_path)}  {len(_ir_ts)} 帧")
-
-    _rgb_ts_path = os.path.splitext(os.path.basename(video_path))[0]
-    _rgb_ts_path = _rgb_ts_path.replace("rgb_", "") if _rgb_ts_path.startswith("rgb_") else _rgb_ts_path
-    _rgb_ts_file = os.path.join(os.path.dirname(os.path.abspath(video_path)),
-                                f"rgb_{_rgb_ts_path}_ts.npy")
-    # 也兼容直接以 rgb_YYYYMMDD_HHMMSS_ts.npy 命名的情况
-    _rgb_ts_file2 = os.path.splitext(os.path.abspath(video_path))[0] + "_ts.npy"
-    for _ts_candidate in [_rgb_ts_file2, _rgb_ts_file]:
-        if os.path.exists(_ts_candidate):
-            _rgb_ts = np.load(_ts_candidate)
-            print(f"[时间戳] RGB 时间戳已加载: {os.path.basename(_ts_candidate)}  {len(_rgb_ts)} 帧")
-            break
-
-    if _rgb_ts is not None and _ir_ts is not None:
-        print(f"[时间戳] 启用时间戳帧对齐模式（精度 ~40ms）")
-    else:
-        print(f"[时间戳] 时间戳文件不完整，fallback 到帧率比例估算")
-
-    # 计算 IR/RGB 帧率比例（用于时间对齐，无时间戳时使用）
-    ir_fps_ratio = 1.0   # 默认 1:1
-    if temp_data is not None and total_frames > 0:
-        ir_fps_ratio = ir_total_frames / total_frames
-        ir_fps_est   = fps * ir_fps_ratio
-        print(f"[帧率对齐] RGB {fps:.1f}fps × {total_frames}帧 | "
-              f"IR ~{ir_fps_est:.1f}fps × {ir_total_frames}帧 | "
-              f"比例 {ir_fps_ratio:.4f}")
-
-    def _get_ir_idx(rgb_abs_idx: int) -> int:
-        """根据 RGB 帧号查找最近邻 IR 帧号（有时间戳用时间戳，无则用帧率比例）"""
-        if _rgb_ts is not None and _ir_ts is not None:
-            if rgb_abs_idx < len(_rgb_ts):
-                t = _rgb_ts[rgb_abs_idx]
-                return int(np.argmin(np.abs(_ir_ts - t)))
-            # 超出时间戳范围，退化到比例
-        return min(int(rgb_abs_idx * ir_fps_ratio), ir_total_frames - 1)
-
-    # ── 设备 ──────────────────────────────────────────────────────────────────
+    # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n[设备] 使用: {device}")
     if device.type == "cuda":
@@ -708,7 +387,7 @@ def main():
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     # ── 加载 SAM2 ─────────────────────────────────────────────────────────────
-    predictor = build_sam2_predictor(device)
+    predictor = _sam2_tracking.build_sam2_predictor(device, MODEL_CFG, CHECKPOINT_PATH)
 
     # ── 输出视频准备 ──────────────────────────────────────────────────────────
     fourcc      = cv2.VideoWriter_fourcc(*"mp4v")
@@ -813,8 +492,8 @@ def main():
         print(f"[缩放] SAM2推理: {infer_wh[0]}×{infer_wh[1]}  "
               f"输出/温度: {orig_wh[0]}×{orig_wh[1]}")
         # 将标注点坐标缩放到推理分辨率
-        fg_infer = scale_points(fg_points, orig_wh, infer_wh)
-        bg_infer = scale_points(bg_points, orig_wh, infer_wh)
+        fg_infer = _sam2_tracking.scale_points(fg_points, orig_wh, infer_wh)
+        bg_infer = _sam2_tracking.scale_points(bg_points, orig_wh, infer_wh)
     else:
         fg_infer = fg_points
         bg_infer = bg_points
@@ -880,7 +559,7 @@ def main():
                           f"  检测={_AXIS_EXCL_R}px  FG排除={_AXIS_FG_EXCL_R}px"
                           f"  来源={_axis_src}")
                     _AXIS_IR_EXCL_R = float(_wok_cfg_al.get("axis_excl_r_ir", 0.0) or 0.0)
-                    _axis_rgb_radius = project_ir_radius_to_rgb_radius(
+                    _axis_rgb_radius = _projection_utils.project_ir_radius_to_rgb_radius(
                         _H_inv_al,
                         _AXIS_IR_CX,
                         _AXIS_IR_CY,
@@ -893,7 +572,7 @@ def main():
                     print(f"[axis radius] IR={_AXIS_IR_EXCL_R:.1f}px  RGB={_AXIS_EXCL_R:.1f}px")
                     if _AXIS_IR_EXCL_R is not None and _AXIS_IR_EXCL_R > 0:
                         _FORWARD_AXIS_IR_EXCL_R = float(_AXIS_IR_EXCL_R)
-                    _forward_axis_rgb_radius = project_ir_radius_to_rgb_radius(
+                    _forward_axis_rgb_radius = _projection_utils.project_ir_radius_to_rgb_radius(
                         _H_inv_al,
                         _AXIS_IR_CX,
                         _AXIS_IR_CY,
@@ -1857,8 +1536,9 @@ def main():
                 except Exception:
                     pass
 
-            tmp_dir, frame_names, actual = extract_chunk_to_dir(
+            tmp_dir, frame_names, actual = _sam2_tracking.extract_chunk_to_dir(
                 video_path, chunk_start_abs, chunk_end_abs,
+                TMP_BASE,
                 infer_size=SAM2_INFER_SIZE
             )
             print(f"[抽帧] 临时目录: {tmp_dir}  实际帧数: {actual}")
@@ -1885,7 +1565,7 @@ def main():
                 # carry_mask 需要缩放到推理分辨率传给下一批
                 carry_mask_infer = None
                 if carry_mask is not None and do_resize:
-                    carry_mask_infer = upscale_mask(carry_mask, infer_wh) \
+                    carry_mask_infer = _sam2_tracking.upscale_mask(carry_mask, infer_wh) \
                         if carry_mask.shape != (infer_wh[1], infer_wh[0]) else carry_mask
                 else:
                     carry_mask_infer = carry_mask
@@ -1973,7 +1653,7 @@ def main():
                     carry_mask_raw = None   # 清零，下批重新采点
                     print(f"[倾斜冻结] 批次{chunk_i+1} SAM2已跳过，carry_mask清零（锅直立期无食材）")
                 else:
-                    chunk_masks, carry_mask_raw = track_chunk(
+                    chunk_masks, carry_mask_raw = _sam2_tracking.track_chunk(
                         predictor, tmp_dir, frame_names,
                         fg_run, bg_run,
                         carry_mask=carry_mask_infer,
@@ -1981,7 +1661,7 @@ def main():
                     )
                 # carry_mask 放大回原始分辨率，供下批 add_new_mask 使用
                 if do_resize and carry_mask_raw is not None:
-                    carry_mask = upscale_mask(carry_mask_raw, orig_wh)
+                    carry_mask = _sam2_tracking.upscale_mask(carry_mask_raw, orig_wh)
                 else:
                     carry_mask = carry_mask_raw
                 # ── 对 carry_mask 也做 wok 约束，防止面积检查出现 >100% ──────
@@ -2037,7 +1717,7 @@ def main():
                                 )
                             if _carry_inv_reset is not None and not _carry_inv_reset["need_reset"]:
                                 if _bottom_carry is not None and do_resize:
-                                    _bc_infer = upscale_mask(_bottom_carry, infer_wh)
+                                    _bc_infer = _sam2_tracking.upscale_mask(_bottom_carry, infer_wh)
                                 else:
                                     _bc_infer = _bottom_carry
                                 _bottom_ref_source = "reuse_carry"
@@ -2225,7 +1905,7 @@ def main():
                                     )
                             _bottom_auto_reset = None
                         elif _bottom_carry is not None and do_resize:
-                            _bc_infer = upscale_mask(_bottom_carry, infer_wh)
+                            _bc_infer = _sam2_tracking.upscale_mask(_bottom_carry, infer_wh)
                             _bottom_ref_source = "reuse_carry"
                             _bottom_ref_mask = _bc_infer
                             _bottom_ref_fg = []
@@ -2293,13 +1973,13 @@ def main():
                             )
                         except Exception:
                             pass
-                        bottom_chunk_masks, _bottom_carry_raw = track_chunk(
+                        bottom_chunk_masks, _bottom_carry_raw = _sam2_tracking.track_chunk(
                             predictor, tmp_dir, frame_names,
                             _bottom_fg_run, _bottom_bg_run,
                             carry_mask=_bc_infer,
                             inject_keyframes=_bottom_inject,
                         )
-                        _bottom_carry = upscale_mask(_bottom_carry_raw, orig_wh) \
+                        _bottom_carry = _sam2_tracking.upscale_mask(_bottom_carry_raw, orig_wh) \
                             if (do_resize and _bottom_carry_raw is not None) \
                             else _bottom_carry_raw
                         print(f"[锅底SAM2] 批次 {chunk_i+1} 锅底追踪完成，"
@@ -2343,7 +2023,7 @@ def main():
                 # SAM2 返回的是推理分辨率的 mask，放大回原始分辨率
                 raw_mask  = chunk_masks.get(local_in_chunk,
                                             np.zeros((infer_wh[1], infer_wh[0]), dtype=bool))
-                mask      = upscale_mask(raw_mask, orig_wh) if do_resize else raw_mask
+                mask      = _sam2_tracking.upscale_mask(raw_mask, orig_wh) if do_resize else raw_mask
                 mask_src  = "SAM2"
 
                 # ── wok 约束后处理：mask AND 预计算的锅内区域 ────────────────
@@ -2640,7 +2320,7 @@ def main():
                     try:
                         _bm_raw = bottom_chunk_masks.get(local_in_chunk)
                         if _bm_raw is not None:
-                            _bm_full = upscale_mask(_bm_raw, orig_wh) if do_resize else _bm_raw
+                            _bm_full = _sam2_tracking.upscale_mask(_bm_raw, orig_wh) if do_resize else _bm_raw
                             # 构建动态锅椭圆 mask（用更新后的中心）
                             if _wok_rgb_constraint is not None:
                                 _dyn_wok_bool = _wok_rgb_constraint
@@ -2819,7 +2499,7 @@ def main():
                     if has_bottom and bottom_chunk_masks:
                         _bm_r2 = bottom_chunk_masks.get(local_in_chunk)
                         if _bm_r2 is not None:
-                            _bm_f2 = upscale_mask(_bm_r2, orig_wh) if do_resize else _bm_r2
+                            _bm_f2 = _sam2_tracking.upscale_mask(_bm_r2, orig_wh) if do_resize else _bm_r2
                             if _wok_rgb_constraint is not None:
                                 _inv_vis_mask = _wok_rgb_constraint & ~_bm_f2
                             elif wok_rgb_mask_static is not None:
@@ -2886,8 +2566,8 @@ def main():
 
             if is_anchor:
                 # SAM2 单帧推理：抽单帧到临时目录
-                tmp_dir, frame_names, actual = extract_chunk_to_dir(
-                    video_path, abs_idx, abs_idx + 1
+                tmp_dir, frame_names, actual = _sam2_tracking.extract_chunk_to_dir(
+                    video_path, abs_idx, abs_idx + 1, TMP_BASE
                 )
                 try:
                     # 检查此帧是否有注入关键帧（对于第一帧之外的额外标注）
@@ -2901,7 +2581,7 @@ def main():
                             "label":       kf.get("label", ""),
                         }]
 
-                    chunk_masks, carry_mask = track_chunk(
+                    chunk_masks, carry_mask = _sam2_tracking.track_chunk(
                         predictor, tmp_dir, frame_names,
                         fg_points, bg_points,
                         carry_mask=carry_mask,
@@ -2922,7 +2602,7 @@ def main():
                     mask = np.zeros((VH, VW), dtype=bool)
                 else:
                     cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    mask     = flow_propagate_mask(flow_prev_gray, cur_gray, flow_prev_mask)
+                    mask     = _sam2_tracking.flow_propagate_mask(flow_prev_gray, cur_gray, flow_prev_mask)
                 mask_src = "Flow"
 
             # 更新光流状态
@@ -2987,7 +2667,7 @@ def main():
     # ── 拼合 RGB + IR 视频 ────────────────────────────────────────────────────
     if temp_data is not None and wok_cfg is not None:
         out_combined = os.path.join(out_dir, "track_result_combined.mp4")
-        ir_fps_val   = fps * ir_fps_ratio   # 估算 IR 帧率
+        ir_fps_val   = fps * ir_timeline.ir_fps_ratio   # 估算 IR 帧率
         print(f"\n[拼合] 开始生成 RGB+IR 并排视频...")
         _output_utils.stitch_rgb_ir(
             rgb_viz_path=out_video_viz,
