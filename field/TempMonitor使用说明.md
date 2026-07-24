@@ -1,26 +1,120 @@
-# 温度监测工具使用说明
+# 现场采集与温度监测工具使用说明（field 文件夹）
 
 ## 📋 目录
 
 1. [工具概述](#工具概述)
-2. [下位机使用指南](#下位机使用指南)
-3. [上位机使用指南](#上位机使用指南)
-4. [常见问题](#常见问题)
+2. [运行环境准备](#运行环境准备)
+3. [下位机使用指南](#下位机使用指南)
+4. [上位机使用指南](#上位机使用指南)
+5. [常见问题](#常见问题)
 
 ---
 
 ## 🎯 工具概述
 
-本项目提供了两个独立的温度监测工具，**完全独立于主项目的 SAM 追踪系统**：
+`field` 文件夹提供三个脚本，**完全独立于主项目的 SAM 追踪系统**：
 
-| 工具 | 用途 | 运行位置 | 需要硬件 |
-|------|------|----------|----------|
-| **FieldTempMonitor.py** | 实时采集 | 下位机（现场） | ✅ 需要热像仪 |
-| **TempMonitor.py** | 离线分析 | 上位机（办公室） | ❌ 不需要 |
+| 工具 | 用途 | 运行位置 | 需要硬件 | 备注 |
+|------|------|----------|----------|------|
+| **FieldCapture.py** | RGB+IR 双画面采集录制 | 下位机（现场） | ✅ 需要热像仪 | 当前主力采集脚本，带补光灯控制（按 L 切换白光） |
+| **FieldTempMonitor.py** | 实时温度监测 | 下位机（现场） | ✅ 需要热像仪 | 框选 ROI 实时显示温度统计 |
+| **TempMonitor.py** | 离线温度分析 | 上位机（办公室） | ❌ 不需要 | 读取已录制的 .npy 文件分析 |
+
+> 三个脚本的 DLL 都从**脚本同目录**加载，所需依赖库已全部放进 `field` 文件夹。
+> 整个 `field` 文件夹拷到目标电脑，装好下面的 Python 环境即可运行。
+
+---
+
+## 🛠️ 运行环境准备
+
+拷走 `field` 文件夹后，目标电脑还需要满足两个条件（DLL 已随文件夹自带，无需单独安装）：
+
+### 1️⃣ 安装 Python
+
+脚本是 `.py` 文件，需要 Python 解释器才能运行。
+
+- 到 https://www.python.org/downloads/ 下载并安装 Python 3.8 及以上版本。
+- 安装时**务必勾选 “Add Python to PATH”**（把 Python 加入环境变量），否则命令行找不到 `python` 命令。
+- 安装完成后，打开 CMD 或 PowerShell 验证：
+
+```bash
+python --version
+```
+
+能打印出版本号（如 `Python 3.11.5`）即安装成功。
+
+### 2️⃣ 安装 3 个 Python 库
+
+在 CMD 或 PowerShell 中运行：
+
+```bash
+pip install numpy opencv-python matplotlib
+```
+
+- **numpy**：温度矩阵数值计算
+- **opencv-python**：图像/视频读写与显示（即代码里的 cv2）
+- **matplotlib**：温度曲线图绘制
+
+> 装好 Python + 这 3 个库之后，`field` 文件夹里的脚本就能反复使用，无需重复安装。
 
 ---
 
 ## 🔧 下位机使用指南
+
+下位机（现场笔记本）有两个采集脚本：主力的 `FieldCapture.py`（RGB+IR 采集录制，带补光灯控制）和 `FieldTempMonitor.py`（实时温度监测）。下面分别说明。
+
+---
+
+## 📹 FieldCapture.py（主力采集脚本）
+
+### 1️⃣ 修改设备参数
+
+用记事本或 VSCode 打开 `FieldCapture.py`，修改第 41-44 行的设备参数：
+
+```python
+DEVICE_IP   = "192.168.1.123"    # 改为实际的热像仪 IP 地址
+DEVICE_PORT = 80                 # 通常不需要改
+USERNAME    = "admin"            # 通常不需要改
+PASSWORD    = "ZGTC2026"         # 改为实际密码
+```
+
+### 2️⃣ 运行程序
+
+在 CMD 或 PowerShell 中，进入 `field` 文件夹并运行：
+
+```bash
+cd field文件夹路径
+python FieldCapture.py
+```
+
+**示例**（假设 field 文件夹拷到了 D 盘根目录）：
+
+```bash
+cd D:\field
+python FieldCapture.py
+```
+
+### 3️⃣ 操作快捷键
+
+| 按键 | 功能 |
+|------|------|
+| **R** | 进入/退出 ROI 编辑（拖拽圆心移动，滚轮调半径） |
+| **S** | 开始录制（画面出现后按） |
+| **L** | 切换白色补光灯（0 → 100 → 0） |
+| **Q** | 停止录制并保存 |
+
+### 4️⃣ 输出文件
+
+录制完成后，在 `field` 文件夹（脚本同目录）生成：
+
+```
+rgb_YYYYMMDD_HHMMSS.mp4      # 可见光视频
+temp_YYYYMMDD_HHMMSS.npy     # 对应的红外温度矩阵（float32，单位 ℃）
+```
+
+---
+
+## 🌡️ FieldTempMonitor.py（实时温度监测）
 
 ### 文件：`FieldTempMonitor.py`
 
@@ -55,9 +149,9 @@
 
 ---
 
-### 2️⃣ 安装 Python 依赖
+### 2️⃣ 安装 Python 环境
 
-在下位机电脑上打开命令行（CMD），运行：
+按上面「运行环境准备」一节，先装好 Python 和 3 个库：
 
 ```bash
 pip install numpy opencv-python matplotlib
@@ -92,9 +186,9 @@ cd 下位机文件夹路径
 python FieldTempMonitor.py
 ```
 
-**示例**：
+**示例**（假设 field 文件夹拷到了 D 盘根目录）：
 ```bash
-cd D:\Chef_Vision
+cd D:\field
 python FieldTempMonitor.py
 ```
 
@@ -339,10 +433,13 @@ ping 192.168.1.123
 
 ## 📝 更新日志
 
-- **2026-07-24**: 结构整理
+- **2026-07-24**: 结构整理 + 文档补全
   - `field` 文件夹自带全部 SDK DLL，整个文件夹拷走即用
   - `FieldTempMonitor.py` 改为从脚本同目录加载 DLL，输出到同目录 `output/` 子文件夹
   - 说明改为「复制 field 文件夹」而非整个 Chef_Vision 项目
+  - 新增「运行环境准备」一节：安装 Python + numpy/opencv-python/matplotlib
+  - 补充主力脚本 `FieldCapture.py` 的运行说明与快捷键
+  - 修正示例路径（D:\Chef_Vision → field 文件夹路径）
 
 - **2026-05-18**: 初始版本
   - 创建 `FieldTempMonitor.py`（下位机实时采集）
