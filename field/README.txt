@@ -24,11 +24,10 @@ field/*.dll），拷贝时请连同 .dll 文件一起复制。
   FieldTempMonitor.py   【实时温度监测】
                         连接热像仪，显示 IR 热图。
                         按 R 框选 ROI，按 S 录制，按 Q 保存。
+                        DLL 从脚本同目录加载，输出到同目录的 output/ 子目录，
+                        与 FieldCapture.py 一致，整个 field/ 拷走即可运行。
                         输出：output/temp_monitor_TIMESTAMP.csv
                               output/temp_monitor_TIMESTAMP.png
-                        注意：此脚本目前仍从上级 ../sdk/ 目录加载 DLL，
-                        单独拷贝 field/ 到低配机时需自行确认 DLL 路径，
-                        或与 FieldCapture.py 一起放在带 DLL 的目录下运行。
 
   TempMonitor.py        【离线温度分析工具，上位机用】
                         加载已录制的 .npy 文件，手动圈选 ROI，

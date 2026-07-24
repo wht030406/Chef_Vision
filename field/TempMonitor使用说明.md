@@ -51,7 +51,7 @@
 └── SDL2.dll
 ```
 
-**💡 提示**：直接复制整个 `Chef_Vision` 文件夹到下位机即可，所有依赖库都在里面。
+**💡 提示**：直接复制整个 `field` 文件夹到下位机即可，所有依赖 DLL 都已放在 `field` 文件夹内。无需复制整个 `Chef_Vision` 项目。
 
 ---
 
@@ -134,7 +134,7 @@ python FieldTempMonitor.py
 4. **停止录制**
    - 按 **Q** 键停止录制
    - 程序会自动保存数据并生成报告
-   - 输出文件会保存在当前文件夹
+   - 输出文件会保存在脚本同目录下的 `output/` 子文件夹
 
 5. **退出程序**
    - 按 **ESC** 键退出
@@ -143,11 +143,11 @@ python FieldTempMonitor.py
 
 ### 6️⃣ 输出文件
 
-录制完成后，会在当前文件夹生成以下文件：
+录制完成后，会在脚本同目录下的 `output/` 子文件夹生成以下文件：
 
 ```
-temp_monitor_20260518_113045.csv      # 温度数据（CSV格式）
-temp_monitor_20260518_113045.png      # 温度曲线图
+output/temp_monitor_20260518_113045.csv      # 温度数据（CSV格式）
+output/temp_monitor_20260518_113045.png      # 温度曲线图
 ```
 
 **CSV 文件格式**：
@@ -273,9 +273,9 @@ ping 192.168.1.123
 ### Q2: 程序提示缺少 DLL 文件怎么办？
 
 **A2**: 
-1. 确保所有 DLL 文件都在同一文件夹
-2. 完整复制 `Chef_Vision` 文件夹到下位机
-3. 不要单独复制 `FieldTempMonitor.py`
+1. 确保所有 DLL 文件都在同一文件夹（`field` 文件夹内已自带全部 DLL）
+2. 完整复制整个 `field` 文件夹到下位机
+3. 不要单独复制 `FieldTempMonitor.py`，要连同 DLL 一起复制
 
 ---
 
@@ -338,6 +338,11 @@ ping 192.168.1.123
 ---
 
 ## 📝 更新日志
+
+- **2026-07-24**: 结构整理
+  - `field` 文件夹自带全部 SDK DLL，整个文件夹拷走即用
+  - `FieldTempMonitor.py` 改为从脚本同目录加载 DLL，输出到同目录 `output/` 子文件夹
+  - 说明改为「复制 field 文件夹」而非整个 Chef_Vision 项目
 
 - **2026-05-18**: 初始版本
   - 创建 `FieldTempMonitor.py`（下位机实时采集）
