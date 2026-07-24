@@ -45,5 +45,8 @@ filter_result.png
 segment_result.png
 temp_verify.png
 
+# tools/ 调试可视化输出图（一次性产物，不入库）
+tools/*.jpg
+
 # Local device auth token for TN220 fill-light HTTP control.
 field/fill_light_token.txt
