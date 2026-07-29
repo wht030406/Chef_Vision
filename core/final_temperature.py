@@ -18,6 +18,7 @@ def select_final_temperature(
     roi_temp,
     *,
     forward_valid,
+    inverse_valid=True,
     previous_final_temp=None,
 ):
     """Choose the final temperature from the available strategy outputs."""
@@ -33,7 +34,7 @@ def select_final_temperature(
             "source": "ir",
             "reason": "forward_invalid_or_empty_use_ir",
         }
-    if is_valid_temperature(inverse_temp):
+    if inverse_valid and is_valid_temperature(inverse_temp):
         return {
             "final_temp": float(inverse_temp),
             "source": "inverse",

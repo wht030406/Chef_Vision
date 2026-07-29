@@ -18,9 +18,8 @@ browse_video.py — 快速浏览视频，目视确认关键帧帧号
   Q / Esc         → 退出
 
 用法：
-  python browse_video.py
-  python browse_video.py --video rgb_20260428_121157.mp4
-  python browse_video.py --video rgb_20260428_121157.mp4 --start 1000
+  python browse_video.py --video path/to/rgb.mp4
+  python browse_video.py --video path/to/rgb.mp4 --start 1000
 """
 
 import cv2
@@ -30,7 +29,6 @@ import argparse
 
 # ── 配置 ─────────────────────────────────────────────────────────────────────
 _HERE         = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_VIDEO = os.path.join(_HERE, "..", "data", "rgb_20260428_121157.mp4")
 SKIP_FRAMES   = 30    # ← → 每次跳几帧
 
 
@@ -98,7 +96,7 @@ def prompt_input_in_console(prompt_text):
 
 def main():
     parser = argparse.ArgumentParser(description="快速浏览视频并确认关键帧帧号")
-    parser.add_argument("--video",  default=DEFAULT_VIDEO, help="视频路径")
+    parser.add_argument("--video", required=True, help="视频路径")
     parser.add_argument("--start",  type=int, default=0,   help="起始帧号")
     args = parser.parse_args()
 

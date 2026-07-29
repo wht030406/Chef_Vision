@@ -8,16 +8,19 @@
 
 import numpy as np
 import os
+import argparse
 
 # ============================================================
 # 1. 加载数据
 # ============================================================
-# 默认验证主追踪温度数据；如需验证其它 .npy，改这里的文件名即可
 _HERE    = os.path.dirname(os.path.abspath(__file__))
-npy_path = os.path.join(_HERE, "..", "data", "temp_20260428_121546.npy")
+parser = argparse.ArgumentParser(description="验证热像仪温度矩阵 .npy")
+parser.add_argument("--npy", required=True, help="温度矩阵 .npy 路径")
+args = parser.parse_args()
+npy_path = args.npy
 if not os.path.exists(npy_path):
     print(f"[错误] 文件不存在: {npy_path}")
-    print("请先用 field/FieldCapture.py 采集数据，或修改本脚本顶部的 npy_path")
+    print("请先用 field/FieldCapture.py 采集数据，或通过 --npy 指定现有温度矩阵")
     exit(1)
 
 data = np.load(npy_path)

@@ -8,7 +8,7 @@ LabelFirstFrame.py — 手动定位食材入锅帧 + 交互标注（支持多关
 
 food_labels.json 结构（多关键帧格式）：
 {
-  "video_path": "rgb_20260428_121157.mp4",
+  "video_path": "path/to/rgb_video.mp4",
   "fps": 25.0,
   "keyframes": [        <- 食材标注（正向追踪）
     {
@@ -175,7 +175,8 @@ def save_labels(data, json_path):
 # ── 绘制 ──────────────────────────────────────────────────────────────────────
 
 def draw_frame(frame, fg_points, bg_points, frame_idx, total_frames, fps,
-               mode_label="initial_food", existing_kf_count=0):
+               mode_label="initial_food", existing_kf_count=0,
+               guide_text=None, guide_title=None):
     """在帧上绘制已标注的点和信息"""
     vis = frame.copy()
     H, W = vis.shape[:2]
@@ -190,26 +191,29 @@ def draw_frame(frame, fg_points, bg_points, frame_idx, total_frames, fps,
 
     # 信息栏
     overlay = vis.copy()
-    cv2.rectangle(overlay, (0, 0), (W, 100), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.5, vis, 0.5, 0, vis)
+    cv2.rectangle(overlay, (0, 0), (W, 150), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.78, vis, 0.22, 0, vis)
 
     ts = frame_idx / fps
     m, s = divmod(int(ts), 60)
 
     mode_color = (100, 255, 100) if existing_kf_count == 0 else (100, 200, 255)
 
-    cv2.putText(vis, f"Frame: {frame_idx}/{total_frames}  Time: {m:02d}:{s:02d}",
-                (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-    cv2.putText(vis, f"Mode: {mode_label}  existing food keyframes: {existing_kf_count}",
-                (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.50, mode_color, 1)
-    cv2.putText(vis, f"FG points: {len(fg_points)}  BG points: {len(bg_points)}",
-                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (100, 255, 100), 1)
+    if guide_title is None:
+        guide_title = f"Mode: {mode_label}"
+    if guide_text is None:
+        guide_text = "Forward food: LMB=food FG, RMB=background BG. Inverse bottom: LMB=bottom FG, RMB=food BG."
+    cv2.putText(vis, guide_title,
+                (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.92, (0, 255, 255), 2)
+    cv2.putText(vis, guide_text,
+                (18, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 240, 255), 2)
+    cv2.putText(vis, f"Frame: {frame_idx}/{total_frames}  Time: {m:02d}:{s:02d}  Label: {mode_label}",
+                (18, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
+    cv2.putText(vis, f"FG points: {len(fg_points)}  BG points: {len(bg_points)}  existing food keyframes: {existing_kf_count}",
+                (18, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.50, mode_color, 1)
     cv2.putText(vis,
-                "[LMB]=FG  [RMB]=BG  [Z]=Undo  [S]=Save  [Q]=Quit  [</>]=Frame",
-                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1)
-    cv2.putText(vis,
-                "Food mode: LMB on food, RMB on background/wok. Bottom mode: LMB on bottom, RMB on food.",
-                (10, 97), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180, 220, 255), 1)
+                "[LMB]=FG  [RMB]=BG  [Z]=Undo  [S]=Save  [Q]=Quit  [A/D]=30 frames  [[/]]=1 frame",
+                (18, 144), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (215, 215, 215), 1)
 
     return vis
 
@@ -486,9 +490,11 @@ def main():
         mode_label  = args.label or "initial_bottom"
         current_idx = args.frame if args.frame is not None else 0
         current_idx = max(0, min(current_idx, total_frames - 1))
+        guide_title = "STEP 2/3  RGB INVERSE BOTTOM"
+        guide_text = "LMB = bottom FG    RMB = food BG"
         print("[mode] RGB inverse semantic / wok-bottom reference")
         print(f"[mode] save target: bottom_keyframes  label={mode_label}  frame={current_idx}")
-        print("[how] Left click = wok bottom/body. Right click = food or non-bottom background.")
+        print("[how] Left click = wok bottom. Right click = food.")
         print()
     elif args.append:
         if existing_kf_count == 0:
@@ -496,6 +502,8 @@ def main():
         mode_label = args.label or f"food_keyframe_{existing_kf_count + 1}"
         current_idx = args.frame if args.frame is not None else 0
         current_idx = max(0, min(current_idx, total_frames - 1))
+        guide_title = "RGB FORWARD FOOD"
+        guide_text = "LMB = food FG    RMB = background BG"
         print("[mode] RGB forward tracking / append extra food keyframe")
         print(f"[mode] save target: keyframes append/replace  label={mode_label}  frame={current_idx}")
     else:
@@ -511,6 +519,8 @@ def main():
         mode_label  = args.label or "initial_food"
         current_idx = args.frame if args.frame is not None else 0
         current_idx = max(0, min(current_idx, total_frames - 1))
+        guide_title = "STEP 1/3  RGB FORWARD FOOD"
+        guide_text = "LMB = food FG    RMB = background BG"
         print("[mode] RGB forward tracking / main food reference")
         print(f"[mode] save target: keyframes[0]  label={mode_label}  frame={current_idx}")
 
@@ -538,7 +548,7 @@ def main():
     bg_points  = []
     all_points = []   # (x, y, label) 用于撤销
 
-    win_name = "LabelFirstFrame - food/bottom labeling"
+    win_name = guide_title
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, min(W, 1280), min(H + 10, 740))
 
@@ -557,7 +567,7 @@ def main():
         if frame_now is not None:
             vis = draw_frame(frame_now, fg_points, bg_points,
                              current_idx, total_frames, fps,
-                             mode_label, existing_kf_count)
+                             mode_label, existing_kf_count, guide_text, guide_title)
             cv2.imshow(win_name, vis)
 
     param = {"frame": None}
@@ -573,7 +583,7 @@ def main():
         param["frame"] = frame
         vis = draw_frame(frame, fg_points, bg_points,
                          current_idx, total_frames, fps,
-                         mode_label, existing_kf_count)
+                         mode_label, existing_kf_count, guide_text, guide_title)
         cv2.imshow(win_name, vis)
 
         key = cv2.waitKey(0) & 0xFF

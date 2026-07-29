@@ -2,7 +2,7 @@
 TrackFood.py — SAM2 视频追踪食材 + 温度融合（分批处理版）
 
 流程：
-1. 读取 food_labels.json（由 LabelFirstFrame.py 生成）
+1. 读取 food_labels.json（由 LabelInitialSetup.py 统一初始标注生成）
 2. 将视频分批抽帧（每批 CHUNK_SIZE 帧），避免内存溢出
 3. 用 SAM2 VideoPredictor 逐批追踪食材，批间传递 mask 状态
 4. 每帧输出食材 mask
@@ -236,7 +236,7 @@ def main():
     # ── 检查依赖文件 ──────────────────────────────────────────────────────────
     if not os.path.exists(labels_json):
         print(f"[error] labels file not found: {labels_json}")
-        print("请先运行 LabelFirstFrame.py 完成标注")
+        print("请先运行 core/LabelInitialSetup.py 完成统一初始标注")
         sys.exit(1)
 
     video_path, start_frame, keyframes, bottom_keyframes = _label_io.load_labels(
@@ -426,6 +426,59 @@ def main():
     # ── 加载 IR 锅区域配置（用于 IR 自动分割温度曲线）────────────────────────
     IR_FOOD_PCT = 40   # 锅内低于此百分位的像素 = 菜
     wok_cfg, wok_mask_ir = _ir_wok.load_ir_wok_region(wok_cfg_path, temp_data)
+    _output_utils.save_run_config_snapshot(out_dir, {
+        "run_timestamp": run_ts,
+        "inputs": {
+            "labels_json": os.path.abspath(labels_json),
+            "video_path": os.path.abspath(video_path),
+            "temp_npy_path": os.path.abspath(TEMP_NPY_PATH) if TEMP_NPY_PATH else None,
+            "homography_path": os.path.abspath(homography_path),
+            "wok_region_path": os.path.abspath(wok_cfg_path),
+            "run_config_path": os.path.abspath(runtime_cfg.run_config_path) if runtime_cfg.run_config_path else None,
+            "output_root": os.path.abspath(output_root),
+        },
+        "video": {
+            "start_frame": int(start_frame),
+            "track_end_frame": int(track_end_frame),
+            "track_frames": int(track_frames),
+            "total_frames": int(total_frames),
+            "fps": float(fps),
+            "width": int(VW),
+            "height": int(VH),
+            "max_frames": int(max_frames) if max_frames is not None else None,
+        },
+        "ir": {
+            "total_frames": int(ir_total_frames) if ir_total_frames is not None else None,
+            "food_seg_mode": IR_FOOD_SEG_MODE,
+            "food_seg_percentile": int(IR_FOOD_SEG_PERCENTILE),
+            "panel_seg_mode": IR_PANEL_SEG_MODE,
+            "wok_strategy": ir_wok_strategy,
+            "wok_region_loaded": bool(wok_cfg is not None),
+        },
+        "sam2": {
+            "chunk_size": int(CHUNK_SIZE),
+            "optical_flow_interval": int(OPTICAL_FLOW_INTERVAL),
+            "infer_size": SAM2_INFER_SIZE,
+            "model_cfg": MODEL_CFG,
+            "checkpoint_path": os.path.abspath(CHECKPOINT_PATH),
+            "device": str(device),
+            "cuda_name": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
+        },
+        "switches": {
+            "relabel_interval_s": float(RELABEL_INTERVAL_S),
+            "enable_upright_wok_freeze": bool(ENABLE_UPRIGHT_WOK_FREEZE),
+            "forward_upper_wok_enable": bool(FORWARD_UPPER_WOK_ENABLE),
+        },
+        "thresholds": {
+            "forward_axis_dynamic_max_shift_ir": float(FORWARD_AXIS_DYNAMIC_MAX_SHIFT_IR),
+            "forward_upper_wok_ratio": float(FORWARD_UPPER_WOK_RATIO),
+            "forward_upper_wok_stuck_frames": int(FORWARD_UPPER_WOK_STUCK_FRAMES),
+            "forward_upper_wok_min_mask_pct": float(FORWARD_UPPER_WOK_MIN_MASK_PCT),
+            "forward_upper_wok_max_mask_pct": float(FORWARD_UPPER_WOK_MAX_MASK_PCT),
+            "inverse_reset_min_ratio": float(INVERSE_RESET_MIN_RATIO),
+            "inverse_reset_max_ratio": float(INVERSE_RESET_MAX_RATIO),
+        },
+    })
 
     # ── 动态 wok 中心跟踪状态（方案B：用温度梯度跟踪锅中心漂移）───────────────
     # 手持拍摄时相机抖动导致 IR 中锅的位置帧间偏移，用高温区质心动态修正 cx/cy
@@ -2316,6 +2369,7 @@ def main():
                 # inverse_mask = wok_rgb_ellipse(动态) & ~bottom_sam2_mask
                 # 即：锅内除锅底以外的区域 = 食材区域（另一种语义）
                 inverse_temp_mean = float("nan")
+                inverse_valid = False
                 if has_bottom and bottom_chunk_masks:
                     try:
                         _bm_raw = bottom_chunk_masks.get(local_in_chunk)
@@ -2349,6 +2403,7 @@ def main():
                             )
                             _inv_too_large = _inv_reset["too_large"]
                             _inv_too_small = _inv_reset["too_small"]
+                            inverse_valid = not _inv_reset["need_reset"]
                             if _inv_reset["need_reset"]:
                                 _bottom_fail_streak += 1
                                 if (_bottom_auto_reset is None and temp_data is not None
@@ -2453,6 +2508,7 @@ def main():
                     inverse_temp_mean,
                     roi_temp_mean,
                     forward_valid=forward_temp_valid,
+                    inverse_valid=inverse_valid,
                     previous_final_temp=_last_final_temp,
                 )
                 final_temp = final_decision["final_temp"]

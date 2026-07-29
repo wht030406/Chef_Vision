@@ -13,21 +13,21 @@ Mask 方案（当前：HSV 颜色分割，后续替换 build_mask() 函数即可
   - 最终：SAM2 自动分割食物区域
 
 用法：
-  1. 修改下方 RGB_FILE / NPY_FILE 为实际文件名
-  2. 运行：python TempFilter.py
+  1. 运行：python TempFilter.py --video path/to/rgb.mp4 --npy path/to/temp.npy
   3. 查看输出的 filter_result.png
 """
 
 import numpy as np
 import cv2
 import os
+import argparse
 
 # ============================================================
 # 配置：修改这里的文件名
 # ============================================================
 _HERE           = os.path.dirname(os.path.abspath(__file__))
-RGB_FILE        = os.path.join(_HERE, "..", "data", "rgb_20260428_121157.mp4")
-NPY_FILE        = os.path.join(_HERE, "..", "data", "temp_20260428_121546.npy")
+RGB_FILE        = None
+NPY_FILE        = None
 HOMOGRAPHY_FILE = os.path.join(_HERE, "..", "data", "homography.npy")
 
 # HSV 颜色过滤范围（临时占位，后续替换 build_mask() 函数）
@@ -236,6 +236,19 @@ def save_visualization(rgb_frame, rgb_aligned, temp_frame, mask, result,
 # 主流程
 # ============================================================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="早期 RGB/IR HSV 温度过滤验证")
+    parser.add_argument("--video", required=True, help="RGB 视频路径")
+    parser.add_argument("--npy", required=True, help="温度矩阵 .npy 路径")
+    parser.add_argument("--homography", default=HOMOGRAPHY_FILE,
+                        help="homography.npy 路径")
+    parser.add_argument("--frame", type=int, default=ANALYZE_FRAME,
+                        help="分析帧号")
+    args = parser.parse_args()
+    RGB_FILE = args.video
+    NPY_FILE = args.npy
+    HOMOGRAPHY_FILE = args.homography
+    ANALYZE_FRAME = args.frame
+
     print("=" * 55)
     print("  Chef Vision - 温度过滤分析")
     print("=" * 55)

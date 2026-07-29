@@ -1,6 +1,7 @@
 import os
 import sys
 import subprocess
+import json
 
 import cv2
 import numpy as np
@@ -17,6 +18,15 @@ except ImportError:
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def save_run_config_snapshot(out_dir, snapshot):
+    """Save the resolved inputs and key switches for this tracking run."""
+    path = os.path.join(out_dir, "run_config.json")
+    with open(path, "w", encoding="utf-8") as file_obj:
+        json.dump(snapshot, file_obj, ensure_ascii=False, indent=2)
+    print(f"[config] run snapshot saved: {path}")
+    return path
 
 
 def _save_three_xlsx(sam2_rows, roi_rows, ir_rows, out_dir, inverse_rows=None, final_rows=None):

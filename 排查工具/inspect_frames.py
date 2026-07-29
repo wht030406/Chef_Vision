@@ -1,11 +1,18 @@
 """提取关键帧截图，诊断 mask 异常扩张区域"""
+import argparse
 import cv2, os, csv
 import numpy as np
 
 _HERE      = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH   = os.path.join(_HERE, "..", "output", "food_temp_log.csv")
-VIDEO_PATH = os.path.join(_HERE, "..", "data",   "rgb_20260428_121157.mp4")
-OUT_DIR    = os.path.join(_HERE, "..", "output", "inspect_frames")
+parser = argparse.ArgumentParser(description="按追踪结果 CSV 抽取重点 RGB 帧")
+parser.add_argument("--csv", required=True, help="追踪结果 CSV 路径")
+parser.add_argument("--video", required=True, help="RGB 视频路径")
+parser.add_argument("--out", default=os.path.join(_HERE, "..", "output", "inspect_frames"),
+                    help="输出目录")
+args = parser.parse_args()
+CSV_PATH   = args.csv
+VIDEO_PATH = args.video
+OUT_DIR    = args.out
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # 读取 mask 数据

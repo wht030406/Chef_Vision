@@ -1,44 +1,94 @@
-tools/ — 数据准备工具集
-==============================
+# tools 目录说明
 
-本目录收纳的是为主流程「准备输入数据」的工具，它们生成主程序
-(core/TrackFood.py) 运行所需的配置或干净数据集。它们不是主流程的
-一部分，按需手动运行一次即可。
+`tools/` 保存主流程运行前的数据准备工具。它们不是
+`core/TrackFood.py` 的自动步骤，而是标定、锅区建立或数据同步剪辑时按需
+手动运行。
 
-（原先混在这里的验证/调试脚本 SegmentFood / TempFilter / VerifyData /
- _check_syntax 已于 2026-07-24 移入 排查工具/。）
+开发排查脚本放在根目录 `排查工具/`，不要把两类工具混用。
 
+## 1. Calibrate.py
 
-工具说明
---------
+作用：在多个 RGB/IR 对应画面上手工点击同名点，计算 RGB 到 IR 的单应矩阵。
 
-  Calibrate.py              【RGB/IR 标定】
-                            多帧手动点选对应点，计算 RGB→IR 单应矩阵。
-                            输出：data/homography.npy
-                            主程序追踪时用它把 mask 映射到红外坐标。
+```powershell
+python tools/Calibrate.py `
+  --video test_data/test8_1/rgb_20260707_153017.mp4 `
+  --npy test_data/test8_1/temp_20260707_153017.npy
+```
 
-  auto_wok_detect.py        【锅区自动检测】
-                            从 IR 温度数据自动检测锅的椭圆区域
-                            （锅壁高温圆环 → 温度阈值分割 + 椭圆拟合）。
-                            输出：data/wok_region.json
-                            主程序追踪时读它定位锅区与旋转轴排除圆。
-                            用法示例：
-                              python tools/auto_wok_detect.py \
-                                --temp data/temp_20260428_121546.npy \
-                                --start_sec 5 --out data/wok_region.json
+输出：
 
-  trim_dataset_segments.py  【数据集片段裁剪】
-                            按指定时间段（秒）从 RGB 视频 + IR + 温度数据
-                            中同步剪掉片段（如锅直立、空锅等无效时段），
-                            生成对齐的新数据集目录。
-                            用法示例：
-                              python tools/trim_dataset_segments.py \
-                                --src-dir data --dst-dir data_trimmed \
-                                --rgb rgb_xxx.mp4 --ir ir_xxx.mp4 \
-                                --temp temp_xxx.npy --segments 33-38 40-46
+```text
+data/homography.npy
+```
 
+注意：
 
-说明
-----
-  这三个工具生成的 homography.npy / wok_region.json 是主程序的必需
-  配置，存放在 data/ 目录（主程序以 ../data 相对路径读取）。
+- 会覆盖当前标定矩阵。
+- 选择分布在画面不同位置、在 RGB/IR 中都可辨认的对应点。
+- 相机移动、裁剪或分辨率变化后需要重新标定。
+- 保存后使用 `排查工具/check_ir_align.py` 验证。
+
+## 2. auto_wok_detect.py
+
+作用：在若干 IR 温度帧的平均图中寻找高温锅环并拟合椭圆。
+
+```powershell
+python tools/auto_wok_detect.py `
+  --temp test_data/test8_1/temp_20260707_153017.npy `
+  --start_sec 5 `
+  --out data/wok_region.json `
+  --viz tools/auto_wok_detect_result.jpg
+```
+
+重要参数：
+
+- `--start_sec`：选择锅形较清晰、温度较稳定的起点。
+- `--rx_scale`：横向半径缩放，当前默认 0.85。
+- `--ry_scale`：纵向半径缩放，当前默认 1.0。
+
+自动检测只生成锅椭圆基础结果。旋转轴中心和排除半径仍需人工检查；若输出
+JSON 缺少主程序所需字段，应通过现有标注流程补齐。
+
+## 3. trim_dataset_segments.py
+
+作用：同步删除 RGB、IR 视频和温度矩阵中的指定时间段，生成新的剪辑测试集。
+
+```powershell
+python tools/trim_dataset_segments.py `
+  --src-dir test_data/test8 `
+  --dst-dir test_data/test8_1_new `
+  --rgb rgb_20260707_153017.mp4 `
+  --ir ir_20260707_153017.mp4 `
+  --temp temp_20260707_153017.npy `
+  --segments 0-1.5 40-48 55-63
+```
+
+输出目录包含同步剪辑后的数据和 `trim_summary.json`。工具会按时间建立保留
+掩码，不能用它代替精确的硬件同步校准。
+
+## 4. 推荐的数据准备顺序
+
+```text
+field/ 采集
+   |
+   +--> 可选：trim_dataset_segments.py
+   |
+   +--> Calibrate.py 生成 homography.npy
+   |
+   +--> auto_wok_detect.py / 人工标注锅区
+   |
+   +--> LabelInitialSetup.py 顺序完成正向、反向和 IR 锅区初始标注
+   |
+   v
+TrackFood.py
+```
+
+## 5. 注意事项
+
+1. 这些工具会写配置或新数据，运行前确认输出路径。
+2. 不要在只想“看效果”时无意覆盖 `data/homography.npy` 或
+   `data/wok_region.json`。
+3. 自动锅区结果不是最终真值，需要结合 RGB/IR 对齐画面检查。
+4. 剪辑后要使用新的时间戳和标注，不能直接沿用原视频帧号。
+5. 旧调试工具已归档到 `排查工具/`；那里部分脚本含失效的默认路径。

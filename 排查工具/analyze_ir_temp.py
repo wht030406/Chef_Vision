@@ -11,15 +11,20 @@ analyze_ir_temp.py — 分析红外温度数据分布
 import numpy as np
 import cv2
 import os
+import argparse
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 _HERE      = os.path.dirname(os.path.abspath(__file__))
-TEMP_NPY   = os.path.join(_HERE, "..", "data",   "temp_20260428_121546.npy")
-VIDEO_PATH = os.path.join(_HERE, "..", "data",   "rgb_20260428_121157.mp4")
-OUT_DIR    = os.path.join(_HERE, "..", "output", "ir_analysis")
+parser = argparse.ArgumentParser(description="分析指定红外温度矩阵的温度分布")
+parser.add_argument("--npy", required=True, help="温度矩阵 .npy 路径")
+parser.add_argument("--out", default=os.path.join(_HERE, "..", "output", "ir_analysis"),
+                    help="输出目录")
+args = parser.parse_args()
+TEMP_NPY   = args.npy
+OUT_DIR    = args.out
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # 要分析的帧索引（绝对帧号，和 RGB 视频对齐）
