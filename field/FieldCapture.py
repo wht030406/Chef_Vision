@@ -31,7 +31,7 @@ import urllib.request
 from datetime import datetime
 from ctypes import (
     c_int, c_int64, c_uint8, c_uint16, c_uint32, c_uint64, c_void_p,
-    POINTER, Structure, CFUNCTYPE, string_at, c_char
+    POINTER, Structure, CFUNCTYPE, string_at, c_char, c_char_p
 )
 import threading
 
@@ -55,6 +55,13 @@ FILL_LIGHT_HTTP_AUTO_LOGIN = True
 FILL_LIGHT_HTTP_PASSWORD_PARAM = "G3D2cWdjF+Rp6EYEOj7ZTg=="
 FILL_LIGHT_USE_PTZ_AUX   = False
 PTZ_CMD_LIGHT            = 15
+
+# Sync the device OSD/system clock to this laptop when the capture script starts.
+SYNC_DEVICE_TIME_ON_START = True
+
+# Temperature range/gain mode to apply at startup:
+#   "auto" = AUTO, "low" = LG, "high" = HG, "keep" = query only.
+TEMP_LEVEL_MODE_ON_START = "auto"
 
 # DLL 路径（与本脚本同目录，适配下位机所有文件放在同一文件夹的情况）
 _HERE    = os.path.dirname(os.path.abspath(__file__))
@@ -147,6 +154,7 @@ ir_frame_count  = 0
 fill_light_level = 0
 fill_light_original_config = None
 fill_light_http_token = ""
+temperature_level_label = "UNKNOWN"
 rec_ts          = None   # 录制开始时间戳（按 S 时记录，视频和 npy 共用）
 
 # IR 视频输出分辨率（原始 192×256 放大 2 倍，方便查看）
@@ -187,6 +195,11 @@ def load_dll():
     dll.IRC_NET_Logout.argtypes = [c_uint64]
     dll.IRC_NET_Logout.restype  = c_int
 
+    # IRC_NET_SyncSystemTime
+    if hasattr(dll, "IRC_NET_SyncSystemTime"):
+        dll.IRC_NET_SyncSystemTime.argtypes = [c_uint64, c_char_p]
+        dll.IRC_NET_SyncSystemTime.restype = c_int
+
     # IRC_NET_StartPreview_V2 / StopPreview
     dll.IRC_NET_StartPreview_V2.argtypes = [
         c_uint64, POINTER(IRC_NET_PREVIEW_INFO), VIDEO_CALLBACK, c_void_p
@@ -200,6 +213,14 @@ def load_dll():
     dll.IRC_NET_StartPullTemp_V2.restype  = c_int
     dll.IRC_NET_StopPullTemp.argtypes = [c_uint64]
     dll.IRC_NET_StopPullTemp.restype  = c_int
+
+    # Optional temperature range/gain query and setting.
+    if hasattr(dll, "IRC_NET_GetTempLevel"):
+        dll.IRC_NET_GetTempLevel.argtypes = [c_uint64, POINTER(c_int)]
+        dll.IRC_NET_GetTempLevel.restype = c_int
+    if hasattr(dll, "IRC_NET_SetTempLevel"):
+        dll.IRC_NET_SetTempLevel.argtypes = [c_uint64, c_int]
+        dll.IRC_NET_SetTempLevel.restype = c_int
 
     # Optional fill light control.
     if hasattr(dll, "IRC_NET_GetFillLightConfigInfo"):
@@ -243,6 +264,84 @@ def sdk_login(dll):
 
     print(f"[OK] 登录成功，句柄: {handle.value}")
     return handle.value
+
+
+def print_temperature_level(dll, handle):
+    """Print the current camera temperature range/gain mode when supported."""
+    global temperature_level_label
+
+    if not hasattr(dll, "IRC_NET_GetTempLevel"):
+        print("[TEMP LEVEL] 当前 SDK 不支持查询测温档位")
+        temperature_level_label = "UNKNOWN"
+        return None
+
+    level = c_int(-1)
+    ret = dll.IRC_NET_GetTempLevel(handle, ctypes.byref(level))
+    if ret != 0:
+        print(f"[TEMP LEVEL] 查询测温档位失败: {ret}")
+        temperature_level_label = "UNKNOWN"
+        return None
+
+    names = {
+        0: ("高增益", "HG"),
+        1: ("低增益", "LG"),
+        2: ("自动", "AUTO"),
+    }
+    cn_name, short_name = names.get(level.value, ("未知档位", f"UNKNOWN-{level.value}"))
+    temperature_level_label = short_name
+    print(f"[TEMP LEVEL] 当前测温档位: {cn_name} {short_name}")
+    return level.value
+
+
+def apply_temperature_level_mode(dll, handle):
+    """Set the camera temperature range/gain mode when configured."""
+    mode = str(TEMP_LEVEL_MODE_ON_START).strip().lower()
+    targets = {
+        "high": (0, "高增益 HG"),
+        "hg": (0, "高增益 HG"),
+        "low": (1, "低增益 LG"),
+        "lg": (1, "低增益 LG"),
+        "auto": (2, "自动 AUTO"),
+        "keep": (None, "保持设备当前档位"),
+    }
+    if mode not in targets:
+        print(f"[TEMP LEVEL] 未知启动档位配置: {TEMP_LEVEL_MODE_ON_START!r}，保持当前档位")
+        return print_temperature_level(dll, handle)
+
+    target_value, target_name = targets[mode]
+    if target_value is None:
+        print("[TEMP LEVEL] 启动档位配置: 保持当前档位")
+        return print_temperature_level(dll, handle)
+
+    if not hasattr(dll, "IRC_NET_SetTempLevel"):
+        print("[TEMP LEVEL] 当前 SDK 不支持设置测温档位，仅查询当前档位")
+        return print_temperature_level(dll, handle)
+
+    ret = dll.IRC_NET_SetTempLevel(handle, int(target_value))
+    if ret != 0:
+        print(f"[TEMP LEVEL] 设置测温档位为 {target_name} 失败: {ret}")
+    else:
+        print(f"[TEMP LEVEL] 已请求设置测温档位为: {target_name}")
+    return print_temperature_level(dll, handle)
+
+
+def sync_device_time(dll, handle):
+    """Synchronize the camera's system/OSD clock to the laptop clock."""
+    if not SYNC_DEVICE_TIME_ON_START:
+        print("[TIME SYNC] 已关闭启动同步设备时间")
+        return False
+    if not hasattr(dll, "IRC_NET_SyncSystemTime"):
+        print("[TIME SYNC] 当前 SDK 不支持同步设备时间")
+        return False
+
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ret = dll.IRC_NET_SyncSystemTime(handle, now_text.encode("utf-8"))
+    if ret != 0:
+        print(f"[TIME SYNC] 同步设备时间失败: {ret}  本机时间={now_text}")
+        return False
+
+    print(f"[TIME SYNC] 已同步设备时间为本机时间: {now_text}")
+    return True
 
 
 def clone_fill_light_config(config):
@@ -625,6 +724,7 @@ def on_video_frame(handle, video_info_ptr, ivs_ptr, user_data):
 def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
     global latest_ir, is_recording, temp_list, temp_count, ir_ts_list
     global ir_video_writer, ir_frame_count, rec_ts
+    global temperature_level_label
     try:
         ti = temp_info_ptr.contents
         if ti.width <= 0 or ti.height <= 0:
@@ -674,6 +774,8 @@ def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
             cv2.putText(colored, f"MIN:{t_min:.1f}C", (4, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             cv2.putText(colored, f"AVG:{float(celsius.mean()):.1f}C", (4, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(colored, f"LEVEL:{temperature_level_label}", (4, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             ir_video_writer.write(colored)
@@ -821,6 +923,8 @@ def main():
     if handle is None:
         input("按 Enter 退出...")
         return
+    apply_temperature_level_mode(dll, handle)
+    sync_device_time(dll, handle)
 
     # 2. 注册回调
     init_fill_light_control(dll, handle)
@@ -933,6 +1037,9 @@ def main():
         # 左右拼接
         light_text = f"White Light: {fill_light_level}  [L]=ON/OFF"
         cv2.putText(right, light_text, (10, PREVIEW_H - 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        level_text = f"Temp Level: {temperature_level_label}"
+        cv2.putText(right, level_text, (10, PREVIEW_H - 75),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
         combined = np.hstack([left, right])

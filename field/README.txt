@@ -49,6 +49,39 @@ cd D:\path\to\field
 python FieldCapture.py
 ```
 
+启动并登录设备后，终端会打印当前测温档位：
+
+```text
+[TEMP LEVEL] 当前测温档位: 高增益 HG
+[TEMP LEVEL] 当前测温档位: 低增益 LG
+[TEMP LEVEL] 当前测温档位: 自动 AUTO
+```
+
+右侧 IR 预览页和录制的 IR 伪彩色视频也会显示 `Temp Level` / `LEVEL`。
+默认启动时会请求把设备测温档位设置为 `AUTO`，然后再次查询确认最终档位。
+若现场不希望程序主动设置档位，可在 `FieldCapture.py` 顶部把
+`TEMP_LEVEL_MODE_ON_START` 改为 `"keep"`。可选值包括：
+
+```text
+"auto"  自动 AUTO
+"low"   低增益 LG
+"high"  高增益 HG
+"keep"  只查询，不修改
+```
+
+若设备处于 `HG` 而不是 `AUTO`，温度超过高增益量程时不会自动切到低增益。
+若采集数据长期卡在约 196°C，可优先检查这里是否显示为 `HG`。
+
+启动时还会调用 SDK 同步设备系统时间到当前电脑时间：
+
+```text
+[TIME SYNC] 已同步设备时间为本机时间: 2026-07-28 10:53:32
+```
+
+这用于让 RGB 画面右上角的设备 OSD 时间与录制电脑时间对齐。若现场不希望
+程序改设备时间，可在 `FieldCapture.py` 顶部把 `SYNC_DEVICE_TIME_ON_START`
+改为 `False`。
+
 ### 快捷键
 
 | 按键 | 功能 |
