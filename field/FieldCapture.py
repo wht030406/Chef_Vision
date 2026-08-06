@@ -7,7 +7,7 @@
   4. 自动以时间戳命名文件，不会覆盖之前的录制
 
 依赖：
-  pip install numpy opencv-python
+  pip install numpy opencv-python matplotlib
 
 运行方式：
   python FieldCapture.py
@@ -19,6 +19,7 @@
 """
 
 import ctypes
+import csv
 import numpy as np
 import cv2
 import time
@@ -71,6 +72,13 @@ DLL_PATH = os.path.join(DLL_DIR, "IRCNetSDK.dll")
 # 数据输出目录（与本脚本同目录）
 _DATA_DIR = _HERE
 os.makedirs(_DATA_DIR, exist_ok=True)
+
+# RGB -> IR spatial calibration. Prefer a self-contained copy next to this
+# script, then fall back to the main project's data directory.
+HOMOGRAPHY_PATHS = (
+    os.path.join(_HERE, "homography.npy"),
+    os.path.join(_HERE, "..", "data", "homography.npy"),
+)
 
 # ============================================================
 # SDK 结构体定义
@@ -146,6 +154,7 @@ is_recording    = False
 video_writer    = None
 ir_video_writer = None   # IR 伪彩色视频写入器
 temp_list       = []
+roi_temp_rows   = []     # 逐帧 ROI 温度统计，用于 CSV 和曲线图
 rgb_ts_list     = []     # RGB 逐帧时间戳（Unix float64）
 ir_ts_list      = []     # IR 逐帧时间戳（Unix float64）
 frame_count     = 0
@@ -156,10 +165,18 @@ fill_light_original_config = None
 fill_light_http_token = ""
 temperature_level_label = "UNKNOWN"
 rec_ts          = None   # 录制开始时间戳（按 S 时记录，视频和 npy 共用）
+rgb_source_w    = 1600   # RGB 原始尺寸，由视频回调持续更新
+rgb_source_h    = 1200
+roi_homography  = None
+roi_mapping_label = "SCALE"
+_roi_mask_cache_key = None
+_roi_mask_cache = None
 
 # IR 视频输出分辨率（原始 192×256 放大 2 倍，方便查看）
 IR_VIDEO_W = 512
 IR_VIDEO_H = 384
+PREVIEW_W  = 640
+PREVIEW_H  = 480
 
 # ============================================================
 # ROI 配置（圆形监测区域，在 RGB 预览坐标系下定义）
@@ -313,6 +330,11 @@ def apply_temperature_level_mode(dll, handle):
         print("[TEMP LEVEL] 启动档位配置: 保持当前档位")
         return print_temperature_level(dll, handle)
 
+    return set_temperature_level(dll, handle, target_value, target_name)
+
+
+def set_temperature_level(dll, handle, target_value, target_name):
+    """Set one device temperature range and query the applied value."""
     if not hasattr(dll, "IRC_NET_SetTempLevel"):
         print("[TEMP LEVEL] 当前 SDK 不支持设置测温档位，仅查询当前档位")
         return print_temperature_level(dll, handle)
@@ -323,6 +345,17 @@ def apply_temperature_level_mode(dll, handle):
     else:
         print(f"[TEMP LEVEL] 已请求设置测温档位为: {target_name}")
     return print_temperature_level(dll, handle)
+
+
+def switch_temperature_level(dll, handle, mode):
+    """Switch temperature range from a runtime hotkey."""
+    targets = {
+        "high": (0, "高增益 HG"),
+        "low": (1, "低增益 LG"),
+        "auto": (2, "自动 AUTO"),
+    }
+    target_value, target_name = targets[mode]
+    return set_temperature_level(dll, handle, target_value, target_name)
 
 
 def sync_device_time(dll, handle):
@@ -689,6 +722,7 @@ def shutdown_fill_light_now(dll, handle):
 
 def on_video_frame(handle, video_info_ptr, ivs_ptr, user_data):
     global latest_rgb, is_recording, video_writer, frame_count, rec_ts, rgb_ts_list
+    global rgb_source_w, rgb_source_h
     try:
         vi = video_info_ptr.contents
         if vi.width <= 0 or vi.height <= 0:
@@ -704,6 +738,8 @@ def on_video_frame(handle, video_info_ptr, ivs_ptr, user_data):
 
         with lock_rgb:
             latest_rgb = bgr.copy()
+            rgb_source_w = vi.width
+            rgb_source_h = vi.height
 
         if is_recording:
             if video_writer is None:
@@ -724,7 +760,7 @@ def on_video_frame(handle, video_info_ptr, ivs_ptr, user_data):
 def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
     global latest_ir, is_recording, temp_list, temp_count, ir_ts_list
     global ir_video_writer, ir_frame_count, rec_ts
-    global temperature_level_label
+    global temperature_level_label, roi_temp_rows
     try:
         ti = temp_info_ptr.contents
         if ti.width <= 0 or ti.height <= 0:
@@ -741,9 +777,22 @@ def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
             latest_ir = celsius.copy()
 
         if is_recording:
+            frame_ts = time.time()
+            roi_stats, roi_mask = compute_roi_temperature_stats(celsius)
+
             # 保存温度矩阵（精度数据）
             temp_list.append(celsius)
-            ir_ts_list.append(time.time())    # 记录本帧时间戳
+            ir_ts_list.append(frame_ts)       # 记录本帧时间戳
+            roi_temp_rows.append({
+                "frame_index": temp_count,
+                "unix_timestamp": frame_ts,
+                "elapsed_s": frame_ts - ir_ts_list[0],
+                "roi_min_c": roi_stats["min"] if roi_stats else float("nan"),
+                "roi_max_c": roi_stats["max"] if roi_stats else float("nan"),
+                "roi_avg_c": roi_stats["avg"] if roi_stats else float("nan"),
+                "roi_pixel_count": roi_stats["pixel_count"] if roi_stats else 0,
+                "temp_level": temperature_level_label,
+            })
             temp_count += 1
 
             # 同步录制 IR 伪彩色视频
@@ -768,13 +817,17 @@ def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
             colored = cv2.resize(colored, (IR_VIDEO_W, IR_VIDEO_H),
                                  interpolation=cv2.INTER_NEAREST)
 
-            # 叠加温度信息文字
-            cv2.putText(colored, f"MAX:{t_max:.1f}C", (4, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(colored, f"MIN:{t_min:.1f}C", (4, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(colored, f"AVG:{float(celsius.mean()):.1f}C", (4, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            draw_ir_roi_outline(colored, roi_mask)
+            if roi_stats:
+                cv2.putText(colored, f"ROI MAX:{roi_stats['max']:.1f}C", (4, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(colored, f"ROI MIN:{roi_stats['min']:.1f}C", (4, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(colored, f"ROI AVG:{roi_stats['avg']:.1f}C", (4, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            else:
+                cv2.putText(colored, "ROI TEMP:N/A", (4, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             cv2.putText(colored, f"LEVEL:{temperature_level_label}", (4, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
@@ -787,6 +840,175 @@ def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
 # ============================================================
 # ROI 工具函数
 # ============================================================
+
+def load_roi_homography():
+    """Load RGB -> IR calibration, with proportional mapping as fallback."""
+    global roi_homography, roi_mapping_label
+    for path in HOMOGRAPHY_PATHS:
+        if not os.path.exists(path):
+            continue
+        try:
+            matrix = np.load(path)
+            if matrix.shape != (3, 3):
+                raise ValueError(f"shape={matrix.shape}")
+            roi_homography = matrix.astype(np.float64)
+            roi_mapping_label = "H"
+            print(f"[ROI] 已加载 RGB->IR 标定矩阵: {os.path.abspath(path)}")
+            return True
+        except Exception as exc:
+            print(f"[ROI] 标定矩阵读取失败: {path}  {exc}")
+
+    roi_homography = None
+    roi_mapping_label = "SCALE"
+    print("[ROI] 未找到 homography.npy，将按画面比例映射 ROI")
+    return False
+
+
+def build_ir_roi_mask(temp_shape):
+    """Project the current RGB preview ROI into one IR-frame mask."""
+    global _roi_mask_cache_key, _roi_mask_cache
+
+    ir_h, ir_w = temp_shape[:2]
+    rgb_w = max(int(rgb_source_w), 1)
+    rgb_h = max(int(rgb_source_h), 1)
+    cache_key = (
+        ir_h, ir_w, rgb_w, rgb_h,
+        int(roi_cx), int(roi_cy), int(roi_radius),
+        id(roi_homography),
+    )
+    if cache_key == _roi_mask_cache_key and _roi_mask_cache is not None:
+        return _roi_mask_cache
+
+    sx = rgb_w / PREVIEW_W
+    sy = rgb_h / PREVIEW_H
+    angles = np.linspace(0.0, 2.0 * np.pi, 72, endpoint=False)
+    points_rgb = np.column_stack((
+        roi_cx * sx + roi_radius * sx * np.cos(angles),
+        roi_cy * sy + roi_radius * sy * np.sin(angles),
+    )).astype(np.float32).reshape(-1, 1, 2)
+
+    if roi_homography is not None:
+        points_ir = cv2.perspectiveTransform(points_rgb, roi_homography).reshape(-1, 2)
+    else:
+        points_ir = points_rgb.reshape(-1, 2)
+        points_ir[:, 0] *= ir_w / rgb_w
+        points_ir[:, 1] *= ir_h / rgb_h
+
+    points_ir = points_ir[np.isfinite(points_ir).all(axis=1)]
+    if len(points_ir) < 3:
+        return None
+
+    points_ir[:, 0] = np.clip(points_ir[:, 0], 0, ir_w - 1)
+    points_ir[:, 1] = np.clip(points_ir[:, 1], 0, ir_h - 1)
+    polygon = np.round(points_ir).astype(np.int32)
+    mask = np.zeros((ir_h, ir_w), dtype=np.uint8)
+    cv2.fillPoly(mask, [polygon], 255)
+    if not np.any(mask):
+        return None
+
+    _roi_mask_cache_key = cache_key
+    _roi_mask_cache = mask
+    return mask
+
+
+def compute_roi_temperature_stats(temp_matrix):
+    """Return min/max/average temperature inside the current RGB ROI."""
+    roi_mask = build_ir_roi_mask(temp_matrix.shape)
+    if roi_mask is None:
+        return None, None
+    values = temp_matrix[roi_mask > 0]
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None, roi_mask
+    return {
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
+        "avg": float(np.mean(values)),
+        "pixel_count": int(values.size),
+    }, roi_mask
+
+
+def draw_ir_roi_outline(image, roi_mask):
+    """Draw the projected ROI boundary on an IR preview or recorded frame."""
+    if roi_mask is None:
+        return
+    resized_mask = cv2.resize(
+        roi_mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST
+    )
+    contours, _ = cv2.findContours(
+        resized_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    cv2.drawContours(image, contours, -1, (255, 200, 0), 2)
+
+
+def save_roi_temperature_outputs(rows, timestamp, output_dir=None):
+    """Save per-frame ROI statistics to CSV and a temperature curve PNG."""
+    if not rows:
+        print("[ROI] 没有可保存的 ROI 温度记录")
+        return None, None
+
+    output_dir = output_dir or _DATA_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, f"roi_temp_{timestamp}.csv")
+    curve_path = os.path.join(output_dir, f"roi_temp_curve_{timestamp}.png")
+    fieldnames = [
+        "frame_index", "unix_timestamp", "elapsed_s",
+        "roi_min_c", "roi_max_c", "roi_avg_c",
+        "roi_pixel_count", "temp_level",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[OK] ROI 温度数据已保存: {csv_path}  ({len(rows)} 帧)")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        elapsed = np.array([row["elapsed_s"] for row in rows], dtype=float)
+        roi_min = np.array([row["roi_min_c"] for row in rows], dtype=float)
+        roi_max = np.array([row["roi_max_c"] for row in rows], dtype=float)
+        roi_avg = np.array([row["roi_avg_c"] for row in rows], dtype=float)
+        valid = (
+            np.isfinite(elapsed) & np.isfinite(roi_min)
+            & np.isfinite(roi_max) & np.isfinite(roi_avg)
+        )
+        if not np.any(valid):
+            raise ValueError("没有有效 ROI 温度值")
+
+        fig, ax = plt.subplots(figsize=(12, 5.5))
+        ax.fill_between(
+            elapsed[valid], roi_min[valid], roi_max[valid],
+            color="#f4a261", alpha=0.22, label="ROI min-max",
+        )
+        ax.plot(
+            elapsed[valid], roi_avg[valid], color="#d1495b",
+            linewidth=1.4, label="ROI average",
+        )
+        ax.plot(
+            elapsed[valid], roi_max[valid], color="#e76f51",
+            linewidth=0.7, alpha=0.75, label="ROI maximum",
+        )
+        ax.plot(
+            elapsed[valid], roi_min[valid], color="#2a9d8f",
+            linewidth=0.7, alpha=0.75, label="ROI minimum",
+        )
+        ax.set_title("ROI Temperature Curve")
+        ax.set_xlabel("Elapsed time (s)")
+        ax.set_ylabel("Temperature (C)")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        fig.savefig(curve_path, dpi=160)
+        plt.close(fig)
+        print(f"[OK] ROI 温度曲线已保存: {curve_path}")
+    except Exception as exc:
+        curve_path = None
+        print(f"[警告] ROI 温度曲线生成失败: {exc}")
+
+    return csv_path, curve_path
 
 def load_roi_config():
     """从文件加载 ROI 配置，不存在则用默认值"""
@@ -869,8 +1091,9 @@ def roi_mouse_callback(event, x, y, flags, param):
 # 温度矩阵 → 伪彩色图（用于预览）
 # ============================================================
 
-def temp_to_colormap(temp_matrix, width=640, height=480):
-    """将温度矩阵转换为 jet 伪彩色图，用于实时预览"""
+def temp_to_colormap(temp_matrix, width=640, height=480,
+                     roi_stats=None, roi_mask=None):
+    """将温度矩阵转换为 jet 伪彩色图，并显示 RGB ROI 温度。"""
     t_min = np.min(temp_matrix)
     t_max = np.max(temp_matrix)
     if t_max - t_min < 0.1:
@@ -880,13 +1103,17 @@ def temp_to_colormap(temp_matrix, width=640, height=480):
     colored = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
     resized = cv2.resize(colored, (width, height))
 
-    # 叠加温度范围文字
-    cv2.putText(resized, f"MAX: {t_max:.1f}C", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(resized, f"MIN: {t_min:.1f}C", (10, 65),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.putText(resized, f"AVG: {np.mean(temp_matrix):.1f}C", (10, 100),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    draw_ir_roi_outline(resized, roi_mask)
+    if roi_stats:
+        cv2.putText(resized, f"ROI MAX: {roi_stats['max']:.1f}C", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+        cv2.putText(resized, f"ROI MIN: {roi_stats['min']:.1f}C", (10, 62),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+        cv2.putText(resized, f"ROI AVG: {roi_stats['avg']:.1f}C", (10, 94),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+    else:
+        cv2.putText(resized, "ROI TEMP: N/A", (10, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
     return resized
 
 # ============================================================
@@ -895,7 +1122,7 @@ def temp_to_colormap(temp_matrix, width=640, height=480):
 
 def main():
     global is_recording, video_writer, ir_video_writer, ir_frame_count
-    global temp_list, frame_count, temp_count, rec_ts
+    global temp_list, roi_temp_rows, frame_count, temp_count, rec_ts
     global rgb_ts_list, ir_ts_list
     global roi_editing, roi_cx, roi_cy, roi_radius, roi_dragging
 
@@ -907,6 +1134,7 @@ def main():
     print("-" * 55)
     print("  操作说明：")
     print("    [S] 开始录制")
+    print("    [1] 高增益 HG  [2] 低增益 LG  [3] 自动 AUTO")
     print("    [Q] 停止录制并保存，退出程序")
     print("=" * 55)
 
@@ -925,6 +1153,7 @@ def main():
         return
     apply_temperature_level_mode(dll, handle)
     sync_device_time(dll, handle)
+    load_roi_homography()
 
     # 2. 注册回调
     init_fill_light_control(dll, handle)
@@ -948,10 +1177,10 @@ def main():
 
     print("\n[等待数据流...] 画面出现后按 S 开始录制，按 Q 退出")
     print("  [R] 进入/退出 ROI 编辑模式（拖拽移动，滚轮调半径）")
+    print("  [1] 高增益 HG  [2] 低增益 LG  [3] 自动 AUTO")
 
     # 5. 主循环：显示双画面预览
-    PREVIEW_W, PREVIEW_H = 640, 480
-    WIN_NAME = "Chef Vision [S] REC  [Q] Quit  [R] ROI  [L] Light"
+    WIN_NAME = "Chef Vision [S] REC [Q] Quit [R] ROI [L] Light [1/2/3] Temp Level"
 
     # 加载已有 ROI 配置
     load_roi_config()
@@ -980,7 +1209,11 @@ def main():
 
         # 构建右画面（IR 热力图）
         if ir_matrix is not None:
-            right = temp_to_colormap(ir_matrix, PREVIEW_W, PREVIEW_H)
+            roi_stats, roi_mask = compute_roi_temperature_stats(ir_matrix)
+            right = temp_to_colormap(
+                ir_matrix, PREVIEW_W, PREVIEW_H,
+                roi_stats=roi_stats, roi_mask=roi_mask,
+            )
         else:
             right = np.zeros((PREVIEW_H, PREVIEW_W, 3), dtype=np.uint8)
             cv2.putText(right, "等待 IR 信号...", (150, 240),
@@ -992,39 +1225,6 @@ def main():
 
         # 在 RGB 预览上绘制 ROI 圆形
         draw_roi_on_frame(left, editing=roi_editing)
-
-        # 在 IR 预览上绘制对应映射区域（通过单应矩阵，若无则按比例估算）
-        hom_path = os.path.join(_HERE, "..", "data", "homography.npy")
-        if ir_matrix is not None:
-            try:
-                H = np.load(hom_path)
-                # ROI 圆心（预览坐标 → 原始 RGB 坐标 → IR 坐标）
-                sx = rgb_orig_w / PREVIEW_W
-                sy = rgb_orig_h / PREVIEW_H
-                rgb_pt = np.array([[[roi_cx * sx, roi_cy * sy]]], dtype=np.float32)
-                ir_pt  = cv2.perspectiveTransform(rgb_pt, H)[0][0]
-                # IR 坐标 → 预览坐标（IR 原始 192×256 → 640×480）
-                ir_h, ir_w = ir_matrix.shape[:2]
-                ir_px = int(ir_pt[0] / ir_w * PREVIEW_W)
-                ir_py = int(ir_pt[1] / ir_h * PREVIEW_H)
-                ir_pr = int(roi_radius * (PREVIEW_W / ir_w) * (ir_w / rgb_orig_w) * sx)
-                ir_pr = max(5, min(100, ir_pr))
-                cv2.circle(right, (ir_px, ir_py), ir_pr, (255, 200, 0), 2)
-                cv2.circle(right, (ir_px, ir_py), 4, (255, 200, 0), -1)
-                # 显示 ROI 区域温度
-                mask = np.zeros(ir_matrix.shape[:2], dtype=np.uint8)
-                cv2.circle(mask,
-                           (int(ir_pt[0]), int(ir_pt[1])),
-                           max(2, int(roi_radius * ir_w / rgb_orig_w * sx)),
-                           255, -1)
-                roi_temps = ir_matrix[mask > 0]
-                if len(roi_temps) > 0:
-                    roi_t = float(np.mean(roi_temps))
-                    cv2.putText(right, f"ROI: {roi_t:.1f}C",
-                                (ir_px - 40, ir_py - ir_pr - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-            except Exception:
-                pass  # 单应矩阵不存在时跳过
 
         # 录制状态指示
         status_color = (0, 0, 255) if is_recording else (0, 200, 0)
@@ -1038,7 +1238,7 @@ def main():
         light_text = f"White Light: {fill_light_level}  [L]=ON/OFF"
         cv2.putText(right, light_text, (10, PREVIEW_H - 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-        level_text = f"Temp Level: {temperature_level_label}"
+        level_text = f"Temp Level: {temperature_level_label}  [1]HG [2]LG [3]AUTO"
         cv2.putText(right, level_text, (10, PREVIEW_H - 75),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
@@ -1061,6 +1261,7 @@ def main():
                 rec_ts          = datetime.now().strftime("%Y%m%d_%H%M%S")  # 统一时间戳
                 is_recording    = True
                 temp_list       = []
+                roi_temp_rows   = []
                 # Reset the shared timestamp buffers used by the callbacks and final save.
                 rgb_ts_list     = []
                 ir_ts_list      = []
@@ -1074,6 +1275,15 @@ def main():
 
         elif key == ord('l') or key == ord('L'):
             toggle_fill_light_level(dll, handle)
+
+        elif key == ord('1'):
+            switch_temperature_level(dll, handle, "high")
+
+        elif key == ord('2'):
+            switch_temperature_level(dll, handle, "low")
+
+        elif key == ord('3'):
+            switch_temperature_level(dll, handle, "auto")
 
         elif key == ord('q') or key == ord('Q'):
             print("\n[停止] 正在保存数据...")
@@ -1123,6 +1333,8 @@ def main():
         rgb_ts_name = os.path.join(_DATA_DIR, f"rgb_{ts}_ts.npy")
         np.save(rgb_ts_name, rgb_ts_arr)
         print(f"[OK] RGB 时间戳已保存: {rgb_ts_name}  ({len(rgb_ts_arr)} 帧)")
+
+    save_roi_temperature_outputs(roi_temp_rows, ts)
 
     # 9. 登出
     restore_fill_light_config(dll, handle)

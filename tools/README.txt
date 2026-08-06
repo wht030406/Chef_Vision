@@ -28,6 +28,8 @@ data/homography.npy
 - 选择分布在画面不同位置、在 RGB/IR 中都可辨认的对应点。
 - 相机移动、裁剪或分辨率变化后需要重新标定。
 - 保存后使用 `排查工具/check_ir_align.py` 验证。
+- 验证无误后，将 `data/homography.npy` 同步复制为 `field/homography.npy`，
+  避免现场采集目录继续使用旧标定。
 
 ## 2. auto_wok_detect.py
 

@@ -31,7 +31,8 @@ python tools/Calibrate.py `
 
 结果会覆盖 `data/homography.npy`。标定后应使用
 `排查工具/check_ir_align.py` 或 `排查工具/check_homography.py`
-检查对齐。
+检查对齐。确认无误后，还应将它复制为 `field/homography.npy`，保证整目录
+迁移到现场低配电脑时使用同一版标定矩阵。
 
 ## 2. wok_region.json
 
@@ -72,7 +73,7 @@ python tools/auto_wok_detect.py `
 ```
 
 自动结果仍应人工检查。旋转轴位置和排除半径通常需要结合实际画面确认。
-公司交接版仓库不固定提交当前调试用的 `wok_region.json`；更换视频或重新
+项目仓库不固定提交当前调试用的 `wok_region.json`；更换视频或重新
 标注时，由统一标注入口生成/更新。
 
 ## 3. 主程序如何读取

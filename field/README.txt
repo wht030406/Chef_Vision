@@ -16,6 +16,7 @@
 | `FieldTempMonitor.py` | 现场选 ROI 并实时记录温度 | 是 |
 | `TempMonitor.py` | 离线读取已有 `.npy` 做 ROI 统计 | 否 |
 | `ThermalCamera.py` | SDK 的基础 Python 封装 | 是 |
+| `homography.npy` | RGB ROI 到 IR 温度矩阵的标定映射 | 否 |
 | `roi_config.json` | 当前 RGB 固定 ROI 配置 | 否 |
 | `fill_light_token.txt` | TN220 补光灯本地 token | 可选、已忽略 |
 | `*.dll` | 热像仪及其 FFmpeg/OpenSSL/Poco 依赖 | 是 |
@@ -34,6 +35,8 @@ FieldCapture.py
           +--> rgb_TIMESTAMP_ts.npy
           +--> temp_TIMESTAMP_ts.npy
           +--> roi_config.json
+          +--> roi_temp_TIMESTAMP.csv
+          +--> roi_temp_curve_TIMESTAMP.png
 ```
 
 ### 环境
@@ -58,6 +61,8 @@ python FieldCapture.py
 ```
 
 右侧 IR 预览页和录制的 IR 伪彩色视频也会显示 `Temp Level` / `LEVEL`。
+IR 左上角的 `ROI MAX / ROI MIN / ROI AVG` 只统计 RGB 圈选 ROI 映射到
+IR 后的区域，不再显示整幅 IR 画面的最高、最低和平均温度。
 默认启动时会请求把设备测温档位设置为 `AUTO`，然后再次查询确认最终档位。
 若现场不希望程序主动设置档位，可在 `FieldCapture.py` 顶部把
 `TEMP_LEVEL_MODE_ON_START` 改为 `"keep"`。可选值包括：
@@ -89,12 +94,33 @@ python FieldCapture.py
 | `R` | 进入/退出 ROI 编辑，保存 ROI |
 | `S` | 开始录制 |
 | `L` | 切换白色补光灯 |
+| `1` | 切换到高增益 `HG` |
+| `2` | 切换到低增益 `LG` |
+| `3` | 切换到自动档位 `AUTO` |
 | `Q` | 停止、保存并退出 |
+
+建议在按 `S` 录制前确定测温档位，日常优先使用 `3`（`AUTO`）。录制过程中
+也可以切换，但同一段数据会包含不同档位；CSV 的 `temp_level` 字段会逐帧记录。
+
+每次录制还会现场生成逐帧 ROI 温度文件和曲线图：
+
+```text
+roi_temp_TIMESTAMP.csv
+roi_temp_curve_TIMESTAMP.png
+```
+
+CSV 包含帧号、时间戳、已录制秒数、ROI 最低/最高/平均温度、ROI 像素数和
+当时的测温档位。曲线图显示 ROI 平均温度以及最低到最高温度范围，不需要回到
+主电脑后处理。
 
 录制文件写到脚本当前工作位置。录制完成后，建议把同一时间戳的全部文件一起
 复制到 `test_data/新目录/`，不要只复制 RGB 视频。
 
 ## 3. 现场实时 ROI 温度
+
+`field/homography.npy` 是 RGB 圈选区域映射到 IR 温度矩阵所需的标定文件，
+已随现场采集目录提供。迁移到低配电脑时请复制完整 `field/` 文件夹；
+若该文件缺失，程序会按画面比例估算映射，精度会低于标定矩阵。
 
 ```powershell
 python FieldTempMonitor.py

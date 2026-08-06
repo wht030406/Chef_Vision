@@ -3,8 +3,9 @@
 *.npy
 *.avi
 
-# 设备标定矩阵需要随公司交接版仓库保留
+# 设备标定矩阵需要随项目仓库保留
 !data/homography.npy
+!field/homography.npy
 
 # 输出目录只保留说明/占位，真实结果由本地运行生成
 output/**
@@ -15,7 +16,7 @@ output/**
 # 临时帧目录
 core/tmp_sam2_frames/
 
-# SAM2 模型权重用于公司交接版仓库，需通过 Git LFS 跟踪。
+# SAM2 模型权重需通过 Git LFS 跟踪。
 
 # 测试数据目录只保留说明/占位，真实采集数据由本地准备
 test_data/**

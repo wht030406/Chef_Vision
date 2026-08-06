@@ -101,16 +101,37 @@ python FieldCapture.py
 | **R** | 进入/退出 ROI 编辑（拖拽圆心移动，滚轮调半径） |
 | **S** | 开始录制（画面出现后按） |
 | **L** | 切换白色补光灯（0 → 100 → 0） |
+| **1** | 切换到高增益 `HG` |
+| **2** | 切换到低增益 `LG` |
+| **3** | 切换到自动档位 `AUTO` |
 | **Q** | 停止录制并保存 |
+
+建议在按 **S** 之前选好测温档位，常规采集优先使用 **3（AUTO）**。录制中
+仍可切换档位，但同一段数据会混合不同量程，CSV 会在 `temp_level` 字段逐帧记录。
 
 ### 4️⃣ 输出文件
 
-录制完成后，在 `field` 文件夹（脚本同目录）生成：
+录制完成后，在 `field` 文件夹（脚本同目录）生成以下 8 项结果：
 
 ```
 rgb_YYYYMMDD_HHMMSS.mp4      # 可见光视频
+ir_YYYYMMDD_HHMMSS.mp4       # IR 伪彩色视频，显示 ROI 温度与档位
 temp_YYYYMMDD_HHMMSS.npy     # 对应的红外温度矩阵（float32，单位 ℃）
+rgb_YYYYMMDD_HHMMSS_ts.npy   # RGB 逐帧时间戳
+temp_YYYYMMDD_HHMMSS_ts.npy  # IR 逐帧时间戳
+roi_temp_YYYYMMDD_HHMMSS.csv # ROI 逐帧最低/最高/平均温度
+roi_temp_curve_YYYYMMDD_HHMMSS.png # ROI 温度曲线
+roi_config.json              # RGB 圈选 ROI 的位置和大小
 ```
+
+`field/homography.npy` 用于将 RGB ROI 准确映射到 IR 温度矩阵，已随现场采集
+目录提供。迁移时复制完整 `field/` 文件夹即可；该文件缺失时程序仍可运行，
+但只会按 RGB/IR 画面比例估算 ROI 位置。
+
+右侧 IR 预览和录制的 IR 视频左上角只显示 RGB 圈选 ROI 映射到 IR 后的
+`ROI MAX / ROI MIN / ROI AVG`，不再显示整幅 IR 画面的温度统计。CSV 会同时
+记录每帧使用的 `HG / LG / AUTO` 档位，便于查看录制中途的档位切换。CSV 和
+曲线图在低配置电脑停止录制时直接生成，不依赖主电脑后处理。
 
 ---
 
