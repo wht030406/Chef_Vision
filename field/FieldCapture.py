@@ -178,6 +178,13 @@ IR_VIDEO_H = 384
 PREVIEW_W  = 640
 PREVIEW_H  = 480
 
+# OpenCV 创建写入器时必须先给出一个帧率，但低配电脑的实际回调帧率
+# 会随负载变化。录制结束后会根据逐帧时间戳重新校正视频播放速度。
+RGB_WRITER_FPS = 25.0
+IR_WRITER_FPS  = 40.0
+CORRECT_VIDEO_PLAYBACK_SPEED = True
+SHOW_RECORDED_FRAME_TIME = True
+
 # ============================================================
 # ROI 配置（圆形监测区域，在 RGB 预览坐标系下定义）
 # 默认位置：预览画面中心偏下，半径 60px（预览尺寸 640×480）
@@ -720,6 +727,32 @@ def shutdown_fill_light_now(dll, handle):
 # 回调函数
 # ============================================================
 
+def draw_recorded_frame_time(image, frame_timestamp, first_timestamp, origin, scale):
+    """Burn wall-clock and elapsed recording time into a recorded video frame."""
+    if not SHOW_RECORDED_FRAME_TIME:
+        return
+
+    current = datetime.fromtimestamp(frame_timestamp)
+    wall_time = current.strftime("%Y-%m-%d %H:%M:%S") + f".{current.microsecond // 1000:03d}"
+    elapsed_s = max(0.0, float(frame_timestamp - first_timestamp))
+    hours = int(elapsed_s // 3600)
+    minutes = int((elapsed_s % 3600) // 60)
+    seconds = elapsed_s % 60
+    elapsed_text = f"REC {hours:02d}:{minutes:02d}:{seconds:05.2f}"
+
+    x, y = origin
+    line_gap = max(20, int(round(32 * scale / 0.7)))
+    for line_index, text in enumerate((wall_time, elapsed_text)):
+        line_y = y + line_index * line_gap
+        cv2.putText(
+            image, text, (x, line_y), cv2.FONT_HERSHEY_SIMPLEX,
+            scale, (0, 0, 0), 4, cv2.LINE_AA,
+        )
+        cv2.putText(
+            image, text, (x, line_y), cv2.FONT_HERSHEY_SIMPLEX,
+            scale, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+
 def on_video_frame(handle, video_info_ptr, ivs_ptr, user_data):
     global latest_rgb, is_recording, video_writer, frame_count, rec_ts, rgb_ts_list
     global rgb_source_w, rgb_source_h
@@ -742,15 +775,22 @@ def on_video_frame(handle, video_info_ptr, ivs_ptr, user_data):
             rgb_source_h = vi.height
 
         if is_recording:
+            frame_ts = time.time()
             if video_writer is None:
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 # 使用 rec_ts（按 S 时记录），与 npy 文件保持同一时间戳
                 ts    = rec_ts if rec_ts else datetime.now().strftime("%Y%m%d_%H%M%S")
                 fname = os.path.join(_DATA_DIR, f"rgb_{ts}.mp4")
-                video_writer = cv2.VideoWriter(fname, fourcc, 25.0, (vi.width, vi.height))
+                video_writer = cv2.VideoWriter(
+                    fname, fourcc, RGB_WRITER_FPS, (vi.width, vi.height)
+                )
                 print(f"[视频] 开始写入: {fname}")
+            rgb_first_ts = rgb_ts_list[0] if rgb_ts_list else frame_ts
+            draw_recorded_frame_time(
+                bgr, frame_ts, rgb_first_ts, origin=(16, 32), scale=0.72
+            )
             video_writer.write(bgr)
-            rgb_ts_list.append(time.time())   # 记录本帧时间戳
+            rgb_ts_list.append(frame_ts)      # 记录本帧时间戳
             frame_count += 1
 
     except Exception as e:
@@ -800,9 +840,9 @@ def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 ts = rec_ts if rec_ts else datetime.now().strftime("%Y%m%d_%H%M%S")
                 ir_fname = os.path.join(_DATA_DIR, f"ir_{ts}.mp4")
-                # IR 实际回调约 40fps，标称帧率设为 40.0 确保视频播放时长正常
+                # 先按标称帧率实时写入；停止录制后根据时间戳校正实际播放速度。
                 ir_video_writer = cv2.VideoWriter(
-                    ir_fname, fourcc, 40.0, (IR_VIDEO_W, IR_VIDEO_H)
+                    ir_fname, fourcc, IR_WRITER_FPS, (IR_VIDEO_W, IR_VIDEO_H)
                 )
                 print(f"[IR视频] 开始写入: {ir_fname}")
 
@@ -830,6 +870,11 @@ def on_temp_frame(handle, temp_info_ptr, ext_ptr, user_data):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             cv2.putText(colored, f"LEVEL:{temperature_level_label}", (4, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            draw_recorded_frame_time(
+                colored, frame_ts, ir_ts_list[0],
+                origin=(4, IR_VIDEO_H - 40), scale=0.43,
+            )
 
             ir_video_writer.write(colored)
             ir_frame_count += 1
@@ -1009,6 +1054,142 @@ def save_roi_temperature_outputs(rows, timestamp, output_dir=None):
         print(f"[警告] ROI 温度曲线生成失败: {exc}")
 
     return csv_path, curve_path
+
+
+def estimate_recorded_fps(timestamps):
+    """Estimate average capture FPS from the first and last frame timestamps."""
+    values = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return None
+
+    duration_s = float(values[-1] - values[0])
+    if duration_s <= 0.0:
+        return None
+
+    fps = float((values.size - 1) / duration_s)
+    if not 0.5 <= fps <= 120.0:
+        return None
+    return fps
+
+
+def correct_video_playback_speed(video_path, timestamps, stream_name):
+    """Rewrite a recorded MP4 at its measured FPS without changing frame order."""
+    if not CORRECT_VIDEO_PLAYBACK_SPEED or not os.path.isfile(video_path):
+        return False
+
+    measured_fps = estimate_recorded_fps(timestamps)
+    if measured_fps is None:
+        print(f"[警告] {stream_name} 时间戳不足，跳过播放速度校正")
+        return False
+
+    capture = cv2.VideoCapture(video_path)
+    source_fps = float(capture.get(cv2.CAP_PROP_FPS))
+    expected_frames = int(round(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+    width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+    height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+
+    if not capture.isOpened() or expected_frames <= 0 or width <= 0 or height <= 0:
+        capture.release()
+        print(f"[警告] {stream_name} 视频无法读取，保留原文件: {video_path}")
+        return False
+
+    timestamp_frames = len(timestamps)
+    if abs(expected_frames - timestamp_frames) > 1:
+        capture.release()
+        print(
+            f"[警告] {stream_name} 视频帧数({expected_frames})与时间戳数"
+            f"({timestamp_frames})不一致，保留原文件"
+        )
+        return False
+
+    if source_fps > 0 and abs(source_fps - measured_fps) / source_fps < 0.01:
+        capture.release()
+        print(f"[校速] {stream_name} 已接近实际速度: {source_fps:.2f} FPS")
+        return True
+
+    stem, extension = os.path.splitext(video_path)
+    temp_path = f"{stem}.timing_tmp{extension}"
+    writer = None
+    written_frames = 0
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            temp_path, fourcc, measured_fps, (width, height)
+        )
+        if not writer.isOpened():
+            raise RuntimeError("无法创建临时视频写入器")
+
+        print(
+            f"[校速] {stream_name}: {source_fps:.2f} -> {measured_fps:.2f} FPS，"
+            "正在生成正常速度视频..."
+        )
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            writer.write(frame)
+            written_frames += 1
+            if written_frames % 500 == 0:
+                print(
+                    f"[校速] {stream_name} 已处理 "
+                    f"{written_frames}/{expected_frames} 帧"
+                )
+    except Exception as exc:
+        print(f"[警告] {stream_name} 播放速度校正失败，保留原文件: {exc}")
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        return False
+    finally:
+        capture.release()
+        if writer is not None:
+            writer.release()
+
+    verify_capture = cv2.VideoCapture(temp_path)
+    verified_frames = int(round(verify_capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+    verified_fps = float(verify_capture.get(cv2.CAP_PROP_FPS))
+    verified_ok = verify_capture.isOpened()
+    verify_capture.release()
+
+    if (
+        written_frames != expected_frames
+        or not verified_ok
+        or verified_frames != expected_frames
+        or verified_fps <= 0.0
+        or abs(verified_fps - measured_fps) / measured_fps > 0.02
+    ):
+        print(
+            f"[警告] {stream_name} 校速结果校验失败 "
+            f"(读取/写入/目标={written_frames}/{verified_frames}/{expected_frames})，"
+            "保留原文件"
+        )
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        return False
+
+    try:
+        os.replace(temp_path, video_path)
+    except OSError as exc:
+        print(f"[警告] {stream_name} 无法替换校速视频，保留原文件: {exc}")
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        return False
+
+    corrected_duration = written_frames / measured_fps
+    print(
+        f"[OK] {stream_name} 播放速度已校正: {measured_fps:.2f} FPS，"
+        f"时长约 {corrected_duration:.1f} 秒"
+    )
+    return True
 
 def load_roi_config():
     """从文件加载 ROI 配置，不存在则用默认值"""
@@ -1325,6 +1506,8 @@ def main():
             ir_ts_name = os.path.join(_DATA_DIR, f"temp_{ts}_ts.npy")
             np.save(ir_ts_name, ir_ts_arr)
             print(f"[OK] IR 时间戳已保存: {ir_ts_name}  ({len(ir_ts_arr)} 帧)")
+        del stack
+        temp_list.clear()
     else:
         print("[警告] 未采集到温度数据（是否忘记按 S 开始录制？）")
     # 保存 RGB 逐帧时间戳
@@ -1335,6 +1518,13 @@ def main():
         print(f"[OK] RGB 时间戳已保存: {rgb_ts_name}  ({len(rgb_ts_arr)} 帧)")
 
     save_roi_temperature_outputs(roi_temp_rows, ts)
+
+    # 低配电脑的实际回调帧率可能低于写入器标称帧率。使用已经保存的
+    # RGB/IR 逐帧时间戳校正两个 MP4 的播放速度，帧数和数据顺序保持不变。
+    rgb_video_path = os.path.join(_DATA_DIR, f"rgb_{ts}.mp4")
+    ir_video_path = os.path.join(_DATA_DIR, f"ir_{ts}.mp4")
+    correct_video_playback_speed(rgb_video_path, rgb_ts_list, "RGB")
+    correct_video_playback_speed(ir_video_path, ir_ts_list, "IR")
 
     # 9. 登出
     restore_fill_light_config(dll, handle)
