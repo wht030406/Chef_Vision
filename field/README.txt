@@ -198,7 +198,8 @@ temp_monitor_curve.png
 - `field/` 不是 SAM2 主程序入口；采集完成后在上位机运行
   `core/TrackFood.py`。
 - `roi_config.json` 与当前画面尺寸和构图相关。
-- DLL 不进 Git，代码回滚不会恢复误删的二进制文件。
-- `fill_light_token.txt` 含本地鉴权信息，不应提交或发给无关人员。
+- 现场运行所需的 SDK DLL 已随项目保留，复制完整 `field/` 即可使用。
+- `fill_light_token.txt` 是当前设备的补光灯鉴权信息，已随现场目录保留；更换
+  设备后需要同步更新，并避免发给无关人员。
 - 现场强反光、白烟和相机震动会同时影响采集和后续标定。
 - 旧 `DataLogger.py` 已移至 `可能不需要的文件/`，当前不使用。

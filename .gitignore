@@ -25,7 +25,7 @@ test_data/**
 !test_data/.gitkeep
 
 # 本地运行标注状态（重新手动标注时会生成/更新，不作为发布版固定配置）
-core/food_labels.json
+core/food_labels*.json
 data/wok_region.json
 
 # Python 缓存

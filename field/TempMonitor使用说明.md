@@ -69,7 +69,7 @@ pip install numpy opencv-python matplotlib
 
 ### 1️⃣ 修改设备参数
 
-用记事本或 VSCode 打开 `FieldCapture.py`，修改第 41-44 行的设备参数：
+用记事本或 VSCode 打开 `FieldCapture.py`，修改文件顶部的设备参数：
 
 ```python
 DEVICE_IP   = "192.168.1.123"    # 改为实际的热像仪 IP 地址

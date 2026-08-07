@@ -49,33 +49,28 @@ IR 视频、温度矩阵、时间戳和 ROI 配置。
 `ENABLE_UPRIGHT_WOK_FREEZE=False`。如果重新处理未剪辑原始视频，需要重新
 评估锅直立/白烟/空锅干扰。
 
-## 4. 当前 test8_1 使用方式
+## 4. 通用测试数据使用方式
 
-当前 `core/food_labels.json` 指向：
+先对目标数据目录运行统一标注入口：
 
-```text
-test_data/test8_1/rgb_20260707_153017.mp4
+```powershell
+python core/LabelInitialSetup.py --data-dir test_data/你的数据目录
 ```
 
-温度文件会自动匹配为：
-
-```text
-test_data/test8_1/temp_20260707_153017.npy
-```
-
-短测：
+标注完成后可先运行 120 帧短测：
 
 ```powershell
 python core/TrackFood.py --max-frames 120
 ```
 
-若 `food_labels.json` 已被其他视频标注覆盖，可显式指定视频和温度，但标注点
-仍必须与该视频匹配：
+若同时保留多套标注，可显式指定标注、视频和温度文件；三者必须来自同一套
+数据：
 
 ```powershell
 python core/TrackFood.py `
-  --video test_data/test8_1/rgb_20260707_153017.mp4 `
-  --temp test_data/test8_1/temp_20260707_153017.npy
+  --labels core/food_labels_你的数据名.json `
+  --video test_data/你的数据目录/rgb_TIMESTAMP.mp4 `
+  --temp test_data/你的数据目录/temp_TIMESTAMP.npy
 ```
 
 ## 5. 新增测试集的推荐步骤
@@ -83,7 +78,7 @@ python core/TrackFood.py `
 1. 把同次采集的 RGB、IR、温度矩阵和时间戳放入独立子目录。
 2. 保持同一时间戳命名，便于自动匹配。
 3. 如需剪辑，使用 `tools/trim_dataset_segments.py` 同步处理所有数据。
-4. 运行 `core/LabelFirstFrame.py --video ...` 重新做食材和锅底标注。
+4. 运行 `core/LabelInitialSetup.py --data-dir ...`，依次完成食材、锅底和 IR 标注。
 5. 确认 `data/homography.npy` 与当前相机位置仍匹配。
 6. 先跑 120 帧短测，再跑完整视频。
 
@@ -92,5 +87,5 @@ python core/TrackFood.py `
 - `.npy` 可能很大，不要用普通文本编辑器打开。
 - 不要单独剪 RGB 视频；必须同步剪 IR、温度和时间戳。
 - `roi_config.json` 属于对应采集画面，复制到另一分辨率或构图可能失效。
-- 测试集不在 Git 中。代码回滚不会恢复被删除的数据。
+- 测试数据独立于代码版本；删除本地数据前应先确认已有其他备份。
 - 当前用户要求保留 `test_data/` 全部内容，不做空间清理。

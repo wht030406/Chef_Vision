@@ -329,8 +329,8 @@ IR 采点原始依据   -> ir_relabel_frames/
 | `食材状态识别/` | [食材状态识别/README.md](食材状态识别/README.md) | 生/熟/焦糊分类实验 |
 | `可能不需要的文件/` | [可能不需要的文件/README.md](可能不需要的文件/README.md) | 尚未最终删除的候选 |
 
-> 版本管理注意：`output/` 和 `test_data/` 当前被 `.gitignore` 整体排除，
-> 因此这两个目录的 README 已保存在本机，但不会自动进入 Git commit。
+> 版本管理注意：`output/` 和 `test_data/` 中的大型运行数据由 `.gitignore`
+> 排除；两个目录的 README 和 `.gitkeep` 占位文件正常纳入版本管理。
 
 ## 9. 依赖与环境
 
