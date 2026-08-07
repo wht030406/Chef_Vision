@@ -95,7 +95,8 @@ def setup_wok_region(npy_path):
     if data.ndim == 2:
         data = data[np.newaxis, ...]
 
-    ref_frame = data[len(data) // 2]
+    ref_idx = len(data) // 2
+    ref_frame = data[ref_idx]
     ir_h, ir_w = ref_frame.shape
     cfg = load_wok_region(ir_h, ir_w)
 
@@ -124,6 +125,11 @@ def setup_wok_region(npy_path):
     def base_img():
         return _make_ir_color_frame(ref_frame, disp_w, disp_h)
 
+    def move_ref_frame(delta):
+        nonlocal ref_idx, ref_frame
+        ref_idx = max(0, min(len(data) - 1, ref_idx + int(delta)))
+        ref_frame = data[ref_idx]
+
     def draw_phase1():
         img = base_img()
         dcx, dcy = to_disp(cx, cy)
@@ -134,8 +140,10 @@ def setup_wok_region(npy_path):
         cv2.circle(img, (dcx, dcy + dry), 5, (255, 200, 0), -1)
         cv2.putText(img, "Phase 1: drag center / right handle / bottom handle",
                     (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        cv2.putText(img, f"cx={cx} cy={cy} rx={rx} ry={ry}  [S]=confirm  [Q]=cancel",
+        cv2.putText(img, f"frame={ref_idx + 1}/{len(data)}  [A]=previous  [D]=next",
                     (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 255, 200), 1)
+        cv2.putText(img, f"cx={cx} cy={cy} rx={rx} ry={ry}  [S]=confirm  [Q]=cancel",
+                    (8, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 255, 200), 1)
         return img
 
     def draw_phase2():
@@ -152,6 +160,8 @@ def setup_wok_region(npy_path):
                     (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
         cv2.putText(img, f"axis_cx={axis_cx} axis_cy={axis_cy}  [S]=confirm  [Q]=keep current",
                     (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 255, 200), 1)
+        cv2.putText(img, f"selected frame={ref_idx + 1}/{len(data)}",
+                    (8, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 255, 200), 1)
         return img
 
     def draw_phase3():
@@ -168,6 +178,8 @@ def setup_wok_region(npy_path):
                     (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
         cv2.putText(img, f"axis_excl_r_ir={axis_excl_r_ir}px  [S]=save  [Q]=keep current",
                     (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 255, 200), 1)
+        cv2.putText(img, f"selected frame={ref_idx + 1}/{len(data)}",
+                    (8, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 255, 200), 1)
         return img
 
     def phase1_mouse(event, x, y, flags, param):
@@ -229,6 +241,12 @@ def setup_wok_region(npy_path):
     while True:
         cv2.imshow(win, draw_phase1())
         key = cv2.waitKey(30) & 0xFF
+        if key in (ord("a"), ord("A")):
+            move_ref_frame(-1)
+            continue
+        if key in (ord("d"), ord("D")):
+            move_ref_frame(1)
+            continue
         if key in (ord("s"), ord("S")):
             break
         if key in (ord("q"), ord("Q")):
@@ -279,6 +297,7 @@ def setup_wok_region(npy_path):
         json.dump(cfg_save, f, indent=2)
 
     print(f"[OK] wok region saved: {WOK_CFG_PATH}")
+    print(f"     reference_frame={ref_idx + 1}/{len(data)}")
     print(f"     cx={cx} cy={cy} rx={rx} ry={ry}")
     print(f"     axis_cx={axis_cx} axis_cy={axis_cy}"
           f"{'  (manual)' if axis_confirmed else '  (kept current/default)'}")
